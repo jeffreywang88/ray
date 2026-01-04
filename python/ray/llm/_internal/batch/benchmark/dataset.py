@@ -2,6 +2,7 @@
 This module defines a dataset framework for sampling benchmark requests.
 """
 
+import random
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -167,6 +168,146 @@ class ShareGPTDataset(BenchmarkDataset):
         )
 
         # Only return a valid prompt if it's not empty
+        if prompt and prompt.strip():
+            if self._truncate_prompt:
+                prompt = prompt[: self._truncate_prompt]
+            return {"prompt": prompt}
+
+        return None
+
+
+class OpenThoughtsDataset(BenchmarkDataset):
+    """Implements the OpenThoughts reasoning dataset.
+
+    Uses math problems from open-r1/OpenThoughts-114k-math to produce prompts
+    that trigger long chain-of-thought reasoning with high decode length variance.
+    This is useful for benchmarking async vs sync execution: under high variance,
+    async can overlap short and long decodes, yielding up to 2x throughput gains.
+    """
+
+    def __init__(
+        self,
+        dataset_path: str,
+        seed: int,
+        hf_dataset_id: str = "open-r1/OpenThoughts-114k-math",
+        hf_split: str = "train",
+        truncate_prompt: Optional[int] = None,
+    ) -> None:
+        """
+        Initializes the OpenThoughtsDataset.
+
+        Args:
+            dataset_path: The path to the dataset on disk.
+            seed: The seed for the random number generator.
+            hf_dataset_id: The Hugging Face dataset ID to download if the
+                dataset is not found on disk.
+            hf_split: The Hugging Face split to load from the dataset.
+            truncate_prompt: Maximum prompt length (in characters) so that the
+                prompt fits in the model's context window.
+        """
+        super().__init__(dataset_path, seed)
+        self._seed = seed
+        self._hf_dataset_id = hf_dataset_id
+        self._hf_split = hf_split
+        self._truncate_prompt = truncate_prompt
+        self._data: list[Dict] | None = None
+
+    def load_data(self) -> None:
+        """Load data from the dataset path into memory."""
+        if self._data is None:
+            self._data = self._load_dataset_data()
+
+    def sample(self, num_requests: int) -> List[Dict]:
+        """Sample prompts from the loaded dataset."""
+        if self._data is None:
+            self.load_data()
+
+        # Extract all valid prompts
+        all_prompts = []
+        for item in self._data:
+            prompt_data = self._extract_prompt(item)
+            if prompt_data is not None:
+                all_prompts.append(prompt_data)
+
+        if not all_prompts:
+            raise ValueError("OpenThoughts dataset yielded no usable prompts")
+
+        # Shuffle deterministically so we get diverse difficulty levels
+        rng = random.Random(self._seed)
+        rng.shuffle(all_prompts)
+
+        # Replicate if we need more samples than available
+        if num_requests <= len(all_prompts):
+            return all_prompts[:num_requests]
+
+        full_copies = num_requests // len(all_prompts)
+        remainder = num_requests % len(all_prompts)
+        prompts = all_prompts * full_copies + all_prompts[:remainder]
+        return prompts
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _load_dataset(self):
+        """Load dataset from disk or Hugging Face."""
+        path = Path(self._dataset_path)
+        print(f"Attempting to load OpenThoughts dataset from {path}")
+        print(f"Dataset exists on disk: {path.exists()}")
+
+        try:
+            if path.exists():
+                dataset = load_from_disk(str(path))
+            else:
+                print(
+                    f"Dataset not found on disk, downloading from Hugging Face: "
+                    f"{self._hf_dataset_id}"
+                )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                dataset = load_dataset(self._hf_dataset_id, split=self._hf_split)
+                dataset.save_to_disk(str(path))
+            return dataset
+
+        except Exception as e:
+            raise RuntimeError(f"Error loading OpenThoughts dataset: {e}")
+
+    def _load_dataset_data(self) -> List[Dict]:
+        """Load and process dataset data into a list of dictionaries."""
+        ds = self._load_dataset().shuffle(seed=self._seed)
+        data = [row for row in ds]
+        print(f"Loaded {len(data)} samples from OpenThoughts dataset")
+        return data
+
+    def _extract_prompt(self, item: Dict) -> Dict | None:
+        """
+        Extracts the math problem from an OpenThoughts item.
+
+        The dataset may use:
+          - A top-level ``problem`` field, OR
+          - A ``conversations`` list with ``{"from": "human", "value": ...}``
+            entries (ShareGPT-style).
+
+        Returns ``{"prompt": <text>}`` or ``None`` if no usable prompt is found.
+        """
+        prompt: str | None = None
+
+        # Prefer the explicit "problem" field
+        if "problem" in item and item["problem"]:
+            prompt = str(item["problem"]).strip()
+
+        # Fall back to conversations / messages
+        if not prompt:
+            messages = item.get("conversations") or item.get("messages") or []
+            prompt = next(
+                (
+                    str(msg.get("value", msg.get("content", ""))).strip()
+                    for msg in messages
+                    if msg.get("from") in {"human", "user"}
+                    or msg.get("role") in {"human", "user"}
+                ),
+                None,
+            )
+
         if prompt and prompt.strip():
             if self._truncate_prompt:
                 prompt = prompt[: self._truncate_prompt]

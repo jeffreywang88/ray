@@ -84,6 +84,10 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
         description="The task type to use. If not specified, will use "
         "'generate' by default.",
     )
+    synchronous_engine: Optional[bool] = Field(
+        default=False,
+        description="Whether to use the synchronous vLLM engine stage.",
+    )
     # LoRA configurations.
     dynamic_lora_loading_path: Optional[str] = Field(
         default=None,
@@ -132,6 +136,12 @@ class vLLMEngineProcessorConfig(OfflineProcessorConfig):
             ).model_dump()
         return values
 
+    @root_validator(pre=True)
+    def validate_max_concurrent_batches(cls, values):
+        synchronous_engine = values.get("synchronous_engine", False)
+        if synchronous_engine:
+            values["max_concurrent_batches"] = 1
+        return values
 
 def build_vllm_engine_processor(
     config: vLLMEngineProcessorConfig,
@@ -266,6 +276,7 @@ def build_vllm_engine_processor(
 
     stages.append(
         vLLMEngineStage(
+            synchronous_engine=config.synchronous_engine,
             fn_constructor_kwargs=dict(
                 batch_size=config.batch_size,
                 max_concurrent_batches=config.max_concurrent_batches,

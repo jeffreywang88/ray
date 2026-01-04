@@ -29,6 +29,7 @@ def test_vllm_engine_processor(
     expected_distributed_executor_backend,
 ):
     config = vLLMEngineProcessorConfig(
+        synchronous_engine=synchronous_engine,
         model_source=model_opt_125m,
         engine_kwargs=dict(
             max_model_len=8192,
@@ -58,6 +59,7 @@ def test_vllm_engine_processor(
     ]
 
     stage = processor.get_stage_by_name("vLLMEngineStage")
+    effective_max_concurrent_batches = 1 if synchronous_engine else 8
     assert stage.fn_constructor_kwargs == {
         "model": model_opt_125m,
         "engine_kwargs": {
@@ -69,7 +71,7 @@ def test_vllm_engine_processor(
         "task_type": vLLMTaskType.GENERATE,
         "max_pending_requests": 111,
         "dynamic_lora_loading_path": None,
-        "max_concurrent_batches": 8,
+        "max_concurrent_batches": effective_max_concurrent_batches,
         "batch_size": 64,
         "should_continue_on_error": False,
     }
@@ -224,6 +226,7 @@ def test_generation_model(gpu_type, model_opt_125m, backend):
     """
 
     processor_config = vLLMEngineProcessorConfig(
+        synchronous_engine=synchronous_engine,
         model_source=model_opt_125m,
         engine_kwargs=dict(
             enable_prefix_caching=False,
@@ -271,56 +274,50 @@ def test_generation_model(gpu_type, model_opt_125m, backend):
     assert all("resp" in out for out in outs)
 
 
-def test_generation_model_tokenized_prompt(gpu_type, model_opt_125m):
-    tokenizer = AutoTokenizer.from_pretrained(model_opt_125m, trust_remote_code=True)
-
+@pytest.mark.parametrize("synchronous_engine", [True, False])
+def test_classification_model(gpu_type, synchronous_engine):
     processor_config = vLLMEngineProcessorConfig(
-        model_source=model_opt_125m,
+        synchronous_engine=synchronous_engine,
+        model_source="HuggingFaceTB/fineweb-edu-classifier",
+        task_type="classify",
         engine_kwargs=dict(
-            enable_prefix_caching=False,
-            enable_chunked_prefill=True,
-            max_num_batched_tokens=2048,
-            max_model_len=2048,
-            enforce_eager=True,
+            max_model_len=512,  # Model only supports up to 512 tokens
         ),
         batch_size=16,
         accelerator_type=gpu_type,
         concurrency=1,
         chat_template_stage=ChatTemplateStageConfig(enabled=False),
-        tokenize_stage=TokenizerStageConfig(enabled=False),
+        tokenize_stage=TokenizerStageConfig(enabled=True),
         detokenize_stage=DetokenizeStageConfig(enabled=False),
     )
 
-    def preprocess(row):
-        prompt_text = f"Calculate {row['id']} ** 3"
-
-        return dict(
-            tokenized_prompt=tokenizer(prompt_text)["input_ids"],
-            sampling_params=dict(
-                temperature=0.3,
-                max_tokens=50,
-            ),
-        )
-
     processor = build_processor(
         processor_config,
-        preprocess=preprocess,
+        preprocess=lambda row: dict(
+            prompt="This is a great educational content",
+            pooling_params=dict(
+                truncate_prompt_tokens=-1,
+            ),
+        ),
         postprocess=lambda row: {
-            "resp": row["generated_text"],
+            "probs": float(row["embeddings"][0])
+                if row.get("embeddings") is not None and len(row["embeddings"]) > 0
+                else None,
         },
     )
 
     ds = ray.data.range(60)
-    ds = ds.map(lambda x: {"id": x["id"], "val": x["id"] + 5})
     ds = processor(ds)
     ds = ds.materialize()
     outs = ds.take_all()
     assert len(outs) == 60
-    assert all("resp" in out for out in outs)
+    assert all("probs" in out for out in outs)
 
 
-def test_embedding_model(gpu_type, model_smolvlm_256m):
+@pytest.mark.parametrize("synchronous_engine", [True, False])
+def test_embedding_model(gpu_type, model_smolvlm_256m, synchronous_engine):
     processor_config = vLLMEngineProcessorConfig(
+        synchronous_engine=synchronous_engine,
         model_source=model_smolvlm_256m,
         task_type="embed",
         engine_kwargs=dict(
@@ -401,11 +398,13 @@ def test_classification_model(gpu_type):
 
 
 @pytest.mark.parametrize("use_nested_config", [True, False])
+@pytest.mark.parametrize("synchronous_engine", [True, False])
 def test_legacy_vision_model(
-    gpu_type, model_smolvlm_256m, use_nested_config, image_asset
+    gpu_type, model_smolvlm_256m, use_nested_config, image_asset, synchronous_engine
 ):
     image_url, _ = image_asset
     processor_config = dict(
+        synchronous_engine=synchronous_engine,
         model_source=model_smolvlm_256m,
         task_type="generate",
         engine_kwargs=dict(
@@ -474,11 +473,13 @@ def test_legacy_vision_model(
 
 @pytest.mark.parametrize("input_raw_image_data", [True, False])
 @pytest.mark.parametrize("decouple_tokenizer", [True, False])
+@pytest.mark.parametrize("synchronous_engine", [True, False])
 def test_vision_model(
-    gpu_type, model_smolvlm_256m, image_asset, input_raw_image_data, decouple_tokenizer
+    gpu_type, model_smolvlm_256m, image_asset, input_raw_image_data, decouple_tokenizer, synchronous_engine
 ):
     image_url, image_pil = image_asset
     llm_processor_config = vLLMEngineProcessorConfig(
+        synchronous_engine=synchronous_engine,
         model_source=model_smolvlm_256m,
         task_type="generate",
         engine_kwargs=dict(
@@ -546,11 +547,13 @@ def test_vision_model(
 
 
 @pytest.mark.parametrize("input_raw_audio_data", [True, False])
+@pytest.mark.parametrize("synchronous_engine", [True, False])
 def test_audio_model(
-    gpu_type, model_qwen_2_5_omni_3b, audio_asset, input_raw_audio_data
+    gpu_type, model_qwen_2_5_omni_3b, audio_asset, input_raw_audio_data, synchronous_engine
 ):
     audio_url, audio_data = audio_asset
     llm_processor_config = vLLMEngineProcessorConfig(
+        synchronous_engine=synchronous_engine,
         model_source=model_qwen_2_5_omni_3b,
         task_type="generate",
         engine_kwargs=dict(
