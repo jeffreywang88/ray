@@ -1,8 +1,5 @@
 import argparse
 
-from dataset import ShareGPTDataset
-from engine_wrapper import Tokenizer, vLLMAsyncWrapper, vLLMSyncWrapper
-
 import ray
 from ray.data.llm import build_processor, vLLMEngineProcessorConfig
 from ray.llm._internal.batch.stages.configs import (
@@ -10,7 +7,10 @@ from ray.llm._internal.batch.stages.configs import (
     DetokenizeStageConfig,
     TokenizerStageConfig,
 )
+from dataset import ShareGPTDataset
+
 from ray.runtime_env import RuntimeEnv
+from engine_wrapper import Tokenizer, vLLMAsyncWrapper, vLLMSyncWrapper
 
 
 def main(args):
@@ -49,7 +49,7 @@ def main(args):
     )
     if args.sync_engine:
         processor_config_kwargs["synchronous_engine"] = True
-
+    
     processor_config = vLLMEngineProcessorConfig(**processor_config_kwargs)
 
     if args.raw_map_batches:
@@ -101,14 +101,14 @@ def main(args):
             processor = build_processor(
                 processor_config,
                 preprocess=lambda row: dict(
-                    prompt=row["prompt"],
+                    prompt=row['prompt'],
                     pooling_params={
                         "truncate_prompt_tokens": -1,
                     }
                 ),
                 postprocess=lambda row: {
-                    "probs": float(row["embeddings"][0])
-                    if row.get("embeddings") is not None and len(row["embeddings"]) > 0
+                    "probs": float(row['embeddings'][0])
+                    if row.get('embeddings') is not None and len(row['embeddings']) > 0
                     else None,
                 },
             )
@@ -116,7 +116,7 @@ def main(args):
             processor = build_processor(
                 processor_config,
                 preprocess=lambda row: dict(
-                    prompt=row["prompt"],
+                    prompt=row['prompt'],
                     sampling_params={
                         "max_tokens": args.max_decode_tokens,
                         "ignore_eos": args.ignore_eos,
@@ -125,7 +125,7 @@ def main(args):
                     }
                 ),
                 postprocess=lambda row: {
-                    "generated_text": row.get("generated_text", ""),
+                    "generated_text": row.get('generated_text', ''),
                 },
             )
         ds = processor(ds)

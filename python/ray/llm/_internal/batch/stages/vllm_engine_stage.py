@@ -606,29 +606,138 @@ class vLLMEngineSyncWrapper(vLLMEngineBaseWrapper):
         # Without the lock and when max_concurrent_batches > 1, concurrent Ray Data tasks could
         # add requests while another is still running, mixing results between batches.
         # with self.generate_lock:
-        requests = [self._prepare_llm_request(row) for row in rows]
-
-        prompts = [self._build_llm_prompt(request) for request in requests]
-        params_list = [request.params for request in requests]
-
-        if self._is_pooling_task():
-            # TODO: Does vLLM.LLM respect truncate_prompt_tokens in the pooling_params?
+        
+        # Extract idx_in_batch for all rows
+        idx_in_batch_list = [row[self.idx_in_batch_column] for row in rows]
+        
+        # For classify task: follow engine_wrapper.py pattern exactly for max performance
+        if self._is_pooling_task() and self.task_type == vLLMTaskType.CLASSIFY:
+            # Extract tokenized_prompt from all rows (like input_ids.tolist() in engine_wrapper.py:52)
+            tokenized_prompts = [row.get("tokenized_prompt") for row in rows]
+            
+            # Build prompts in list comprehension (exactly like engine_wrapper.py:54-58)
+            prompts = [
+                vllm.inputs.data.TokensPrompt(
+                    prompt_token_ids=token_id_list.tolist() if isinstance(token_id_list, np.ndarray) else token_id_list,
+                ) for token_id_list in tokenized_prompts
+            ]
+            
+            # Create single PoolingParams object (exactly like engine_wrapper.py:63-66)
+            pooling_params_dict = rows[0].get("pooling_params", {})
+            pooling_params_dict = maybe_convert_ndarray_to_list(pooling_params_dict)
+            pooling_params = vllm.PoolingParams(
+                truncate_prompt_tokens=pooling_params_dict.get("truncate_prompt_tokens", -1),
+                task="classify",
+            )
+            
+            # Use encode() instead of classify() to compare performance
+            # encode() expects a list of params (one per prompt), but we reuse the same object
+            params_list = [pooling_params] * len(prompts)
             results = self.engine.encode(
                 prompts=prompts,
                 pooling_params=params_list,
-                # truncate_prompt_tokens=truncate_prompt_tokens,
+                pooling_task="classify",
+            )
+            
+            # Extract results from encode() - returns PoolingRequestOutput
+            # encode() returns embeddings in result.outputs.data, but for classify we need probs
+            # Note: encode() with pooling_task="classify" should return probs in outputs.data
+            output_list = []
+            for idx_in_batch, result in zip(idx_in_batch_list, results):
+                # encode() returns PoolingRequestOutput with outputs.data containing the probabilities
+                # For classify task, outputs.data should be the probabilities tensor
+                embeddings = result.outputs.data
+                if isinstance(embeddings, torch.Tensor):
+                    # Convert tensor to numpy/list for classify probabilities
+                    if embeddings.dtype == torch.bfloat16:
+                        embeddings = embeddings.to(torch.float32)
+                    # For classify, extract first element (probabilities)
+                    if embeddings.dim() > 1:
+                        embeddings = embeddings[0] if embeddings.shape[0] == 1 else embeddings
+                    embeddings = embeddings.cpu().numpy() if hasattr(embeddings, 'cpu') else embeddings
+                
+                output_dict = {
+                    "embeddings": embeddings,
+                    "prompt": rows[idx_in_batch].get("prompt", ""),
+                    "prompt_token_ids": rows[idx_in_batch].get("tokenized_prompt"),
+                    "num_input_tokens": len(rows[idx_in_batch].get("tokenized_prompt", [])),
+                }
+                output_list.append((idx_in_batch, output_dict))
+            
+            return output_list
+        
+        # Fallback for other task types (embed, score, generate) - keep existing logic
+        prompts = []
+        original_prompts = []
+        
+        for row in rows:
+            tokenized_prompt = row.get("tokenized_prompt")
+            if tokenized_prompt is not None:
+                if isinstance(tokenized_prompt, np.ndarray):
+                    tokenized_prompt = tokenized_prompt.tolist()
+                elif not isinstance(tokenized_prompt, list):
+                    tokenized_prompt = maybe_convert_ndarray_to_list(tokenized_prompt)
+                
+                prompt = vllm.inputs.data.TokensPrompt(
+                    prompt_token_ids=tokenized_prompt,
+                    multi_modal_data=row.get("multimodal_data"),
+                    mm_processor_kwargs=row.get("mm_processor_kwargs"),
+                    multi_modal_uuids=row.get("multimodal_uuids"),
+                )
+            else:
+                prompt_text = row.get("prompt", "")
+                prompt = vllm.inputs.data.TextPrompt(
+                    prompt=prompt_text,
+                    multi_modal_data=row.get("multimodal_data"),
+                    mm_processor_kwargs=row.get("mm_processor_kwargs"),
+                    multi_modal_uuids=row.get("multimodal_uuids"),
+                )
+            
+            prompts.append(prompt)
+            original_prompts.append(row.get("prompt", ""))
+        
+        if self._is_pooling_task():
+            pooling_params_dict = rows[0].get("pooling_params", {})
+            pooling_params_dict = maybe_convert_ndarray_to_list(pooling_params_dict)
+            shared_params = vllm.PoolingParams(
+                **pooling_params_dict,
+                task=self.task_type,
+            )
+            params_list = [shared_params] * len(prompts)
+            
+            results = self.engine.encode(
+                prompts=prompts,
+                pooling_params=params_list,
                 pooling_task=self._get_pooling_task(),
             )
         else:
+            sampling_params_dict = rows[0].get("sampling_params", {})
+            sampling_params_dict = maybe_convert_ndarray_to_list(sampling_params_dict)
+            
+            structured_outputs = None
+            if "guided_decoding" in sampling_params_dict:
+                structured_outputs = vllm.sampling_params.StructuredOutputsParams(
+                    **maybe_convert_ndarray_to_list(
+                        sampling_params_dict.pop("guided_decoding")
+                    )
+                )
+            
+            shared_params = vllm.SamplingParams(
+                **sampling_params_dict,
+                structured_outputs=structured_outputs,
+            )
+            params_list = [shared_params] * len(prompts)
+            
             results = self.engine.generate(
                 prompts=prompts,
                 sampling_params=params_list,
-                )
+            )
 
         output_list = []
-        for result, request in zip(results, requests):
-            result.prompt = request.prompt
-            output_list.append((request.idx_in_batch,
+        for idx_in_batch, result, original_prompt in zip(idx_in_batch_list, results, original_prompts):
+            result.prompt = original_prompt
+            output_list.append((
+                idx_in_batch,
                 vLLMOutputData.from_vllm_engine_output(result).model_dump()
             ))
 
