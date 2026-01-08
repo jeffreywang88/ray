@@ -290,9 +290,9 @@ def test_embedding_model(gpu_type, model_smolvlm_256m):
     assert all("prompt" in out for out in outs)
 
 
-def test_classification_model(gpu_type):
+def test_classification_model(gpu_type, model_fineweb_edu_classifier):
     processor_config = vLLMEngineProcessorConfig(
-        model_source="HuggingFaceTB/fineweb-edu-classifier",
+        model_source=model_fineweb_edu_classifier,
         task_type="classify",
         engine_kwargs=dict(
             max_model_len=512,  # Model only supports up to 512 tokens

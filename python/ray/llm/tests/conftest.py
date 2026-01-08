@@ -180,6 +180,21 @@ def model_qwen_2_5_omni_3b():
 
 
 @pytest.fixture(scope="session")
+def model_fineweb_edu_classifier():
+    REMOTE_URL = f"{S3_ARTIFACT_LLM_OSSCI_URL}fineweb-edu-classifier/"
+    FILE_LIST = [
+        "config.json",
+        "generation_config.json",
+        "model.safetensors",
+        "special_tokens_map.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "vocab.txt",
+    ]
+    yield from download_model_from_s3(REMOTE_URL, FILE_LIST)
+
+
+@pytest.fixture(scope="session")
 def gpu_type():
     """Get the GPU type used for testing."""
 
