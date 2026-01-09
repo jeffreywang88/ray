@@ -54,7 +54,7 @@ class LatencyMetrics:
 class ThroughputMetrics:
     """Throughput metrics."""
 
-    target_rps: int
+    num_concurrent: int
     achieved_rps: float
     goodput: float
     total_requests: int
@@ -222,7 +222,7 @@ def aggregate_run(
             duration_s = actual_duration
 
     throughput = ThroughputMetrics(
-        target_rps=config.get("target_rps", 0),
+        num_concurrent=config.get("num_concurrent", 0),
         achieved_rps=total / duration_s if duration_s > 0 else 0,
         goodput=success_count / duration_s if duration_s > 0 else 0,
         total_requests=total,
@@ -327,7 +327,7 @@ def metrics_to_dict(metrics: AggregatedMetrics) -> dict:
             "mean": metrics.simulated_latency.mean,
         },
         "throughput": {
-            "target_rps": metrics.throughput.target_rps,
+            "num_concurrent": metrics.throughput.num_concurrent,
             "achieved_rps": metrics.throughput.achieved_rps,
             "goodput": metrics.throughput.goodput,
             "total_requests": metrics.throughput.total_requests,
@@ -393,7 +393,7 @@ def create_summary_dataframe(
             "load_level": m.config.get("load_level"),
             "parent_replicas": m.config.get("parent_replicas"),
             "child_replicas": m.config.get("child_replicas"),
-            "target_rps": m.config.get("target_rps"),
+            "num_concurrent": m.config.get("num_concurrent"),
             # Latency
             "latency_p50": m.latency.p50,
             "latency_p90": m.latency.p90,

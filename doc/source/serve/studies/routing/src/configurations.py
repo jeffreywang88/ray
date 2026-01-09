@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Generator, List, Optional
 import hashlib
-import json
 
 
 class Algorithm(Enum):
@@ -40,7 +39,8 @@ class Scale(Enum):
     SMALL = "small"
     MEDIUM = "medium"
     LARGE = "large"
-    XLARGE = "xlarge"
+    # XLARGE = "xlarge" # disbale untill we convert script to anyscale service and then we can use anyscale SDK to launch service
+    # and hit the AWS ALB endpoint. For now we are always hitting the local endpoint, which hits the same HAProxy endpoint.
 
 
 class Ratio(Enum):
@@ -71,7 +71,8 @@ SCALE_REPLICAS = {
     Scale.SMALL: 8,
     Scale.MEDIUM: 32,
     Scale.LARGE: 128,
-    Scale.XLARGE: 512,
+    # Scale.XLARGE: 512, # disable untill we convert script to anyscale service and then we can use anyscale SDK to launch service
+    # and hit the AWS ALB endpoint. For now we are always hitting the local endpoint, which hits the same HAProxy endpoint.
 }
 
 # Realistic max RPS per replica
@@ -82,7 +83,11 @@ SCALE_REPLICAS = {
 # - asyncio scheduling
 # - Parent→Child chain adds latency
 # Empirically measured with Locust: ~120 RPS per replica at scale
-RPS_PER_REPLICA = 120
+RPS_PER_REPLICA = 300
+
+# Concurrent users per replica for closed-loop load testing
+# This controls how much load we put on each replica
+CONCURRENT_PER_REPLICA = 8
 
 
 @dataclass(frozen=True)
@@ -134,8 +139,15 @@ class ExperimentConfig:
 
     @property
     def target_rps(self) -> int:
-        """Target RPS for this load level."""
+        """Target RPS for this load level (estimated from concurrent users)."""
         return int(self.theoretical_max_rps * self.load_level.value)
+
+    @property
+    def num_concurrent(self) -> int:
+        """Number of concurrent users for closed-loop load testing."""
+        # Scale concurrent users based on bottleneck replicas and load level
+        base_concurrent = self.bottleneck_replicas * CONCURRENT_PER_REPLICA
+        return int(base_concurrent * self.load_level.value)
 
     @property
     def total_replicas(self) -> int:
@@ -167,6 +179,7 @@ class ExperimentConfig:
             "load_level": self.load_level.value,
             "parent_replicas": self.parent_replicas,
             "child_replicas": self.child_replicas,
+            "num_concurrent": self.num_concurrent,
             "target_rps": self.target_rps,
             "theoretical_max_rps": self.theoretical_max_rps,
             "config_hash": self.config_hash,
@@ -179,11 +192,11 @@ class ExperimentConfig:
         )
 
 
-def generate_large_scale_configs() -> Generator[ExperimentConfig, None, None]:
+def generate_medium_scale_configs() -> Generator[ExperimentConfig, None, None]:
     """
-    Generate all configurations for Large scale (full variation).
+    Generate all configurations for Medium scale (full variation).
 
-    Large scale tests all combinations:
+    Medium scale tests all combinations:
     - 3 algorithms × 3 ratios × 2 topologies × 2 localities × 3 load levels = 108 configs
     """
     for algorithm in Algorithm:
@@ -193,7 +206,7 @@ def generate_large_scale_configs() -> Generator[ExperimentConfig, None, None]:
                     for load_level in LoadLevel:
                         yield ExperimentConfig(
                             algorithm=algorithm,
-                            scale=Scale.LARGE,
+                            scale=Scale.MEDIUM,
                             ratio=ratio,
                             topology=topology,
                             locality=locality,
@@ -209,7 +222,7 @@ def generate_other_scale_configs() -> Generator[ExperimentConfig, None, None]:
     - 3 algorithms × 3 scales × 3 load levels = 27 configs
     """
     for algorithm in Algorithm:
-        for scale in [Scale.SMALL, Scale.MEDIUM, Scale.XLARGE]:
+        for scale in [Scale.SMALL, Scale.LARGE]: #, Scale.XLARGE]:
             for load_level in LoadLevel:
                 yield ExperimentConfig(
                     algorithm=algorithm,
@@ -229,7 +242,7 @@ def generate_all_configs() -> List[ExperimentConfig]:
         List of all configurations for the full experiment matrix.
     """
     configs = []
-    configs.extend(generate_large_scale_configs())
+    configs.extend(generate_medium_scale_configs())
     configs.extend(generate_other_scale_configs())
     return configs
 
@@ -332,4 +345,3 @@ if __name__ == "__main__":
 
     print("\n=== Quick Test ===")
     print_config_summary(generate_quick_configs())
-

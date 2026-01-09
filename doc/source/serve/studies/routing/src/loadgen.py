@@ -1,28 +1,28 @@
 """
-Poisson load generator for routing algorithm study.
+Closed-loop load generator for routing algorithm study.
 
-Implements open-loop load generation where requests are sent at a target rate
-independent of response times. Uses Poisson arrivals to model independent user requests.
+Implements closed-loop load generation where a fixed number of concurrent "users"
+each wait for a response before sending the next request. This naturally limits
+load and prevents queue buildup.
 
-Supports multi-process mode for high RPS (>250) to avoid asyncio event loop saturation.
+Supports multi-process mode with max 100 concurrent requests per process.
 """
 
 import asyncio
 import csv
 import math
 import multiprocessing as mp
-import random
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import aiohttp
 
 
-# Maximum RPS per worker process to keep event loop responsive
-MAX_RPS_PER_WORKER = 800
+# Maximum concurrent requests per worker process
+MAX_CONCURRENT_PER_WORKER = 128
 
 
 @dataclass
@@ -50,14 +50,14 @@ class LoadTestResult:
     results: List[RequestResult]
     warmup_duration_s: float
     steady_state_duration_s: float
-    target_rps: int
+    num_concurrent: int  # Total concurrent users
 
     @property
     def steady_state_results(self) -> List[RequestResult]:
         """Results from steady state period only (excludes warmup)."""
         if not self.results:
             return []
-        start_time = self.results[0].start_time
+        start_time = min(r.start_time for r in self.results)
         warmup_end = start_time + self.warmup_duration_s
         return [r for r in self.results if r.start_time >= warmup_end]
 
@@ -81,10 +81,8 @@ class LoadTestResult:
 
     @property
     def offered_rps(self) -> float:
-        """Rate at which requests were sent (offered load)."""
-        if self.steady_state_duration_s == 0:
-            return 0.0
-        return self.total_requests / self.steady_state_duration_s
+        """Rate at which requests were completed (same as achieved for closed-loop)."""
+        return self.achieved_rps
 
     @property
     def achieved_rps(self) -> float:
@@ -112,10 +110,16 @@ class LoadTestResult:
             return 0.0
         return self.successful_requests / actual_duration
 
+    # Keep target_rps for backwards compatibility
+    @property
+    def target_rps(self) -> int:
+        """Backwards compatibility - returns num_concurrent."""
+        return self.num_concurrent
+
 
 def _worker_run_load_test(
     worker_id: int,
-    target_rps: int,
+    num_concurrent: int,
     warmup_duration_s: float,
     steady_state_duration_s: float,
     target_url: str,
@@ -127,7 +131,7 @@ def _worker_run_load_test(
     
     Args:
         worker_id: Unique identifier for this worker.
-        target_rps: Target RPS for this worker.
+        num_concurrent: Number of concurrent users for this worker.
         warmup_duration_s: Warmup duration.
         steady_state_duration_s: Steady state duration.
         target_url: URL to send requests to.
@@ -140,16 +144,15 @@ def _worker_run_load_test(
         time.sleep(wait_time)
     
     async def run():
-        generator = PoissonLoadGenerator(
+        generator = ClosedLoopLoadGenerator(
             target_url=target_url,
-            max_connections=100,  # Lower per-worker
-            max_in_flight=500,    # Lower per-worker
+            request_timeout_s=30.0,
         )
         return await generator.run(
-            target_rps=target_rps,
+            num_concurrent=num_concurrent,
             warmup_duration_s=warmup_duration_s,
             steady_state_duration_s=steady_state_duration_s,
-            progress_interval_s=10.0,  # Less frequent logging per worker
+            progress_interval_s=10.0,
             worker_id=worker_id,
         )
     
@@ -179,30 +182,31 @@ def _worker_run_load_test(
 
 class MultiProcessLoadGenerator:
     """
-    Multi-process load generator that distributes load across worker processes.
+    Multi-process closed-loop load generator.
     
-    Each worker handles at most MAX_RPS_PER_WORKER to keep asyncio responsive.
+    Distributes concurrent users across worker processes,
+    with max MAX_CONCURRENT_PER_WORKER users per process.
     """
     
     def __init__(
         self,
         target_url: str = "http://localhost:8000",
-        max_rps_per_worker: int = MAX_RPS_PER_WORKER,
+        max_concurrent_per_worker: int = MAX_CONCURRENT_PER_WORKER,
     ):
         self.target_url = target_url
-        self.max_rps_per_worker = max_rps_per_worker
+        self.max_concurrent_per_worker = max_concurrent_per_worker
     
     def run(
         self,
-        target_rps: int,
+        num_concurrent: int,
         warmup_duration_s: float = 10.0,
         steady_state_duration_s: float = 60.0,
     ) -> LoadTestResult:
         """
-        Run load test using multiple worker processes.
+        Run closed-loop load test using multiple worker processes.
         
         Args:
-            target_rps: Total target RPS across all workers.
+            num_concurrent: Total number of concurrent users.
             warmup_duration_s: Warmup duration.
             steady_state_duration_s: Steady state duration.
         
@@ -210,11 +214,14 @@ class MultiProcessLoadGenerator:
             Combined LoadTestResult from all workers.
         """
         # Calculate number of workers needed
-        num_workers = max(1, math.ceil(target_rps / self.max_rps_per_worker))
-        rps_per_worker = target_rps // num_workers
-        remainder = target_rps % num_workers
+        num_workers = max(1, math.ceil(num_concurrent / self.max_concurrent_per_worker))
+        users_per_worker = num_concurrent // num_workers
+        remainder = num_concurrent % num_workers
         
-        print(f"Multi-process load generator: {num_workers} workers, ~{rps_per_worker} RPS each")
+        print(f"Multi-process closed-loop load generator:")
+        print(f"  Total concurrent users: {num_concurrent}")
+        print(f"  Workers: {num_workers}")
+        print(f"  ~{users_per_worker} users per worker")
         
         # Create result queue
         result_queue = mp.Queue()
@@ -226,13 +233,13 @@ class MultiProcessLoadGenerator:
         workers = []
         for i in range(num_workers):
             # Distribute remainder across first workers
-            worker_rps = rps_per_worker + (1 if i < remainder else 0)
+            worker_users = users_per_worker + (1 if i < remainder else 0)
             
             p = mp.Process(
                 target=_worker_run_load_test,
                 args=(
                     i,
-                    worker_rps,
+                    worker_users,
                     warmup_duration_s,
                     steady_state_duration_s,
                     self.target_url,
@@ -242,7 +249,7 @@ class MultiProcessLoadGenerator:
             )
             p.start()
             workers.append(p)
-            print(f"  Started worker {i}: {worker_rps} RPS")
+            print(f"  Started worker {i}: {worker_users} concurrent users")
         
         # Collect results from all workers
         all_results: List[RequestResult] = []
@@ -264,27 +271,22 @@ class MultiProcessLoadGenerator:
             results=all_results,
             warmup_duration_s=warmup_duration_s,
             steady_state_duration_s=steady_state_duration_s,
-            target_rps=target_rps,
+            num_concurrent=num_concurrent,
         )
 
 
-class PoissonLoadGenerator:
+class ClosedLoopLoadGenerator:
     """
-    Open-loop load generator with Poisson arrivals.
+    Closed-loop load generator with fixed concurrency.
 
-    Sends requests at a target rate independent of response times.
-    This is more realistic than closed-loop (fixed concurrency) because:
-    - Real traffic doesn't wait for responses before sending new requests
-    - Allows queue buildup to stress the routing algorithm
-    - Poisson arrivals model independent user requests
+    Each "user" runs in a loop: send request → wait for response → repeat.
+    This naturally limits load based on system capacity and prevents queue buildup.
     """
 
     def __init__(
         self,
         target_url: str = "http://localhost:8000",
         request_timeout_s: float = 30.0,
-        max_connections: int = 0,  # 0 = unlimited
-        max_in_flight: int = 5000,  # Limit concurrent requests to prevent memory issues
     ):
         """
         Initialize load generator.
@@ -292,22 +294,9 @@ class PoissonLoadGenerator:
         Args:
             target_url: URL to send requests to.
             request_timeout_s: Timeout for individual requests.
-            max_connections: Maximum concurrent connections (0 = unlimited).
-            max_in_flight: Maximum concurrent in-flight requests.
         """
         self.target_url = target_url
         self.request_timeout_s = request_timeout_s
-        self.max_connections = max_connections
-        self.max_in_flight = max_in_flight
-
-    async def _send_request_with_semaphore(
-        self,
-        session: aiohttp.ClientSession,
-        semaphore: asyncio.Semaphore,
-    ) -> RequestResult:
-        """Send request with semaphore to limit concurrency."""
-        async with semaphore:
-            return await self._send_request(session)
 
     async def _send_request(
         self,
@@ -370,19 +359,37 @@ class PoissonLoadGenerator:
                 error=str(e),
             )
 
+    async def _user_loop(
+        self,
+        user_id: int,
+        session: aiohttp.ClientSession,
+        end_time: float,
+        results: List[RequestResult],
+        results_lock: asyncio.Lock,
+    ) -> None:
+        """
+        Simulate a single user making requests in a loop.
+        
+        Each user waits for response before sending next request (closed-loop).
+        """
+        while time.time() < end_time:
+            result = await self._send_request(session)
+            async with results_lock:
+                results.append(result)
+
     async def run(
         self,
-        target_rps: int,
+        num_concurrent: int,
         warmup_duration_s: float = 10.0,
         steady_state_duration_s: float = 60.0,
         progress_interval_s: float = 5.0,
         worker_id: Optional[int] = None,
     ) -> LoadTestResult:
         """
-        Run load test with Poisson arrivals.
+        Run closed-loop load test with fixed concurrency.
 
         Args:
-            target_rps: Target requests per second.
+            num_concurrent: Number of concurrent users (each sends requests in a loop).
             warmup_duration_s: Duration of warmup period (data discarded).
             steady_state_duration_s: Duration of steady state measurement.
             progress_interval_s: Interval for progress logging.
@@ -396,76 +403,63 @@ class PoissonLoadGenerator:
 
         # Configure connection pool
         connector = aiohttp.TCPConnector(
-            limit=self.max_connections,
+            limit=num_concurrent + 10,  # Slightly more than concurrent users
             keepalive_timeout=30,
             force_close=False,
         )
 
         results: List[RequestResult] = []
-        tasks: List[asyncio.Task] = []
-        
-        # Semaphore to limit in-flight requests (prevents memory exhaustion)
-        semaphore = asyncio.Semaphore(self.max_in_flight)
+        results_lock = asyncio.Lock()
 
         async with aiohttp.ClientSession(connector=connector) as session:
             start_time = time.time()
             end_time = start_time + total_duration_s
-            last_progress = start_time
-            requests_sent = 0
 
-            print(f"{log_prefix}Starting load test: {target_rps} RPS for {total_duration_s}s "
+            print(f"{log_prefix}Starting closed-loop load test:")
+            print(f"{log_prefix}  Concurrent users: {num_concurrent}")
+            print(f"{log_prefix}  Duration: {total_duration_s}s "
                   f"({warmup_duration_s}s warmup + {steady_state_duration_s}s steady state)")
 
-            # Pre-generate all arrival times to avoid per-request overhead
-            # This gives us accurate Poisson arrivals without asyncio.sleep precision issues
-            arrival_times = []
-            t = start_time
-            while t < end_time:
-                inter_arrival_s = random.expovariate(target_rps)
-                t += inter_arrival_s
-                if t < end_time:
-                    arrival_times.append(t)
-
-            print(f"{log_prefix}  Pre-generated {len(arrival_times)} arrival times")
-
-            arrival_idx = 0
-            while arrival_idx < len(arrival_times):
-                current_time = time.time()
-
-                # Send all requests whose arrival time has passed
-                while arrival_idx < len(arrival_times) and arrival_times[arrival_idx] <= current_time:
-                    task = asyncio.create_task(self._send_request_with_semaphore(session, semaphore))
-                    tasks.append(task)
-                    requests_sent += 1
-                    arrival_idx += 1
-
-                # Progress logging
-                if current_time - last_progress >= progress_interval_s:
+            # Start progress logging task
+            async def log_progress():
+                last_count = 0
+                last_time = start_time
+                while time.time() < end_time:
+                    await asyncio.sleep(progress_interval_s)
+                    current_time = time.time()
                     elapsed = current_time - start_time
-                    actual_rps = requests_sent / elapsed if elapsed > 0 else 0
+                    async with results_lock:
+                        current_count = len(results)
+                    
+                    # Calculate RPS for this interval
+                    interval_requests = current_count - last_count
+                    interval_duration = current_time - last_time
+                    interval_rps = interval_requests / interval_duration if interval_duration > 0 else 0
+                    
                     in_warmup = elapsed < warmup_duration_s
                     phase = "warmup" if in_warmup else "steady"
-                    print(f"{log_prefix}  [{phase}] {elapsed:.1f}s: {requests_sent} requests sent "
-                          f"(actual RPS: {actual_rps:.1f})")
-                    last_progress = current_time
+                    print(f"{log_prefix}  [{phase}] {elapsed:.1f}s: {current_count} requests "
+                          f"(RPS: {interval_rps:.1f})")
+                    
+                    last_count = current_count
+                    last_time = current_time
 
-                # Sleep until next arrival (or short sleep if we're behind)
-                if arrival_idx < len(arrival_times):
-                    sleep_time = max(0.0001, arrival_times[arrival_idx] - time.time())
-                    # Cap sleep to 10ms to stay responsive
-                    sleep_time = min(sleep_time, 0.001)
-                    await asyncio.sleep(sleep_time)
+            # Start all user tasks
+            progress_task = asyncio.create_task(log_progress())
+            user_tasks = [
+                asyncio.create_task(
+                    self._user_loop(i, session, end_time, results, results_lock)
+                )
+                for i in range(num_concurrent)
+            ]
 
-            # Wait for all in-flight requests to complete
-            print(f"{log_prefix}Waiting for {len(tasks)} in-flight requests to complete...")
-            completed = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for result in completed:
-                if isinstance(result, RequestResult):
-                    results.append(result)
-                elif isinstance(result, Exception):
-                    # Log but don't fail
-                    print(f"{log_prefix}Request exception: {result}")
+            # Wait for all users to complete
+            await asyncio.gather(*user_tasks)
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
 
         print(f"{log_prefix}Load test complete: {len(results)} total requests")
 
@@ -473,7 +467,7 @@ class PoissonLoadGenerator:
             results=results,
             warmup_duration_s=warmup_duration_s,
             steady_state_duration_s=steady_state_duration_s,
-            target_rps=target_rps,
+            num_concurrent=num_concurrent,
         )
 
 
@@ -526,60 +520,19 @@ def save_results_to_csv(results: LoadTestResult, output_path: Path) -> None:
 
 
 def run_load_test_sync(
-    target_rps: int,
-    warmup_duration_s: float = 10.0,
-    steady_state_duration_s: float = 60.0,
-    target_url: str = "http://127.0.0.1:8000",
-) -> LoadTestResult:
-    """
-    Run a load test, automatically using multi-process mode for high RPS.
-
-    Uses multi-process mode when target_rps > MAX_RPS_PER_WORKER to avoid
-    asyncio event loop saturation.
-
-    Args:
-        target_rps: Target requests per second.
-        warmup_duration_s: Duration of warmup period.
-        steady_state_duration_s: Duration of steady state measurement.
-        target_url: URL to send requests to.
-
-    Returns:
-        LoadTestResult containing all request results.
-    """
-    if target_rps > MAX_RPS_PER_WORKER:
-        # Use multi-process mode for high RPS
-        generator = MultiProcessLoadGenerator(target_url=target_url)
-        return generator.run(
-            target_rps=target_rps,
-            warmup_duration_s=warmup_duration_s,
-            steady_state_duration_s=steady_state_duration_s,
-        )
-    else:
-        # Use single-process mode for low RPS
-        async def _run():
-            generator = PoissonLoadGenerator(target_url=target_url)
-            return await generator.run(
-                target_rps=target_rps,
-                warmup_duration_s=warmup_duration_s,
-                steady_state_duration_s=steady_state_duration_s,
-            )
-        return asyncio.run(_run())
-
-
-async def run_load_test(
-    target_rps: int,
+    num_concurrent: int,
     warmup_duration_s: float = 10.0,
     steady_state_duration_s: float = 60.0,
     target_url: str = "http://localhost:8000",
 ) -> LoadTestResult:
     """
-    Async convenience function to run a load test (single-process only).
+    Run a closed-loop load test using multi-process mode.
 
-    For high RPS (>250), use run_load_test_sync() instead which supports
-    multi-process mode.
+    Always uses multi-process mode to avoid event loop conflicts when called
+    from async contexts (e.g., run_experiment).
 
     Args:
-        target_rps: Target requests per second.
+        num_concurrent: Number of concurrent users.
         warmup_duration_s: Duration of warmup period.
         steady_state_duration_s: Duration of steady state measurement.
         target_url: URL to send requests to.
@@ -587,30 +540,60 @@ async def run_load_test(
     Returns:
         LoadTestResult containing all request results.
     """
-    generator = PoissonLoadGenerator(target_url=target_url)
+    # Always use multi-process mode to avoid asyncio.run() conflicts
+    # when called from within an existing event loop
+    generator = MultiProcessLoadGenerator(target_url=target_url)
+    return generator.run(
+        num_concurrent=num_concurrent,
+        warmup_duration_s=warmup_duration_s,
+        steady_state_duration_s=steady_state_duration_s,
+    )
+
+
+async def run_load_test(
+    num_concurrent: int,
+    warmup_duration_s: float = 10.0,
+    steady_state_duration_s: float = 60.0,
+    target_url: str = "http://localhost:8000",
+) -> LoadTestResult:
+    """
+    Async convenience function to run a closed-loop load test (single-process only).
+
+    For high concurrency (>100), use run_load_test_sync() instead which supports
+    multi-process mode.
+
+    Args:
+        num_concurrent: Number of concurrent users.
+        warmup_duration_s: Duration of warmup period.
+        steady_state_duration_s: Duration of steady state measurement.
+        target_url: URL to send requests to.
+
+    Returns:
+        LoadTestResult containing all request results.
+    """
+    generator = ClosedLoopLoadGenerator(target_url=target_url)
     return await generator.run(
-        target_rps=target_rps,
+        num_concurrent=num_concurrent,
         warmup_duration_s=warmup_duration_s,
         steady_state_duration_s=steady_state_duration_s,
     )
 
 
 if __name__ == "__main__":
-    # Quick test with low RPS
+    # Quick test with low concurrency
     async def main():
         results = await run_load_test(
-            target_rps=10,
+            num_concurrent=10,
             warmup_duration_s=2.0,
             steady_state_duration_s=5.0,
         )
         print(f"\nResults summary:")
+        print(f"  Concurrent users: {results.num_concurrent}")
         print(f"  Total requests: {results.total_requests}")
         print(f"  Successful: {results.successful_requests}")
         print(f"  Failed: {results.failed_requests}")
         print(f"  Error rate: {results.error_rate:.2%}")
-        print(f"  Offered RPS: {results.offered_rps:.1f}")
         print(f"  Achieved RPS: {results.achieved_rps:.1f}")
         print(f"  Goodput: {results.goodput:.1f}")
 
     asyncio.run(main())
-

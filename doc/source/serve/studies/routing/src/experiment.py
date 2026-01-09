@@ -123,8 +123,7 @@ def write_results_summary(
         "run_id": run_id,
         "config": config.to_dict(),
         "throughput": {
-            "target_rps": results.target_rps,
-            "offered_rps": results.offered_rps,
+            "num_concurrent": results.num_concurrent,
             "achieved_rps": results.achieved_rps,
             "goodput": results.goodput,
             "total_requests": results.total_requests,
@@ -247,10 +246,10 @@ async def run_experiment(
             output_dir=results_dir / "manifests",
         )
 
-        # Step 5: Run load test (uses multi-process for high RPS automatically)
-        print(f"\nRunning load test at {config.target_rps} RPS...")
+        # Step 5: Run load test (uses multi-process for high concurrency automatically)
+        print(f"\nRunning closed-loop load test with {config.num_concurrent} concurrent users...")
         results = run_load_test_sync(
-            target_rps=config.target_rps,
+            num_concurrent=config.num_concurrent,
             warmup_duration_s=warmup_duration_s,
             steady_state_duration_s=steady_state_duration_s,
         )
@@ -271,8 +270,7 @@ async def run_experiment(
         print(f"\n{'='*60}")
         print(f"Experiment {run_id} complete!")
         print(f"{'='*60}")
-        print(f"Target RPS: {config.target_rps}")
-        print(f"Offered RPS: {results.offered_rps:.1f}")
+        print(f"Concurrent users: {config.num_concurrent}")
         print(f"Achieved RPS: {results.achieved_rps:.1f}")
         print(f"Goodput: {results.goodput:.1f}")
         print(f"Error rate: {results.error_rate:.2%}")

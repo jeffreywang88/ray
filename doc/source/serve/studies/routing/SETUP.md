@@ -131,55 +131,43 @@ The bottleneck is always the deployment with fewer replicas relative to load:
 
 ### 0. Load Generation Strategy
 
-**Approach: Open-Loop with Poisson Arrivals**
+**Approach: Closed-Loop with Fixed Concurrency**
 
-We use open-loop load generation where requests are sent at a target rate independent of response times. This is more realistic than closed-loop (fixed concurrency) because:
-- Real traffic doesn't wait for responses before sending new requests
-- Allows queue buildup to stress the routing algorithm
-- Poisson arrivals model independent user requests
+We use closed-loop load generation where a fixed number of concurrent "users" each wait for a response before sending the next request. This approach:
+- Naturally limits load to match system capacity
+- Prevents queue buildup and timeouts at high scale
+- Provides stable, predictable throughput measurements
+- Matches behavior of tools like Locust for easier validation
 
 ```python
-import asyncio
-import random
-
-async def poisson_load_generator(
-    target_rps: float,
-    duration_s: float,
-    send_request_func: callable,
+async def closed_loop_user(
+    session: aiohttp.ClientSession,
+    end_time: float,
+    results: List[RequestResult],
 ):
-    """Generate requests with Poisson arrivals at target_rps."""
-    end_time = time.time() + duration_s
-    tasks = []
-    
+    """Simulate a single user making requests in a loop."""
     while time.time() < end_time:
-        # Poisson process: inter-arrival times are exponential
-        inter_arrival_s = random.expovariate(target_rps)
-        await asyncio.sleep(inter_arrival_s)
-        
-        # Fire-and-forget: don't wait for response
-        task = asyncio.create_task(send_request_func())
-        tasks.append(task)
-    
-    # Wait for all in-flight requests to complete
-    await asyncio.gather(*tasks, return_exceptions=True)
+        result = await send_request(session)
+        results.append(result)
+        # Immediately send next request (closed-loop)
 ```
 
-**Calculating Target RPS by Load Level:**
+**Calculating Concurrent Users by Load Level:**
 
 ```
-Target RPS = Load% × Measured Max RPS
+Concurrent Users = Load% × Bottleneck Replicas × CONCURRENT_PER_REPLICA
 
-Measured Max RPS = min(parent_replicas, child_replicas) × 300 req/s
+CONCURRENT_PER_REPLICA = 4  (must be <= max_ongoing_requests to avoid timeouts)
 ```
 
 | Scale | Ratio | Bottleneck Replicas | 50% Load | 75% Load | 100% Load |
 |-------|-------|---------------------|----------|----------|-----------|
-| Small | 1:1 | 8 | 1,200 | 1,800 | 2,400 |
-| Medium | 1:1 | 32 | 4,800 | 7,200 | 9,600 |
-| Large | 1:1 | 128 | 19,200 | 28,800 | 38,400 |
-| Large | 1:2 | 128 (parent) | 19,200 | 28,800 | 38,400 |
-| Large | 2:1 | 128 (child) | 19,200 | 28,800 | 38,400 |
-| XLarge | 1:1 | 512 | 76,800 | 115,200 | 153,600 |
+| Small | 1:1 | 8 | 16 | 24 | 32 |
+| Medium | 1:1 | 32 | 64 | 96 | 128 |
+| Large | 1:1 | 128 | 256 | 384 | 512 |
+| Large | 1:2 | 128 (parent) | 256 | 384 | 512 |
+| Large | 2:1 | 128 (child) | 256 | 384 | 512 |
+| XLarge | 1:1 | 512 | 1024 | 1536 | 2048 |
 
 **Load Generation Infrastructure:**
 
@@ -187,12 +175,12 @@ Measured Max RPS = min(parent_replicas, child_replicas) × 300 req/s
 |-----------|--------------|
 | Load Generator Location | Head node (32 vCPU m7i.8xlarge has capacity) |
 | Client Library | aiohttp with connection pooling |
-| Client Concurrency | 1000+ concurrent connections |
-| Connection Pool | Keepalive enabled to HAProxy |
+| Multi-Process | Yes, max 500 concurrent users per process |
+| Connection Pool | Keepalive enabled |
 | Request Timeout | 30s (capture extreme tail latency) |
 | Warmup Handling | Discard first 10s of measurements |
 
-**Note:** Load generator runs on head node alongside HAProxy. The 32 vCPU m7i.8xlarge has sufficient capacity for both.
+**Note:** Closed-loop prevents overloading the system. With `max_ongoing_requests=5` per replica and `CONCURRENT_PER_REPLICA=4`, we stay under server capacity and avoid request timeouts.
 
 ### 1. Routing Algorithm
 
@@ -243,10 +231,12 @@ We test four scale levels, each with three Parent:Child ratios (1:1, 1:2, 2:1).
 
 | Level | Description | Target |
 |-------|-------------|--------|
-| Low | Well below capacity | 25% of theoretical max RPS |
-| Medium | Moderate load | 50% of theoretical max RPS |
-| High | Near capacity | 75% of theoretical max RPS |
-| Saturated | At/above capacity | 100% of theoretical max RPS |
+| Low | Well below capacity | 25% of max concurrent users |
+| Medium | Moderate load | 50% of max concurrent users |
+| High | Near capacity | 75% of max concurrent users |
+| Saturated | At capacity | 100% of max concurrent users |
+
+**Note:** Max concurrent users = `bottleneck_replicas × CONCURRENT_PER_REPLICA` where `CONCURRENT_PER_REPLICA = 4`.
 
 ---
 
@@ -266,8 +256,9 @@ We test four scale levels, each with three Parent:Child ratios (1:1, 1:2, 2:1).
 
 | Metric | Description | Collection Method |
 |--------|-------------|-------------------|
-| **Achieved RPS** | Actual requests per second | Client-side counter |
-| **Goodput** | Successful requests per second | Client-side (exclude errors) |
+| **Concurrent Users** | Number of simultaneous users | Configuration parameter |
+| **Achieved RPS** | Actual requests per second | Completed requests / actual duration |
+| **Goodput** | Successful requests per second | Successful requests / actual duration |
 | **Error Rate** | Percentage of failed requests | Client-side |
 
 ### 3. Fairness Metrics
@@ -298,7 +289,7 @@ All fairness metrics are computed from the distribution of request counts across
 
 **Precondition:** Application must be fully deployed and ready before starting (verified via health check).
 
-**Traffic Pattern:** Immediate ramp to target RPS
+**Traffic Pattern:** All concurrent users start immediately
 
 **Data:** Discarded (not included in analysis)
 
@@ -310,7 +301,7 @@ All fairness metrics are computed from the distribution of request counts across
 - Collect primary metrics under stable conditions
 - Sufficient for statistical significance with high request rates
 
-**Traffic Pattern:** Constant rate at target RPS
+**Traffic Pattern:** Fixed number of concurrent users, each sending requests continuously
 
 **Data:** Primary analysis dataset
 
