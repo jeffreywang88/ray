@@ -1,0 +1,182 @@
+"""
+Ray Serve application for routing algorithm study.
+
+Contains Parent and Child deployments that form a simple request chain:
+HAProxy -> Parent -> Child
+
+Parent deployment receives external requests and forwards to Child.
+Child deployment performs simulated work with exponential latency distribution.
+"""
+
+import asyncio
+import random
+import time
+from typing import Optional
+
+import ray
+from ray import serve
+from ray.serve.config import RequestRouterConfig
+from ray.serve.handle import DeploymentHandle
+
+
+@serve.deployment(
+    ray_actor_options={"num_cpus": 0.25},
+    max_ongoing_requests=1000,
+    max_queued_requests=-1,
+)
+class ChildDeployment:
+    """
+    Child deployment that simulates work with variable latency.
+
+    Latency follows exponential distribution with mean=10ms, capped at 100ms.
+    Returns replica ID for routing analysis.
+    """
+
+    def __init__(self):
+        self.replica_id = serve.get_replica_context().replica_id.unique_id
+        self.node_id = ray.get_runtime_context().get_node_id()
+        self.request_count = 0
+
+    async def __call__(
+        self, parent_replica_id: str, parent_node_id: str, parent_send_time: float
+    ) -> dict:
+        # Record when child receives the request - routing delay is the difference
+        # Uses wall-clock time (time.time()) which is synchronized across nodes via NTP
+        child_receive_time = time.time()
+        routing_delay_ms = (child_receive_time - parent_send_time) * 1000
+        
+        self.request_count += 1
+
+        # Exponential distribution with mean=10ms to mimic real-world variance
+        # - Most requests complete quickly
+        # - Occasional slow requests (tail latency)
+        latency_s = random.expovariate(1 / 0.01)  # mean = 10ms
+        latency_s = min(latency_s, 0.1)  # Cap at 100ms to avoid extreme outliers
+        await asyncio.sleep(latency_s)
+
+        return {
+            "child_replica_id": self.replica_id,
+            "child_node_id": self.node_id,
+            "parent_replica_id": parent_replica_id,
+            "parent_node_id": parent_node_id,
+            "simulated_latency_ms": latency_s * 1000,
+            "routing_delay_ms": routing_delay_ms,
+        }
+
+
+@serve.deployment(
+    ray_actor_options={"num_cpus": 0.25},
+    max_ongoing_requests=1000,
+    max_queued_requests=-1,
+)
+class ParentDeployment:
+    """
+    Parent deployment that receives external requests and forwards to Child.
+
+    Acts as the entry point for the request chain.
+    Returns combined routing information from both Parent and Child.
+    """
+
+    def __init__(
+        self,
+        child_handle: DeploymentHandle,
+        prefer_local_routing: bool = False,
+    ):
+        self.child_handle = child_handle
+
+        # Apply locality preference to the handle using _init()
+        # Must be called before .remote() or .options()
+        if prefer_local_routing:
+            self.child_handle._init(_prefer_local_routing=True)
+
+        self.replica_id = serve.get_replica_context().replica_id.unique_id
+        self.node_id = ray.get_runtime_context().get_node_id()
+        self.request_count = 0
+
+    async def __call__(self, request) -> dict:
+        self.request_count += 1
+
+        # Record send time for routing delay measurement (wall-clock for cross-process timing)
+        parent_send_time = time.time()
+        
+        # Forward to child and get response
+        child_response = await self.child_handle.remote(
+            self.replica_id, self.node_id, parent_send_time
+        )
+
+        return child_response
+
+
+def build_app(
+    parent_replicas: int,
+    child_replicas: int,
+    prefer_local_routing: bool = False,
+    request_router_class: Optional[str] = None,
+) -> serve.Application:
+    """
+    Build the Serve application with specified configuration.
+
+    Args:
+        parent_replicas: Number of Parent deployment replicas.
+        child_replicas: Number of Child deployment replicas.
+        prefer_local_routing: Whether to prefer routing to replicas on the same node.
+        request_router_class: Import path to custom request router class.
+            None uses default Pow2 router.
+            Examples:
+                - "src.routers.RandomRequestRouter"
+                - "src.routers.RoundRobinRequestRouter"
+
+    Returns:
+        Configured Serve application ready for deployment.
+    """
+    # Configure Child deployment
+    child_config = {
+        "num_replicas": child_replicas,
+    }
+    if request_router_class:
+        child_config["request_router_config"] = RequestRouterConfig(
+            request_router_class=request_router_class,
+        )
+
+    child = ChildDeployment.options(**child_config)
+    child_handle = child.bind()
+
+    # Configure Parent deployment
+    # Note: request_router_config only affects how OTHER deployments route TO this one,
+    # so we don't need to set it on Parent (external requests come via HTTP, not handles)
+    parent_config = {
+        "num_replicas": parent_replicas,
+    }
+
+    # Pass locality preference to ParentDeployment constructor
+    # The handle._init() call happens inside the deployment's __init__
+    parent = ParentDeployment.options(**parent_config).bind(
+        child_handle,
+        prefer_local_routing,
+    )
+
+    return parent
+
+
+# Convenience function for quick testing
+def run_app(
+    parent_replicas: int = 2,
+    child_replicas: int = 2,
+    prefer_local_routing: bool = False,
+    request_router_class: Optional[str] = None,
+    blocking: bool = False,
+):
+    """Deploy and run the application for testing."""
+    app = build_app(
+        parent_replicas=parent_replicas,
+        child_replicas=child_replicas,
+        prefer_local_routing=prefer_local_routing,
+        request_router_class=request_router_class,
+    )
+    serve.run(app, blocking=blocking)
+    print(f"Application deployed with {parent_replicas} parent, {child_replicas} child replicas")
+    print("Send requests to http://localhost:8000")
+
+
+if __name__ == "__main__":
+    run_app(blocking=True, parent_replicas=128, child_replicas=128)
