@@ -196,6 +196,9 @@ async def run_experiment(
         # Step 0b: Set environment for faster shutdown (proxy drain period)
         os.environ["RAY_SERVE_PROXY_MIN_DRAINING_PERIOD_S"] = "0"
         
+        # Increase runtime env package expiration to avoid GCS race conditions
+        os.environ["RAY_RUNTIME_ENV_TEMPORARY_REFERENCE_EXPIRATION_S"] = "1800"
+        
         # Step 1: Set environment for topology
         if config.topology == Topology.PACKED:
             os.environ["RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY"] = "1"
@@ -216,6 +219,13 @@ async def run_experiment(
             request_router_class=config.algorithm.get_router_class(),
         )
         serve.run(app, name="routing-study")
+        
+        # Print Ray log directory for debugging
+        try:
+            log_dir = ray._private.worker._global_node.get_logs_dir_path()
+            print(f"Ray logs: {log_dir}")
+        except Exception:
+            pass  # Not critical if this fails
 
         # Step 3: Wait for application to be ready
         ready = await wait_for_serve_ready(app_name="routing-study")
@@ -265,8 +275,10 @@ async def run_experiment(
     finally:
         # Step 7: Shutdown Serve for clean state between experiments
         print("Shutting down Serve...")
-        serve.shutdown()
+        await serve.shutdown_async()
         print("Shutdown complete")
+        ray.shutdown()
+        await asyncio.sleep(3)
 
 
 def run_experiment_sync(

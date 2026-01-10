@@ -56,13 +56,17 @@ class ChildDeployment:
         latency_s = min(latency_s, 0.1)  # Cap at 100ms to avoid extreme outliers
         await asyncio.sleep(latency_s)
 
+        # Record when child sends response (for return path timing)
+        child_send_time = time.time()
+
         return {
             "child_replica_id": self.replica_id,
             "child_node_id": self.node_id,
             "parent_replica_id": parent_replica_id,
             "parent_node_id": parent_node_id,
             "simulated_latency_ms": latency_s * 1000,
-            "routing_delay_ms": routing_delay_ms,
+            "parent_to_child_delay_ms": routing_delay_ms,
+            "child_send_time": child_send_time,
         }
 
 
@@ -131,8 +135,21 @@ class ParentDeployment:
             self.replica_id, self.node_id, parent_send_time
         )
 
-        # Add client → parent delay to response
+        # Record when parent receives child's response (return path timing)
+        parent_receive_child_time = time.time()
+        
+        # Calculate child → parent return delay
+        child_send_time = child_response.get("child_send_time")
+        child_to_parent_delay_ms = None
+        if child_send_time is not None:
+            child_to_parent_delay_ms = (parent_receive_child_time - child_send_time) * 1000
+
+        # Add timing info to response
         child_response["client_to_parent_delay_ms"] = client_to_parent_delay_ms
+        child_response["child_to_parent_delay_ms"] = child_to_parent_delay_ms
+        
+        # Record when parent sends response to client (for parent → client delay)
+        child_response["parent_send_response_time"] = time.time()
         
         return child_response
 

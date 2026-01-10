@@ -245,17 +245,23 @@ def main():
     total_runs = total_configs * args.repetitions
     estimated_duration_mins = total_runs * (args.warmup + args.duration + 30) / 60
 
+    # Generate execution ID for this run of the script
+    # All experiments in this execution share this namespace
+    execution_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    s3_prefix_with_execution = f"{args.s3_prefix}/{execution_id}"
+
     # Print summary
     print("\n" + "=" * 60)
     print("ROUTING ALGORITHM STUDY - EXPERIMENT RUNNER")
     print("=" * 60)
-    print(f"\nRun type: {args.run_type}")
+    print(f"\nExecution ID: {execution_id}")
+    print(f"Run type: {args.run_type}")
     print(f"Configurations: {total_configs}")
     print(f"Repetitions: {args.repetitions}")
     print(f"Total runs: {total_runs}")
     print(f"Warmup: {args.warmup}s, Duration: {args.duration}s")
     print(f"Estimated duration: {estimated_duration_mins:.1f} minutes ({estimated_duration_mins/60:.1f} hours)")
-    print(f"S3 output: s3://{args.s3_bucket}/{args.s3_prefix}/")
+    print(f"S3 output: s3://{args.s3_bucket}/{s3_prefix_with_execution}/")
     if args.clear_s3:
         print(f"Clear S3: ENABLED (will delete existing files before each run)")
 
@@ -284,7 +290,7 @@ def main():
         configs=configs,
         repetitions=args.repetitions,
         s3_bucket=args.s3_bucket,
-        s3_prefix=args.s3_prefix,
+        s3_prefix=s3_prefix_with_execution,
     )
 
     # Run experiments
@@ -306,7 +312,7 @@ def main():
             run_config = create_run_config(
                 config=config,
                 s3_bucket=args.s3_bucket,
-                s3_prefix=args.s3_prefix,
+                s3_prefix=s3_prefix_with_execution,
                 repetition=rep,
                 warmup_s=args.warmup,
                 duration_s=args.duration,
@@ -336,12 +342,13 @@ def main():
     print("\n" + "=" * 60)
     print("EXPERIMENT RUN COMPLETE")
     print("=" * 60)
+    print(f"Execution ID: {execution_id}")
     print(f"Total time: {total_time/60:.1f} minutes ({total_time/3600:.2f} hours)")
     print(f"Successful runs: {successful_runs}")
     print(f"Failed runs: {failed_runs}")
     if successful_runs + failed_runs > 0:
         print(f"Success rate: {successful_runs/(successful_runs+failed_runs)*100:.1f}%")
-    print(f"Results saved to: s3://{args.s3_bucket}/{args.s3_prefix}/")
+    print(f"Results saved to: s3://{args.s3_bucket}/{s3_prefix_with_execution}/")
     print("=" * 60)
 
 

@@ -84,8 +84,13 @@ class AggregatedMetrics:
     run_id: str
     config: dict
     latency: LatencyMetrics
-    client_to_parent_delay: LatencyMetrics  # Time from Client send to Parent receive
-    routing_delay: LatencyMetrics  # Time from Parent send to Child receive
+    # Forward path timing
+    client_to_parent_delay: LatencyMetrics  # Client → Parent
+    parent_to_child_delay: LatencyMetrics  # Parent → Child
+    # Return path timing
+    child_to_parent_delay: LatencyMetrics  # Child → Parent
+    parent_to_client_delay: LatencyMetrics  # Parent → Client
+    # Work time
     simulated_latency: LatencyMetrics  # Actual work time in Child (sleep duration)
     throughput: ThroughputMetrics
     child_fairness: FairnessMetrics  # Fairness across child replicas
@@ -424,11 +429,30 @@ def aggregate_from_dataframe(
         client_to_parent_delays = []
     client_to_parent_delay = compute_latency_metrics(client_to_parent_delays)
 
-    # Compute routing delay metrics (Parent send → Child receive)
+    # Compute parent → child delay metrics (Parent send → Child receive)
     # Filter out any negative values (clock skew) and NaN
-    routing_delays = successful["routing_delay_ms"].dropna()
-    routing_delays = routing_delays[routing_delays >= 0].tolist()
-    routing_delay = compute_latency_metrics(routing_delays)
+    if "parent_to_child_delay_ms" in successful.columns:
+        parent_to_child_delays = successful["parent_to_child_delay_ms"].dropna()
+        parent_to_child_delays = parent_to_child_delays[parent_to_child_delays >= 0].tolist()
+    else:
+        parent_to_child_delays = []
+    parent_to_child_delay = compute_latency_metrics(parent_to_child_delays)
+
+    # Compute child → parent delay metrics (Child send → Parent receive)
+    if "child_to_parent_delay_ms" in successful.columns:
+        child_to_parent_delays = successful["child_to_parent_delay_ms"].dropna()
+        child_to_parent_delays = child_to_parent_delays[child_to_parent_delays >= 0].tolist()
+    else:
+        child_to_parent_delays = []
+    child_to_parent_delay = compute_latency_metrics(child_to_parent_delays)
+
+    # Compute parent → client delay metrics (Parent send → Client receive)
+    if "parent_to_client_delay_ms" in successful.columns:
+        parent_to_client_delays = successful["parent_to_client_delay_ms"].dropna()
+        parent_to_client_delays = parent_to_client_delays[parent_to_client_delays >= 0].tolist()
+    else:
+        parent_to_client_delays = []
+    parent_to_client_delay = compute_latency_metrics(parent_to_client_delays)
 
     # Compute simulated latency metrics (actual work time in Child)
     simulated_latencies = successful["simulated_latency_ms"].dropna().tolist()
@@ -489,7 +513,9 @@ def aggregate_from_dataframe(
         config=config,
         latency=latency,
         client_to_parent_delay=client_to_parent_delay,
-        routing_delay=routing_delay,
+        parent_to_child_delay=parent_to_child_delay,
+        child_to_parent_delay=child_to_parent_delay,
+        parent_to_client_delay=parent_to_client_delay,
         simulated_latency=simulated_latency,
         throughput=throughput,
         child_fairness=child_fairness,
@@ -657,14 +683,32 @@ def metrics_to_dict(metrics: AggregatedMetrics) -> dict:
             "min": metrics.client_to_parent_delay.min,
             "mean": metrics.client_to_parent_delay.mean,
         },
-        "routing_delay_ms": {
-            "p50": metrics.routing_delay.p50,
-            "p90": metrics.routing_delay.p90,
-            "p95": metrics.routing_delay.p95,
-            "p99": metrics.routing_delay.p99,
-            "max": metrics.routing_delay.max,
-            "min": metrics.routing_delay.min,
-            "mean": metrics.routing_delay.mean,
+        "parent_to_child_delay_ms": {
+            "p50": metrics.parent_to_child_delay.p50,
+            "p90": metrics.parent_to_child_delay.p90,
+            "p95": metrics.parent_to_child_delay.p95,
+            "p99": metrics.parent_to_child_delay.p99,
+            "max": metrics.parent_to_child_delay.max,
+            "min": metrics.parent_to_child_delay.min,
+            "mean": metrics.parent_to_child_delay.mean,
+        },
+        "child_to_parent_delay_ms": {
+            "p50": metrics.child_to_parent_delay.p50,
+            "p90": metrics.child_to_parent_delay.p90,
+            "p95": metrics.child_to_parent_delay.p95,
+            "p99": metrics.child_to_parent_delay.p99,
+            "max": metrics.child_to_parent_delay.max,
+            "min": metrics.child_to_parent_delay.min,
+            "mean": metrics.child_to_parent_delay.mean,
+        },
+        "parent_to_client_delay_ms": {
+            "p50": metrics.parent_to_client_delay.p50,
+            "p90": metrics.parent_to_client_delay.p90,
+            "p95": metrics.parent_to_client_delay.p95,
+            "p99": metrics.parent_to_client_delay.p99,
+            "max": metrics.parent_to_client_delay.max,
+            "min": metrics.parent_to_client_delay.min,
+            "mean": metrics.parent_to_client_delay.mean,
         },
         "simulated_latency_ms": {
             "p50": metrics.simulated_latency.p50,
@@ -751,11 +795,21 @@ def create_summary_dataframe(
             "client_parent_delay_p90": m.client_to_parent_delay.p90,
             "client_parent_delay_p99": m.client_to_parent_delay.p99,
             "client_parent_delay_mean": m.client_to_parent_delay.mean,
-            # Routing delay (Parent -> Child)
-            "routing_delay_p50": m.routing_delay.p50,
-            "routing_delay_p90": m.routing_delay.p90,
-            "routing_delay_p99": m.routing_delay.p99,
-            "routing_delay_mean": m.routing_delay.mean,
+            # Parent -> Child delay
+            "parent_child_delay_p50": m.parent_to_child_delay.p50,
+            "parent_child_delay_p90": m.parent_to_child_delay.p90,
+            "parent_child_delay_p99": m.parent_to_child_delay.p99,
+            "parent_child_delay_mean": m.parent_to_child_delay.mean,
+            # Child -> Parent delay (return path)
+            "child_parent_delay_p50": m.child_to_parent_delay.p50,
+            "child_parent_delay_p90": m.child_to_parent_delay.p90,
+            "child_parent_delay_p99": m.child_to_parent_delay.p99,
+            "child_parent_delay_mean": m.child_to_parent_delay.mean,
+            # Parent -> Client delay (return path)
+            "parent_client_delay_p50": m.parent_to_client_delay.p50,
+            "parent_client_delay_p90": m.parent_to_client_delay.p90,
+            "parent_client_delay_p99": m.parent_to_client_delay.p99,
+            "parent_client_delay_mean": m.parent_to_client_delay.mean,
             # Simulated latency (actual work time)
             "simulated_latency_p50": m.simulated_latency.p50,
             "simulated_latency_p90": m.simulated_latency.p90,
@@ -836,12 +890,25 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Aggregate experiment results from S3 or local files"
+        description="Aggregate experiment results from S3 or local files",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Aggregate all runs from a specific execution
+  python -m analysis.aggregate s3://bucket/routing-study/20260110_123456/
+
+  # Aggregate all runs across all executions
+  python -m analysis.aggregate s3://bucket/routing-study/
+
+  # Aggregate with custom output paths
+  python -m analysis.aggregate s3://bucket/routing-study/20260110_123456/ \\
+      --output /tmp/metrics.json --csv-output /tmp/summary.csv
+""",
     )
     parser.add_argument(
         "source",
         type=str,
-        help="S3 path (s3://bucket/prefix/) or local results directory",
+        help="S3 path to execution (s3://bucket/prefix/execution_id/) or local directory",
     )
     parser.add_argument(
         "--output",

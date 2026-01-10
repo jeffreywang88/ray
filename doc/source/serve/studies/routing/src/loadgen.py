@@ -35,8 +35,12 @@ class RequestResult:
     child_replica_id: Optional[str] = None
     child_node_id: Optional[str] = None
     simulated_latency_ms: Optional[float] = None
-    client_to_parent_delay_ms: Optional[float] = None  # Client → Parent routing
-    routing_delay_ms: Optional[float] = None  # Parent → Child routing
+    # Forward path timing
+    client_to_parent_delay_ms: Optional[float] = None  # Client → Parent
+    parent_to_child_delay_ms: Optional[float] = None  # Parent → Child
+    # Return path timing
+    child_to_parent_delay_ms: Optional[float] = None  # Child → Parent
+    parent_to_client_delay_ms: Optional[float] = None  # Parent → Client
 
 
 @dataclass
@@ -129,7 +133,11 @@ def write_results_to_s3(results: List[RequestResult], s3_path: str) -> None:
     fieldnames = [
         "request_id", "start_time", "end_time", "latency_ms", "success", "error",
         "parent_replica_id", "parent_node_id", "child_replica_id", "child_node_id",
-        "simulated_latency_ms", "client_to_parent_delay_ms", "routing_delay_ms",
+        "simulated_latency_ms",
+        # Forward path
+        "client_to_parent_delay_ms", "parent_to_child_delay_ms",
+        # Return path
+        "child_to_parent_delay_ms", "parent_to_client_delay_ms",
     ]
     
     output = io.StringIO()
@@ -149,8 +157,12 @@ def write_results_to_s3(results: List[RequestResult], s3_path: str) -> None:
             "child_replica_id": result.child_replica_id,
             "child_node_id": result.child_node_id,
             "simulated_latency_ms": result.simulated_latency_ms,
+            # Forward path
             "client_to_parent_delay_ms": result.client_to_parent_delay_ms,
-            "routing_delay_ms": result.routing_delay_ms,
+            "parent_to_child_delay_ms": result.parent_to_child_delay_ms,
+            # Return path
+            "child_to_parent_delay_ms": result.child_to_parent_delay_ms,
+            "parent_to_client_delay_ms": result.parent_to_client_delay_ms,
         })
     
     # Upload to S3
@@ -224,6 +236,13 @@ def run_load_generator_task(
                     response = await parent_handle.remote(client_send_time)
                     request_end = time.perf_counter()
                     
+                    # Capture wall-clock receive time for return path timing
+                    client_receive_time = time.time()
+                    
+                    # Calculate parent → client delay
+                    parent_send_response_time = response["parent_send_response_time"]
+                    parent_to_client_delay_ms = (client_receive_time - parent_send_response_time) * 1000
+                    
                     # Only record after warmup period
                     if request_start >= warmup_end:
                         async with results_lock:
@@ -237,8 +256,12 @@ def run_load_generator_task(
                                 child_replica_id=response.get("child_replica_id"),
                                 child_node_id=response.get("child_node_id"),
                                 simulated_latency_ms=response.get("simulated_latency_ms"),
+                                # Forward path
                                 client_to_parent_delay_ms=response.get("client_to_parent_delay_ms"),
-                                routing_delay_ms=response.get("routing_delay_ms"),
+                                parent_to_child_delay_ms=response.get("parent_to_child_delay_ms"),
+                                # Return path
+                                child_to_parent_delay_ms=response.get("child_to_parent_delay_ms"),
+                                parent_to_client_delay_ms=parent_to_client_delay_ms,
                                 success=True,
                             ))
                             

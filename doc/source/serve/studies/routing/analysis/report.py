@@ -14,7 +14,9 @@ from typing import Dict, List, Optional
 import pandas as pd
 import numpy as np
 
-from analysis.aggregate import RESULTS_DIR
+
+# Default output directory
+DEFAULT_OUTPUT_DIR = Path("/tmp/routing_results")
 
 
 REPORT_TEMPLATE = """# Ray Serve Routing Algorithm Study - Results Report
@@ -38,13 +40,49 @@ REPORT_TEMPLATE = """# Ray Serve Routing Algorithm Study - Results Report
 
 {latency_findings}
 
+![Latency by Scale]({figures_dir}/latency_by_scale.png)
+
+![Latency Breakdown]({figures_dir}/latency_breakdown.png)
+
 ### 2. Fairness Analysis
 
 {fairness_findings}
 
+![Fairness Comparison]({figures_dir}/fairness_comparison.png)
+
+![Replica Coverage]({figures_dir}/replica_coverage.png)
+
 ### 3. Throughput Analysis
 
 {throughput_findings}
+
+![Throughput vs Latency]({figures_dir}/throughput_vs_latency.png)
+
+![Error Rate by Load]({figures_dir}/error_rate_by_load.png)
+
+### 4. Utilization Analysis
+
+{utilization_findings}
+
+![Utilization Comparison]({figures_dir}/utilization_comparison.png)
+
+---
+
+## Routing Delay Analysis
+
+### Client → Parent Delay
+
+This measures time from when the client sends a request to when the parent replica receives it.
+High values indicate router bottleneck (e.g., queue length probing blocking the request path).
+
+![Client to Parent Delay]({figures_dir}/client_to_parent_delay.png)
+
+### Parent → Child Delay
+
+This measures time from when the parent sends to child to when the child receives it.
+Includes routing decision time + network RTT + queue wait.
+
+![Parent→Child Delay Comparison]({figures_dir}/parent_child_delay_comparison.png)
 
 ---
 
@@ -78,11 +116,15 @@ REPORT_TEMPLATE = """# Ray Serve Routing Algorithm Study - Results Report
 ### Scale Impact
 {scale_impact}
 
+![Heatmap: Latency by Algorithm and Scale]({figures_dir}/heatmap_latency_p99_algo_scale.png)
+
 ### Topology Impact (Large Scale)
 {topology_impact}
 
 ### Locality Impact (Large Scale)
 {locality_impact}
+
+![Algorithm Heatmap (Large Scale)]({figures_dir}/algorithm_heatmap_large.png)
 
 ---
 
@@ -98,9 +140,13 @@ REPORT_TEMPLATE = """# Ray Serve Routing Algorithm Study - Results Report
 
 {latency_table}
 
-### Routing Delay by Algorithm (Parent → Child)
+### Client → Parent Delay by Algorithm
 
-{routing_delay_table}
+{client_to_parent_table}
+
+### Parent → Child Delay by Algorithm
+
+{parent_to_child_table}
 
 ### Simulated Latency by Algorithm (Actual Work Time)
 
@@ -109,6 +155,10 @@ REPORT_TEMPLATE = """# Ray Serve Routing Algorithm Study - Results Report
 ### Fairness Metrics by Algorithm (mean across all runs)
 
 {fairness_table}
+
+### Utilization Metrics by Algorithm
+
+{utilization_table}
 
 ---
 
@@ -153,8 +203,11 @@ def format_latency_table(df: pd.DataFrame) -> str:
     return "\n".join(rows)
 
 
-def format_routing_delay_table(df: pd.DataFrame) -> str:
-    """Format routing delay statistics as markdown table."""
+def format_parent_to_child_table(df: pd.DataFrame) -> str:
+    """Format parent-to-child delay statistics as markdown table."""
+    if "parent_child_delay_mean" not in df.columns:
+        return "*Parent→Child delay data not available.*"
+    
     rows = []
     rows.append("| Algorithm | Mean (ms) | p50 (ms) | p90 (ms) | p99 (ms) |")
     rows.append("|-----------|-----------|----------|----------|----------|")
@@ -163,10 +216,10 @@ def format_routing_delay_table(df: pd.DataFrame) -> str:
         alg_df = df[df["algorithm"] == alg]
         rows.append(
             f"| {alg.replace('_', ' ').title()} | "
-            f"{alg_df['routing_delay_mean'].mean():.2f} | "
-            f"{alg_df['routing_delay_p50'].mean():.2f} | "
-            f"{alg_df['routing_delay_p90'].mean():.2f} | "
-            f"{alg_df['routing_delay_p99'].mean():.2f} |"
+            f"{alg_df['parent_child_delay_mean'].mean():.2f} | "
+            f"{alg_df['parent_child_delay_p50'].mean():.2f} | "
+            f"{alg_df['parent_child_delay_p90'].mean():.2f} | "
+            f"{alg_df['parent_child_delay_p99'].mean():.2f} |"
         )
 
     return "\n".join(rows)
@@ -194,17 +247,79 @@ def format_simulated_latency_table(df: pd.DataFrame) -> str:
 def format_fairness_table(df: pd.DataFrame) -> str:
     """Format fairness statistics as markdown table."""
     rows = []
-    rows.append("| Algorithm | Child Jain's | Child CV | Parent Jain's | Parent CV |")
-    rows.append("|-----------|--------------|----------|---------------|-----------|")
+    
+    # Check if unique_pct columns exist
+    has_unique_pct = "child_unique_pct" in df.columns
+    
+    if has_unique_pct:
+        rows.append("| Algorithm | Child Jain's | Child CV | Child Coverage % | Parent Jain's | Parent CV | Parent Coverage % |")
+        rows.append("|-----------|--------------|----------|------------------|---------------|-----------|-------------------|")
+    else:
+        rows.append("| Algorithm | Child Jain's | Child CV | Parent Jain's | Parent CV |")
+        rows.append("|-----------|--------------|----------|---------------|-----------|")
+
+    for alg in df["algorithm"].unique():
+        alg_df = df[df["algorithm"] == alg]
+        if has_unique_pct:
+            rows.append(
+                f"| {alg.replace('_', ' ').title()} | "
+                f"{alg_df['child_jains'].mean():.4f} | "
+                f"{alg_df['child_cv'].mean():.4f} | "
+                f"{alg_df['child_unique_pct'].mean():.1f}% | "
+                f"{alg_df['parent_jains'].mean():.4f} | "
+                f"{alg_df['parent_cv'].mean():.4f} | "
+                f"{alg_df['parent_unique_pct'].mean():.1f}% |"
+            )
+        else:
+            rows.append(
+                f"| {alg.replace('_', ' ').title()} | "
+                f"{alg_df['child_jains'].mean():.4f} | "
+                f"{alg_df['child_cv'].mean():.4f} | "
+                f"{alg_df['parent_jains'].mean():.4f} | "
+                f"{alg_df['parent_cv'].mean():.4f} |"
+            )
+
+    return "\n".join(rows)
+
+
+def format_client_to_parent_table(df: pd.DataFrame) -> str:
+    """Format client-to-parent delay statistics as markdown table."""
+    if "client_parent_delay_mean" not in df.columns:
+        return "*Client→Parent delay data not available.*"
+    
+    rows = []
+    rows.append("| Algorithm | Mean (ms) | p50 (ms) | p90 (ms) | p99 (ms) |")
+    rows.append("|-----------|-----------|----------|----------|----------|")
 
     for alg in df["algorithm"].unique():
         alg_df = df[df["algorithm"] == alg]
         rows.append(
             f"| {alg.replace('_', ' ').title()} | "
-            f"{alg_df['child_jains'].mean():.4f} | "
-            f"{alg_df['child_cv'].mean():.4f} | "
-            f"{alg_df['parent_jains'].mean():.4f} | "
-            f"{alg_df['parent_cv'].mean():.4f} |"
+            f"{alg_df['client_parent_delay_mean'].mean():.2f} | "
+            f"{alg_df['client_parent_delay_p50'].mean():.2f} | "
+            f"{alg_df['client_parent_delay_p90'].mean():.2f} | "
+            f"{alg_df['client_parent_delay_p99'].mean():.2f} |"
+        )
+
+    return "\n".join(rows)
+
+
+def format_utilization_table(df: pd.DataFrame) -> str:
+    """Format utilization statistics as markdown table."""
+    if "child_util_mean" not in df.columns:
+        return "*Utilization data not available.*"
+    
+    rows = []
+    rows.append("| Algorithm | Mean Util | Min Util | Max Util |")
+    rows.append("|-----------|-----------|----------|----------|")
+
+    for alg in df["algorithm"].unique():
+        alg_df = df[df["algorithm"] == alg]
+        rows.append(
+            f"| {alg.replace('_', ' ').title()} | "
+            f"{alg_df['child_util_mean'].mean():.2%} | "
+            f"{alg_df['child_util_min'].mean():.2%} | "
+            f"{alg_df['child_util_max'].mean():.2%} |"
         )
 
     return "\n".join(rows)
@@ -315,14 +430,26 @@ def generate_executive_summary(df: pd.DataFrame) -> str:
 def generate_latency_findings(df: pd.DataFrame) -> str:
     """Generate latency findings section."""
     findings = []
+    has_client_parent = "client_parent_delay_mean" in df.columns
+
+    has_parent_child = "parent_child_delay_mean" in df.columns
 
     for alg in df["algorithm"].unique():
         alg_df = df[df["algorithm"] == alg]
-        routing_delay = alg_df["routing_delay_mean"].mean()
-        findings.append(
-            f"- **{alg.replace('_', ' ').title()}:** p50={alg_df['latency_p50'].mean():.1f}ms, "
-            f"p99={alg_df['latency_p99'].mean():.1f}ms, routing_delay={routing_delay:.2f}ms"
-        )
+        parent_child_delay = alg_df["parent_child_delay_mean"].mean() if has_parent_child else 0
+        
+        if has_client_parent:
+            client_parent_delay = alg_df["client_parent_delay_mean"].mean()
+            findings.append(
+                f"- **{alg.replace('_', ' ').title()}:** p50={alg_df['latency_p50'].mean():.1f}ms, "
+                f"p99={alg_df['latency_p99'].mean():.1f}ms, "
+                f"client→parent={client_parent_delay:.2f}ms, parent→child={parent_child_delay:.2f}ms"
+            )
+        else:
+            findings.append(
+                f"- **{alg.replace('_', ' ').title()}:** p50={alg_df['latency_p50'].mean():.1f}ms, "
+                f"p99={alg_df['latency_p99'].mean():.1f}ms, parent→child={parent_child_delay:.2f}ms"
+            )
 
     return "\n".join(findings)
 
@@ -354,6 +481,37 @@ def generate_throughput_findings(df: pd.DataFrame) -> str:
             f"- **{alg.replace('_', ' ').title()}:** Mean goodput={alg_df['goodput'].mean():.0f} req/s, "
             f"Error rate={alg_df['error_rate'].mean():.2%}"
         )
+
+    return "\n".join(findings)
+
+
+def generate_utilization_findings(df: pd.DataFrame) -> str:
+    """Generate utilization findings section."""
+    if "child_util_mean" not in df.columns:
+        return "*Utilization data not available.*"
+    
+    findings = []
+
+    for alg in df["algorithm"].unique():
+        alg_df = df[df["algorithm"] == alg]
+        mean_util = alg_df["child_util_mean"].mean()
+        min_util = alg_df["child_util_min"].mean()
+        
+        # Interpret utilization
+        if mean_util > 0.8:
+            efficiency = "highly efficient"
+        elif mean_util > 0.5:
+            efficiency = "moderately efficient"
+        else:
+            efficiency = "underutilized (possible router bottleneck)"
+        
+        findings.append(
+            f"- **{alg.replace('_', ' ').title()}:** Mean utilization={mean_util:.1%} ({efficiency}), "
+            f"Min={min_util:.1%}"
+        )
+    
+    # Add interpretation note
+    findings.append("\n*Note: Low utilization with high routing delay indicates router-side bottlenecks.*")
 
     return "\n".join(findings)
 
@@ -454,6 +612,22 @@ def generate_algorithm_tables(df: pd.DataFrame) -> str:
     """Generate detailed tables per algorithm."""
     sections = []
 
+    # Build list of metrics to include
+    metrics = [
+        ("latency_p99", "p99 Latency (ms)"),
+        ("child_jains", "Child Jain's Index"),
+        ("goodput", "Goodput (req/s)"),
+        ("error_rate", "Error Rate"),
+    ]
+    
+    # Add optional metrics if available
+    if "client_parent_delay_mean" in df.columns:
+        metrics.append(("client_parent_delay_mean", "Client→Parent (ms)"))
+    if "parent_child_delay_mean" in df.columns:
+        metrics.append(("parent_child_delay_mean", "Parent→Child (ms)"))
+    if "child_util_mean" in df.columns:
+        metrics.append(("child_util_mean", "Child Utilization"))
+
     for alg in df["algorithm"].unique():
         alg_df = df[df["algorithm"] == alg]
         alg_name = alg.replace("_", " ").title()
@@ -465,12 +639,10 @@ def generate_algorithm_tables(df: pd.DataFrame) -> str:
         section += "| Metric | Mean | Std | Min | Max |\n"
         section += "|--------|------|-----|-----|-----|\n"
 
-        for col, label in [
-            ("latency_p99", "p99 Latency (ms)"),
-            ("child_jains", "Child Jain's Index"),
-            ("goodput", "Goodput (req/s)"),
-            ("error_rate", "Error Rate"),
-        ]:
+        for col, label in metrics:
+            if col not in alg_df.columns:
+                continue
+                
             mean = alg_df[col].mean()
             std = alg_df[col].std()
             min_val = alg_df[col].min()
@@ -480,6 +652,8 @@ def generate_algorithm_tables(df: pd.DataFrame) -> str:
                 section += f"| {label} | {mean:.2%} | {std:.2%} | {min_val:.2%} | {max_val:.2%} |\n"
             elif col == "child_jains":
                 section += f"| {label} | {mean:.4f} | {std:.4f} | {min_val:.4f} | {max_val:.4f} |\n"
+            elif col == "child_util_mean":
+                section += f"| {label} | {mean:.2%} | {std:.2%} | {min_val:.2%} | {max_val:.2%} |\n"
             else:
                 section += f"| {label} | {mean:.1f} | {std:.1f} | {min_val:.1f} | {max_val:.1f} |\n"
 
@@ -491,13 +665,15 @@ def generate_algorithm_tables(df: pd.DataFrame) -> str:
 def generate_report(
     df: pd.DataFrame,
     output_path: Optional[Path] = None,
+    figures_dir: str = "figures",
 ) -> str:
     """
-    Generate full markdown report.
+    Generate full markdown report with embedded figures.
 
     Args:
         df: Summary DataFrame.
         output_path: Path to save report (optional).
+        figures_dir: Relative path to figures directory from the report location.
 
     Returns:
         Report as markdown string.
@@ -506,10 +682,12 @@ def generate_report(
         timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         total_runs=len(df),
         unique_configs=len(df.groupby(["algorithm", "scale", "ratio", "topology", "locality", "load_level"])),
+        figures_dir=figures_dir,
         executive_summary=generate_executive_summary(df),
         latency_findings=generate_latency_findings(df),
         fairness_findings=generate_fairness_findings(df),
         throughput_findings=generate_throughput_findings(df),
+        utilization_findings=generate_utilization_findings(df),
         hypothesis_1=validate_hypothesis_1(df),
         hypothesis_2=validate_hypothesis_2(df),
         hypothesis_3=validate_hypothesis_3(df),
@@ -519,9 +697,11 @@ def generate_report(
         locality_impact=generate_locality_impact(df),
         recommendations=generate_recommendations(df),
         latency_table=format_latency_table(df),
-        routing_delay_table=format_routing_delay_table(df),
+        client_to_parent_table=format_client_to_parent_table(df),
+        parent_to_child_table=format_parent_to_child_table(df),
         simulated_latency_table=format_simulated_latency_table(df),
         fairness_table=format_fairness_table(df),
+        utilization_table=format_utilization_table(df),
     )
 
     if output_path:
@@ -536,18 +716,36 @@ def generate_report(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Generate summary report")
+    parser = argparse.ArgumentParser(
+        description="Generate summary report from aggregated metrics",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Generate report with figures in same directory
+  python -m analysis.report --input /tmp/routing_results/summary.csv
+
+  # Specify custom output and figures directory
+  python -m analysis.report --input /tmp/routing_results/summary.csv \\
+      --output /tmp/routing_results/RESULTS.md --figures-dir figures
+""",
+    )
     parser.add_argument(
         "--input",
         type=Path,
-        default=RESULTS_DIR / "all_metrics.csv",
-        help="Input CSV file with aggregated metrics",
+        required=True,
+        help="Input CSV file with aggregated metrics (e.g., summary.csv from aggregate.py)",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=RESULTS_DIR.parent / "RESULTS.md",
-        help="Output markdown file",
+        default=DEFAULT_OUTPUT_DIR / "RESULTS.md",
+        help=f"Output markdown file. Default: {DEFAULT_OUTPUT_DIR / 'RESULTS.md'}",
+    )
+    parser.add_argument(
+        "--figures-dir",
+        type=str,
+        default="figures",
+        help="Relative path to figures directory from the report location. Default: figures",
     )
 
     args = parser.parse_args()
@@ -560,10 +758,6 @@ if __name__ == "__main__":
     df = pd.read_csv(args.input)
     print(f"Loaded {len(df)} rows from {args.input}")
 
-    report = generate_report(df, args.output)
+    report = generate_report(df, args.output, figures_dir=args.figures_dir)
     print("\n" + "=" * 60)
-    print("Report preview (first 2000 chars):")
-    print("=" * 60)
-    print(report[:2000])
-    print("...")
 

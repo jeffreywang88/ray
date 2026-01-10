@@ -16,20 +16,13 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
-from analysis.aggregate import (
-    RESULTS_DIR,
-    create_summary_dataframe,
-    load_raw_results,
-    load_manifest,
-)
-
 
 # Set style
 plt.style.use("seaborn-v0_8-whitegrid")
 sns.set_palette("husl")
 
-# Output directory
-FIGURES_DIR = RESULTS_DIR.parent / "figures"
+# Default output directory
+FIGURES_DIR = Path("/tmp/routing_results/figures")
 
 
 def plot_latency_cdf(
@@ -113,7 +106,7 @@ def plot_latency_comparison(
     ax.set_ylabel(f"{percentile.upper()} Latency (ms)", fontsize=12)
     ax.set_title(f"{percentile.upper()} Latency by Scale and Algorithm", fontsize=14)
     ax.legend(title="Algorithm")
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=45)
+    ax.tick_params(axis="x", rotation=45)
 
     plt.tight_layout()
 
@@ -139,32 +132,31 @@ def plot_fairness_comparison(
     Returns:
         matplotlib Figure.
     """
+    # Format algorithm names for display
+    plot_df = df.copy()
+    plot_df["algorithm"] = plot_df["algorithm"].str.replace("_", " ").str.title()
+
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     # Child replica fairness
     ax1 = axes[0]
-    grouped_child = df.groupby("algorithm")["child_jains"].agg(["mean", "std"])
-    x = range(len(grouped_child))
-    ax1.bar(x, grouped_child["mean"], yerr=grouped_child["std"], capsize=5)
-    ax1.set_xticks(x)
-    ax1.set_xticklabels([a.replace("_", " ").title() for a in grouped_child.index])
+    sns.barplot(data=plot_df, x="algorithm", y="child_jains", ax=ax1, errorbar="sd", 
+                hue="algorithm", palette="husl", legend=False)
+    ax1.set_xlabel("")
     ax1.set_ylabel("Jain's Fairness Index", fontsize=12)
     ax1.set_title("Child Replica Fairness", fontsize=14)
     ax1.set_ylim(0, 1.05)
-    ax1.axhline(y=1.0, color="green", linestyle="--", alpha=0.5, label="Perfect Fairness")
-    ax1.legend()
+    ax1.axhline(y=1.0, color="green", linestyle="--", alpha=0.5)
 
     # Parent replica fairness
     ax2 = axes[1]
-    grouped_parent = df.groupby("algorithm")["parent_jains"].agg(["mean", "std"])
-    ax2.bar(x, grouped_parent["mean"], yerr=grouped_parent["std"], capsize=5)
-    ax2.set_xticks(x)
-    ax2.set_xticklabels([a.replace("_", " ").title() for a in grouped_parent.index])
+    sns.barplot(data=plot_df, x="algorithm", y="parent_jains", ax=ax2, errorbar="sd",
+                hue="algorithm", palette="husl", legend=False)
+    ax2.set_xlabel("")
     ax2.set_ylabel("Jain's Fairness Index", fontsize=12)
     ax2.set_title("Parent Replica Fairness", fontsize=14)
     ax2.set_ylim(0, 1.05)
-    ax2.axhline(y=1.0, color="green", linestyle="--", alpha=0.5, label="Perfect Fairness")
-    ax2.legend()
+    ax2.axhline(y=1.0, color="green", linestyle="--", alpha=0.5)
 
     plt.tight_layout()
 
@@ -361,6 +353,8 @@ def plot_error_rate(
     ax.set_ylabel("Error Rate", fontsize=12)
     ax.set_title("Error Rate by Load Level and Algorithm", fontsize=14)
     ax.legend(title="Algorithm")
+    # Format load level ticks as percentages
+    ax.set_xticks(range(len(grouped.index)))
     ax.set_xticklabels([f"{int(x * 100)}%" for x in grouped.index], rotation=0)
 
     # Format y-axis as percentage
@@ -376,14 +370,14 @@ def plot_error_rate(
     return fig
 
 
-def plot_routing_delay_comparison(
+def plot_parent_to_child_delay_comparison(
     df: pd.DataFrame,
     output_path: Optional[Path] = None,
 ) -> plt.Figure:
     """
-    Plot routing delay comparison across algorithms.
+    Plot parent-to-child delay comparison across algorithms.
 
-    Routing delay measures time from Parent send to Child receive,
+    Parent→Child delay measures time from Parent send to Child receive,
     capturing routing decision time + network RTT + queue wait.
 
     Args:
@@ -393,38 +387,37 @@ def plot_routing_delay_comparison(
     Returns:
         matplotlib Figure.
     """
+    if "parent_child_delay_mean" not in df.columns:
+        print("Skipping parent-to-child delay plot: no data")
+        return None
+
+    # Format algorithm names for display
+    plot_df = df.copy()
+    plot_df["algorithm"] = plot_df["algorithm"].str.replace("_", " ").str.title()
+
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    colors = {"pow2": "#2ecc71", "random": "#e74c3c", "round_robin": "#3498db"}
-
-    # Plot 1: Routing delay by algorithm (bar chart)
+    # Plot 1: Mean delay by algorithm
     ax1 = axes[0]
-    grouped = df.groupby("algorithm")["routing_delay_mean"].agg(["mean", "std"])
-    x = range(len(grouped))
-    ax1.bar(x, grouped["mean"], yerr=grouped["std"], capsize=5,
-            color=[colors.get(alg, "#888888") for alg in grouped.index])
-    ax1.set_xticks(x)
-    ax1.set_xticklabels([a.replace("_", " ").title() for a in grouped.index])
-    ax1.set_ylabel("Routing Delay (ms)", fontsize=12)
-    ax1.set_title("Mean Routing Delay by Algorithm", fontsize=14)
+    sns.barplot(data=plot_df, x="algorithm", y="parent_child_delay_mean", ax=ax1,
+                errorbar="sd", hue="algorithm", palette="husl", legend=False)
+    ax1.set_xlabel("")
+    ax1.set_ylabel("Parent→Child Delay (ms)", fontsize=12)
+    ax1.set_title("Mean Parent→Child Delay", fontsize=14)
 
-    # Plot 2: Routing delay percentiles by algorithm
+    # Plot 2: Percentiles by algorithm
     ax2 = axes[1]
-    algorithms = df["algorithm"].unique()
-    x = np.arange(len(algorithms))
-    width = 0.35
-
-    p50_vals = [df[df["algorithm"] == alg]["routing_delay_p50"].mean() for alg in algorithms]
-    p99_vals = [df[df["algorithm"] == alg]["routing_delay_p99"].mean() for alg in algorithms]
-
-    ax2.bar(x - width/2, p50_vals, width, label="p50", alpha=0.8)
-    ax2.bar(x + width/2, p99_vals, width, label="p99", alpha=0.8)
-
-    ax2.set_xticks(x)
-    ax2.set_xticklabels([a.replace("_", " ").title() for a in algorithms])
-    ax2.set_ylabel("Routing Delay (ms)", fontsize=12)
-    ax2.set_title("Routing Delay Percentiles", fontsize=14)
-    ax2.legend()
+    pct_cols = ["parent_child_delay_p50", "parent_child_delay_p99"]
+    pct_cols = [c for c in pct_cols if c in df.columns]
+    if pct_cols:
+        pct_df = plot_df.melt(id_vars=["algorithm"], value_vars=pct_cols,
+                              var_name="percentile", value_name="delay_ms")
+        pct_df["percentile"] = pct_df["percentile"].str.extract(r"_p(\d+)$")[0].apply(lambda x: f"p{x}")
+        sns.barplot(data=pct_df, x="algorithm", y="delay_ms", hue="percentile", ax=ax2)
+        ax2.legend(title="")
+    ax2.set_xlabel("")
+    ax2.set_ylabel("Parent→Child Delay (ms)", fontsize=12)
+    ax2.set_title("Parent→Child Delay Percentiles", fontsize=14)
 
     plt.tight_layout()
 
@@ -441,12 +434,10 @@ def plot_latency_breakdown(
     output_path: Optional[Path] = None,
 ) -> plt.Figure:
     """
-    Plot latency breakdown showing simulated work, routing delay, and overhead.
+    Plot latency breakdown showing all latency components.
 
-    This helps visualize where time is spent:
-    - Simulated latency: actual work time in Child
-    - Routing delay: Parent→Child transmission (routing + network + queue)
-    - Other overhead: remaining time (HTTP, serialization, etc.)
+    Shows where time is spent in the full request path, grouped by load level
+    with adjacent bars for each algorithm.
 
     Args:
         df: Summary DataFrame.
@@ -455,44 +446,276 @@ def plot_latency_breakdown(
     Returns:
         matplotlib Figure.
     """
+    # Define components and their display properties
+    components = [
+        ("client_parent_delay_mean", "① Client→Parent", "#3498db"),
+        ("parent_child_delay_mean", "② Parent→Child", "#9b59b6"),
+        ("simulated_latency_mean", "③ Simulated Work", "#2ecc71"),
+        ("child_parent_delay_mean", "④ Child→Parent", "#f39c12"),
+        ("parent_client_delay_mean", "⑤ Parent→Client", "#e67e22"),
+    ]
+
+    # Filter to columns that exist
+    components = [(col, label, color) for col, label, color in components if col in df.columns]
+
+    # Aggregate data by load_level and algorithm
+    group_cols = ["load_level", "algorithm"]
+    value_cols = [col for col, _, _ in components] + ["latency_mean"]
+    agg_df = df.groupby(group_cols)[value_cols].mean().reset_index()
+
+    # Calculate overhead (unexplained latency)
+    known_sum = agg_df[[col for col, _, _ in components]].sum(axis=1)
+    agg_df["overhead"] = (agg_df["latency_mean"] - known_sum).clip(lower=0)
+    components.append(("overhead", "⑥ Other Overhead", "#e74c3c"))
+
+    # Melt to long format for easier plotting
+    id_vars = ["load_level", "algorithm"]
+    value_vars = [col for col, _, _ in components]
+    melted = agg_df.melt(id_vars=id_vars, value_vars=value_vars,
+                         var_name="component", value_name="latency_ms")
+
+    # Create component order and color mapping
+    comp_order = [col for col, _, _ in components]
+    comp_labels = {col: label for col, label, _ in components}
+    comp_colors = {col: color for col, _, color in components}
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    # Plot stacked bars using pandas pivot
+    load_levels = sorted(agg_df["load_level"].unique())
+    algorithms = sorted(agg_df["algorithm"].unique())
+    n_alg = len(algorithms)
+    bar_width = 0.25
+    group_spacing = 0.3
+
+    # X positions for each bar
+    x_base = np.arange(len(load_levels)) * (n_alg * bar_width + group_spacing)
+
+    for alg_idx, alg in enumerate(algorithms):
+        alg_data = agg_df[agg_df["algorithm"] == alg].set_index("load_level")
+        x_pos = x_base + alg_idx * bar_width
+        bottom = np.zeros(len(load_levels))
+
+        for col, label, color in components:
+            values = [alg_data.loc[ll, col] if ll in alg_data.index else 0 for ll in load_levels]
+            ax.bar(x_pos, values, bar_width, bottom=bottom, color=color,
+                   label=label if alg_idx == 0 else "", edgecolor="white", linewidth=0.5)
+            bottom += values
+
+        # Add algorithm label below bars
+        for i, x in enumerate(x_pos):
+            ax.text(x, -3, alg[0].upper(), ha="center", va="top", fontsize=9, color="#555")
+
+    # X-axis labels (load levels)
+    ax.set_xticks(x_base + (n_alg - 1) * bar_width / 2)
+    ax.set_xticklabels([f"{int(ll * 100)}%" for ll in load_levels], fontsize=11)
+    ax.set_xlabel("Load Level", fontsize=12)
+    ax.set_ylabel("Latency (ms)", fontsize=12)
+    ax.set_title("End-to-End Latency Breakdown", fontsize=14)
+
+    # Legend
+    ax.legend(loc="upper left", fontsize=9, ncol=2)
+
+    # Algorithm key
+    alg_key = " | ".join([f"{a[0].upper()}={a.replace('_', ' ').title()}" for a in algorithms])
+    ax.text(0.99, 0.98, alg_key, transform=ax.transAxes, fontsize=9,
+            ha="right", va="top", color="#555")
+
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {output_path}")
+
+    return fig
+
+
+def plot_utilization_comparison(
+    df: pd.DataFrame,
+    output_path: Optional[Path] = None,
+) -> plt.Figure:
+    """
+    Plot child replica utilization comparison across algorithms.
+
+    Utilization = total_work_time / (duration × max_ongoing_requests)
+    Low utilization + high routing delay indicates router bottleneck.
+    Grouped by load level with adjacent bars for each algorithm.
+
+    Args:
+        df: Summary DataFrame.
+        output_path: Path to save figure.
+
+    Returns:
+        matplotlib Figure.
+    """
+    if "child_util_mean" not in df.columns:
+        print("Skipping utilization plot: no utilization data")
+        return None
+
+    # Get unique load levels and algorithms
+    load_levels = sorted(df["load_level"].unique())
+    algorithms = sorted(df["algorithm"].unique())
+    n_alg = len(algorithms)
+    n_load = len(load_levels)
+
+    # Aggregate data
+    agg_df = df.groupby(["load_level", "algorithm"]).agg({
+        "child_util_mean": "mean",
+        "child_util_min": "mean" if "child_util_min" in df.columns else "first",
+    }).reset_index()
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Bar positioning
+    bar_width = 0.25
+    group_spacing = 0.3
+    x_base = np.arange(n_load) * (n_alg * bar_width + group_spacing)
+
+    colors = sns.color_palette("husl", n_alg)
+
+    for alg_idx, alg in enumerate(algorithms):
+        alg_data = agg_df[agg_df["algorithm"] == alg].set_index("load_level")
+        x_pos = x_base + alg_idx * bar_width
+        
+        values = [alg_data.loc[ll, "child_util_mean"] if ll in alg_data.index else 0 
+                  for ll in load_levels]
+        
+        ax.bar(x_pos, values, bar_width, color=colors[alg_idx], 
+               label=alg.replace("_", " ").title(), edgecolor="white", linewidth=0.5)
+
+        # Add algorithm label below bars
+        for i, x in enumerate(x_pos):
+            ax.text(x, -0.03, alg[0].upper(), ha="center", va="top", fontsize=9, color="#555")
+
+    # X-axis labels (load levels)
+    ax.set_xticks(x_base + (n_alg - 1) * bar_width / 2)
+    ax.set_xticklabels([f"{int(ll * 100)}%" for ll in load_levels], fontsize=11)
+    ax.set_xlabel("Load Level", fontsize=12)
+    ax.set_ylabel("Child Utilization", fontsize=12)
+    ax.set_title("Child Replica Utilization by Load Level", fontsize=14)
+    ax.set_ylim(0, 1.05)
+    ax.axhline(y=1.0, color="green", linestyle="--", alpha=0.5, label="100%")
+    ax.legend(loc="upper left", fontsize=9)
+    ax.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {output_path}")
+
+    return fig
+
+
+def plot_client_to_parent_delay(
+    df: pd.DataFrame,
+    output_path: Optional[Path] = None,
+) -> plt.Figure:
+    """
+    Plot client-to-parent delay comparison across algorithms.
+
+    This measures the time from when the client sends a request to when
+    the parent replica receives it. High values indicate router bottleneck
+    (e.g., queue length probing blocking the request path).
+
+    Args:
+        df: Summary DataFrame.
+        output_path: Path to save figure.
+
+    Returns:
+        matplotlib Figure.
+    """
+    if "client_parent_delay_mean" not in df.columns:
+        print("Skipping client-to-parent delay plot: no data")
+        return None
+
+    # Format algorithm names for display
+    plot_df = df.copy()
+    plot_df["algorithm"] = plot_df["algorithm"].str.replace("_", " ").str.title()
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Plot 1: Mean delay by algorithm
+    ax1 = axes[0]
+    sns.barplot(data=plot_df, x="algorithm", y="client_parent_delay_mean", ax=ax1,
+                errorbar="sd", hue="algorithm", palette="husl", legend=False)
+    ax1.set_xlabel("")
+    ax1.set_ylabel("Client→Parent Delay (ms)", fontsize=12)
+    ax1.set_title("Mean Client→Parent Delay", fontsize=14)
+
+    # Plot 2: Percentiles by algorithm
+    ax2 = axes[1]
+    pct_cols = ["client_parent_delay_p50", "client_parent_delay_p90", "client_parent_delay_p99"]
+    pct_cols = [c for c in pct_cols if c in df.columns]
+    if pct_cols:
+        pct_df = plot_df.melt(id_vars=["algorithm"], value_vars=pct_cols,
+                              var_name="percentile", value_name="delay_ms")
+        pct_df["percentile"] = pct_df["percentile"].str.extract(r"_p(\d+)$")[0].apply(lambda x: f"p{x}")
+        sns.barplot(data=pct_df, x="algorithm", y="delay_ms", hue="percentile", ax=ax2)
+        ax2.legend(title="")
+    ax2.set_xlabel("")
+    ax2.set_ylabel("Client→Parent Delay (ms)", fontsize=12)
+    ax2.set_title("Client→Parent Delay Percentiles", fontsize=14)
+
+    plt.tight_layout()
+
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved figure to {output_path}")
+
+    return fig
+
+
+def plot_replica_coverage(
+    df: pd.DataFrame,
+    output_path: Optional[Path] = None,
+) -> plt.Figure:
+    """
+    Plot replica coverage (unique replica percentage) by algorithm.
+
+    This shows what percentage of expected replicas actually received requests.
+    Low coverage indicates routing is not reaching all replicas.
+
+    Args:
+        df: Summary DataFrame.
+        output_path: Path to save figure.
+
+    Returns:
+        matplotlib Figure.
+    """
+    if "child_unique_pct" not in df.columns:
+        print("Skipping replica coverage plot: no data")
+        return None
+
+    # Format algorithm names for display
+    plot_df = df.copy()
+    plot_df["algorithm"] = plot_df["algorithm"].str.replace("_", " ").str.title()
+
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    colors = {
-        "simulated": "#2ecc71",  # Green - actual work
-        "routing": "#f39c12",    # Orange - routing delay
-        "overhead": "#e74c3c",   # Red - other overhead
-    }
+    # Melt child and parent coverage into long format
+    coverage_cols = ["child_unique_pct", "parent_unique_pct"]
+    coverage_cols = [c for c in coverage_cols if c in df.columns]
+    
+    cov_df = plot_df.melt(id_vars=["algorithm"], value_vars=coverage_cols,
+                          var_name="replica_type", value_name="coverage_pct")
+    cov_df["replica_type"] = cov_df["replica_type"].map({
+        "child_unique_pct": "Child", "parent_unique_pct": "Parent"
+    })
 
-    algorithms = df["algorithm"].unique()
-    x = range(len(algorithms))
-    width = 0.6
-
-    simulated = []
-    routing = []
-    overhead = []
-
-    for alg in algorithms:
-        alg_df = df[df["algorithm"] == alg]
-        sim_mean = alg_df["simulated_latency_mean"].mean()
-        route_mean = alg_df["routing_delay_mean"].mean()
-        total_mean = alg_df["latency_mean"].mean()
-        other = max(0, total_mean - sim_mean - route_mean)
-
-        simulated.append(sim_mean)
-        routing.append(route_mean)
-        overhead.append(other)
-
-    # Stacked bar chart
-    ax.bar(x, simulated, width, label="Simulated Work", color=colors["simulated"])
-    ax.bar(x, routing, width, bottom=simulated, label="Routing Delay", color=colors["routing"])
-    ax.bar(x, overhead, width, bottom=[s + r for s, r in zip(simulated, routing)],
-           label="Other Overhead", color=colors["overhead"])
-
-    ax.set_xticks(x)
-    ax.set_xticklabels([a.replace("_", " ").title() for a in algorithms])
-    ax.set_ylabel("Latency (ms)", fontsize=12)
-    ax.set_title("Latency Breakdown by Algorithm", fontsize=14)
-    ax.legend(loc="upper right")
+    sns.barplot(data=cov_df, x="algorithm", y="coverage_pct", hue="replica_type",
+                ax=ax, errorbar="sd")
+    ax.set_xlabel("")
+    ax.set_ylabel("Replica Coverage (%)", fontsize=12)
+    ax.set_title("Percentage of Replicas Receiving Requests", fontsize=14)
+    ax.set_ylim(0, 105)
+    ax.axhline(y=100, color="green", linestyle="--", alpha=0.5, label="100%")
+    ax.legend(title="")
     ax.grid(axis="y", alpha=0.3)
 
     plt.tight_layout()
@@ -542,43 +765,69 @@ def generate_all_figures(
     plot_error_rate(df, path)
     generated.append(path)
 
-    # 5. Routing delay comparison
-    path = output_dir / "routing_delay_comparison.png"
-    plot_routing_delay_comparison(df, path)
+    # 5. Parent→Child delay comparison
+    path = output_dir / "parent_child_delay_comparison.png"
+    plot_parent_to_child_delay_comparison(df, path)
     generated.append(path)
 
-    # 6. Latency breakdown (simulated work vs routing vs overhead)
+    # 6. Latency breakdown (all components)
     path = output_dir / "latency_breakdown.png"
     plot_latency_breakdown(df, path)
     generated.append(path)
 
-    # 8. Algorithm heatmap (Large scale only)
+    # 7. Client-to-parent delay comparison
+    if "client_parent_delay_mean" in df.columns:
+        path = output_dir / "client_to_parent_delay.png"
+        fig = plot_client_to_parent_delay(df, path)
+        if fig:
+            generated.append(path)
+
+    # 8. Utilization comparison
+    if "child_util_mean" in df.columns:
+        path = output_dir / "utilization_comparison.png"
+        fig = plot_utilization_comparison(df, path)
+        if fig:
+            generated.append(path)
+
+    # 9. Replica coverage (unique replica percentage)
+    if "child_unique_pct" in df.columns:
+        path = output_dir / "replica_coverage.png"
+        fig = plot_replica_coverage(df, path)
+        if fig:
+            generated.append(path)
+
+    # 10. Algorithm heatmap (Large scale only)
     large_df = df[df["scale"] == "large"]
     if len(large_df) > 0:
         path = output_dir / "algorithm_heatmap_large.png"
         plot_algorithm_heatmap(large_df, path)
         generated.append(path)
 
-    # 9. Heatmaps for key metrics
+    # 11. Heatmaps for key metrics
     heatmap_metrics = [
         ("latency_p99", "RdYlGn_r"),
         ("child_jains", "RdYlGn"),
         ("error_rate", "RdYlGn_r"),
-        ("routing_delay_mean", "RdYlGn_r"),
+        ("parent_child_delay_mean", "RdYlGn_r"),
         ("simulated_latency_mean", "RdYlGn_r"),
     ]
 
+    # Add utilization heatmap if available
+    if "child_util_mean" in df.columns:
+        heatmap_metrics.append(("child_util_mean", "RdYlGn"))
+
     for metric, cmap in heatmap_metrics:
-        path = output_dir / f"heatmap_{metric}_algo_scale.png"
-        plot_heatmap(
-            df,
-            metric=metric,
-            row_var="algorithm",
-            col_var="scale",
-            output_path=path,
-            cmap=cmap,
-        )
-        generated.append(path)
+        if metric in df.columns:
+            path = output_dir / f"heatmap_{metric}_algo_scale.png"
+            plot_heatmap(
+                df,
+                metric=metric,
+                row_var="algorithm",
+                col_var="scale",
+                output_path=path,
+                cmap=cmap,
+            )
+            generated.append(path)
 
     print(f"\nGenerated {len(generated)} figures in {output_dir}")
     return generated
@@ -591,8 +840,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--input",
         type=Path,
-        default=RESULTS_DIR / "all_metrics.csv",
-        help="Input CSV file with aggregated metrics",
+        required=True,
+        help="Input CSV file with aggregated metrics (e.g., summary.csv from aggregate.py)",
     )
     parser.add_argument(
         "--output-dir",
