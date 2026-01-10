@@ -1,5 +1,5 @@
 """
-Aggregate metrics from raw experiment logs.
+Aggregate metrics from raw experiment logs using Ray Data for parallel processing.
 
 Supports reading from both local files and S3.
 
@@ -8,16 +8,20 @@ Computes:
 - Routing delay percentiles (time from Parent send to Child receive)
 - Throughput metrics (RPS, goodput, error rate)
 - Fairness metrics (CV, Jain's Index, Min/Max ratio)
+
+Performance: Uses Ray Data for parallel reading and Ray tasks for parallel aggregation.
 """
 
 import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+import ray
 
 
 @dataclass
@@ -119,27 +123,6 @@ def parse_s3_path(s3_path: str) -> tuple:
     bucket = path_parts[0]
     key = path_parts[1] if len(path_parts) > 1 else ""
     return bucket, key
-
-
-def read_csv_from_s3(s3_path: str) -> pd.DataFrame:
-    """
-    Read CSV file from S3 into pandas DataFrame.
-    
-    Args:
-        s3_path: S3 path to CSV file.
-    
-    Returns:
-        pandas DataFrame.
-    """
-    import boto3
-    
-    bucket, key = parse_s3_path(s3_path)
-    s3_client = boto3.client("s3")
-    
-    response = s3_client.get_object(Bucket=bucket, Key=key)
-    content = response["Body"].read().decode("utf-8")
-    
-    return pd.read_csv(io.StringIO(content))
 
 
 def read_json_from_s3(s3_path: str) -> dict:
@@ -524,11 +507,152 @@ def aggregate_from_dataframe(
     )
 
 
+# ============================================================================
+# Ray Data Parallel Aggregation
+# ============================================================================
+
+def _get_run_info_from_summary(summary_path: str) -> Tuple[str, str, dict]:
+    """
+    Extract run info from a summary.json file.
+    
+    Args:
+        summary_path: S3 path to summary.json file.
+    
+    Returns:
+        Tuple of (run_path, run_id, config).
+    """
+    summary = read_json_from_s3(summary_path)
+    run_config = summary.get("run_config", {})
+    run_id = run_config.get("run_id", "unknown")
+    config = run_config.get("config", {})
+    
+    # Add timing info to config
+    config["duration_s"] = run_config.get("duration_s", 60.0)
+    config["warmup_s"] = run_config.get("warmup_s", 10.0)
+    config["num_concurrent"] = run_config.get("config", {}).get("num_concurrent", 0)
+    
+    run_path = summary_path.rsplit("/", 1)[0] + "/"
+    return run_path, run_id, config
+
+
+@ray.remote
+def _aggregate_single_run_ray(
+    run_path: str,
+    run_id: str,
+    config: dict,
+) -> Optional[AggregatedMetrics]:
+    """
+    Ray task to aggregate a single run using Ray Data for parallel CSV reading.
+    
+    Args:
+        run_path: S3 path to run directory.
+        run_id: Run identifier.
+        config: Experiment configuration.
+    
+    Returns:
+        AggregatedMetrics or None if aggregation fails.
+    """
+    try:
+        # List CSV files for this run
+        csv_files = list_s3_files(run_path, suffix=".csv")
+        
+        if not csv_files:
+            print(f"No CSV files found for run {run_id}")
+            return None
+        
+        # Use Ray Data for parallel CSV reading
+        ds = ray.data.read_csv(csv_files)
+        
+        # Convert to pandas for aggregation (the data fits in memory per run)
+        combined_df = ds.to_pandas()
+        
+        return aggregate_from_dataframe(combined_df, run_id, config)
+    except Exception as e:
+        print(f"ERROR aggregating {run_id}: {e}")
+        return None
+
+
+def aggregate_runs_parallel_from_s3(
+    s3_prefix: str,
+    max_concurrent_runs: int = 16,
+) -> List[AggregatedMetrics]:
+    """
+    Aggregate metrics for all runs under an S3 prefix using Ray for parallelism.
+    
+    Uses Ray tasks to process multiple runs concurrently, and Ray Data within
+    each run for parallel CSV reading.
+    
+    Args:
+        s3_prefix: S3 path prefix (e.g., "s3://bucket/routing-study/")
+        max_concurrent_runs: Maximum number of runs to process concurrently.
+    
+    Returns:
+        List of AggregatedMetrics for all successful runs.
+    """
+    # Ensure Ray is initialized
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True)
+    
+    # Ensure path ends with /
+    if not s3_prefix.endswith("/"):
+        s3_prefix += "/"
+    
+    # Find all summary.json files (one per run)
+    print(f"Listing runs under {s3_prefix}...")
+    summary_files = list_s3_files(s3_prefix, suffix="summary.json")
+    
+    if not summary_files:
+        print(f"No runs found under {s3_prefix}")
+        return []
+    
+    print(f"Found {len(summary_files)} runs to aggregate")
+    
+    # Extract run info from all summaries
+    print("Reading run configurations...")
+    run_infos = []
+    for summary_path in summary_files:
+        try:
+            run_path, run_id, config = _get_run_info_from_summary(summary_path)
+            run_infos.append((run_path, run_id, config))
+        except Exception as e:
+            print(f"ERROR reading summary {summary_path}: {e}")
+    
+    print(f"Processing {len(run_infos)} runs in parallel...")
+    
+    # Submit all runs as Ray tasks
+    futures = []
+    for run_path, run_id, config in run_infos:
+        future = _aggregate_single_run_ray.remote(run_path, run_id, config)
+        futures.append(future)
+    
+    # Collect results with progress reporting
+    aggregated = []
+    completed = 0
+    total = len(futures)
+    
+    while futures:
+        # Wait for next batch of results
+        ready, futures = ray.wait(futures, num_returns=min(max_concurrent_runs, len(futures)))
+        results = ray.get(ready)
+        
+        for metrics in results:
+            completed += 1
+            if metrics is not None:
+                aggregated.append(metrics)
+                print(f"[{completed}/{total}] Aggregated {metrics.run_id}")
+            else:
+                print(f"[{completed}/{total}] Skipped (failed)")
+    
+    print(f"\nSuccessfully aggregated {len(aggregated)} of {total} runs")
+    return aggregated
+
+
 def aggregate_run_from_s3(s3_run_path: str) -> AggregatedMetrics:
     """
-    Aggregate metrics for a single experiment run from S3.
+    Aggregate metrics for a single experiment run from S3 using Ray Data.
     
     Reads all task_*.csv files and summary.json from the run path.
+    Uses Ray Data for parallel CSV reading.
     
     Args:
         s3_run_path: S3 path to run directory (e.g., "s3://bucket/prefix/exp_id/run_id/")
@@ -536,6 +660,10 @@ def aggregate_run_from_s3(s3_run_path: str) -> AggregatedMetrics:
     Returns:
         AggregatedMetrics for this run.
     """
+    # Ensure Ray is initialized
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True)
+    
     # Ensure path ends with /
     if not s3_run_path.endswith("/"):
         s3_run_path += "/"
@@ -553,65 +681,22 @@ def aggregate_run_from_s3(s3_run_path: str) -> AggregatedMetrics:
     config["warmup_s"] = run_config.get("warmup_s", 10.0)
     config["num_concurrent"] = run_config.get("config", {}).get("num_concurrent", 0)
     
-    # List and read all task CSV files
+    # List CSV files
     task_files = list_s3_files(s3_run_path, suffix=".csv")
     
     if not task_files:
         raise ValueError(f"No task CSV files found at {s3_run_path}")
     
-    print(f"Reading {len(task_files)} task files from {s3_run_path}")
+    print(f"Reading {len(task_files)} task files from {s3_run_path} using Ray Data")
     
-    # Combine all task DataFrames
-    dfs = []
-    for task_file in task_files:
-        df = read_csv_from_s3(task_file)
-        dfs.append(df)
+    # Use Ray Data for parallel CSV reading
+    ds = ray.data.read_csv(task_files)
     
-    combined_df = pd.concat(dfs, ignore_index=True)
+    # Convert to pandas for aggregation
+    combined_df = ds.to_pandas()
     print(f"Combined {len(combined_df)} total requests")
     
     return aggregate_from_dataframe(combined_df, run_id, config)
-
-
-def aggregate_all_runs_from_s3(
-    s3_experiment_path: str,
-) -> List[AggregatedMetrics]:
-    """
-    Aggregate metrics for all runs under an experiment path in S3.
-    
-    Args:
-        s3_experiment_path: S3 path to experiment directory 
-            (e.g., "s3://bucket/prefix/experiment_id/")
-    
-    Returns:
-        List of AggregatedMetrics for all runs.
-    """
-    # Ensure path ends with /
-    if not s3_experiment_path.endswith("/"):
-        s3_experiment_path += "/"
-    
-    # Find all summary.json files (one per run)
-    summary_files = list_s3_files(s3_experiment_path, suffix="summary.json")
-    
-    if not summary_files:
-        print(f"No runs found at {s3_experiment_path}")
-        return []
-    
-    print(f"Found {len(summary_files)} runs to aggregate")
-    
-    aggregated = []
-    for summary_path in summary_files:
-        # Extract run path from summary path
-        run_path = summary_path.rsplit("/", 1)[0] + "/"
-        
-        try:
-            metrics = aggregate_run_from_s3(run_path)
-            aggregated.append(metrics)
-            print(f"Aggregated {metrics.run_id}")
-        except Exception as e:
-            print(f"ERROR aggregating {run_path}: {e}")
-    
-    return aggregated
 
 
 def aggregate_experiment_prefix_from_s3(
@@ -620,7 +705,7 @@ def aggregate_experiment_prefix_from_s3(
     """
     Aggregate metrics for all experiments under a prefix in S3.
     
-    This finds all experiment_id/run_id/summary.json files under the prefix.
+    This is the main entry point for parallel aggregation using Ray.
     
     Args:
         s3_prefix: S3 path prefix (e.g., "s3://bucket/routing-study/")
@@ -628,32 +713,26 @@ def aggregate_experiment_prefix_from_s3(
     Returns:
         List of AggregatedMetrics for all runs.
     """
-    # Ensure path ends with /
-    if not s3_prefix.endswith("/"):
-        s3_prefix += "/"
+    return aggregate_runs_parallel_from_s3(s3_prefix)
+
+
+# Legacy function for backward compatibility
+def aggregate_all_runs_from_s3(
+    s3_experiment_path: str,
+) -> List[AggregatedMetrics]:
+    """
+    Aggregate metrics for all runs under an experiment path in S3.
     
-    # Find all summary.json files
-    summary_files = list_s3_files(s3_prefix, suffix="summary.json")
+    This is a legacy wrapper that now uses parallel processing.
     
-    if not summary_files:
-        print(f"No runs found under {s3_prefix}")
-        return []
+    Args:
+        s3_experiment_path: S3 path to experiment directory 
+            (e.g., "s3://bucket/prefix/experiment_id/")
     
-    print(f"Found {len(summary_files)} runs to aggregate")
-    
-    aggregated = []
-    for summary_path in summary_files:
-        # Extract run path from summary path
-        run_path = summary_path.rsplit("/", 1)[0] + "/"
-        
-        try:
-            metrics = aggregate_run_from_s3(run_path)
-            aggregated.append(metrics)
-            print(f"Aggregated {metrics.run_id}")
-        except Exception as e:
-            print(f"ERROR aggregating {run_path}: {e}")
-    
-    return aggregated
+    Returns:
+        List of AggregatedMetrics for all runs.
+    """
+    return aggregate_runs_parallel_from_s3(s3_experiment_path)
 
 
 # ============================================================================
@@ -890,7 +969,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Aggregate experiment results from S3 or local files",
+        description="Aggregate experiment results from S3 or local files using Ray Data",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -903,6 +982,9 @@ Examples:
   # Aggregate with custom output paths
   python -m analysis.aggregate s3://bucket/routing-study/20260110_123456/ \\
       --output /tmp/metrics.json --csv-output /tmp/summary.csv
+      
+  # Control parallelism
+  python -m analysis.aggregate s3://bucket/routing-study/ --max-concurrent 32
 """,
     )
     parser.add_argument(
@@ -922,43 +1004,67 @@ Examples:
         default=None,
         help="Output path for summary CSV. Can be local or S3 path.",
     )
+    parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=16,
+        help="Maximum number of runs to process concurrently (default: 16).",
+    )
 
     args = parser.parse_args()
+
+    # Initialize Ray
+    if not ray.is_initialized():
+        ray.init(ignore_reinit_error=True)
+        print(f"Ray initialized with {ray.cluster_resources().get('CPU', 0)} CPUs")
 
     # Aggregate based on source type
     if args.source.startswith("s3://"):
         print(f"Aggregating from S3: {args.source}")
-        metrics = aggregate_experiment_prefix_from_s3(args.source)
+        metrics = aggregate_runs_parallel_from_s3(
+            args.source,
+            max_concurrent_runs=args.max_concurrent,
+        )
     else:
-        # Legacy local file support
-        from pathlib import Path
+        # Legacy local file support (still uses Ray Data for reading)
         results_dir = Path(args.source)
         raw_dir = results_dir / "raw"
         manifests_dir = results_dir / "manifests"
         
-        metrics = []
-        for csv_path in sorted(raw_dir.glob("*.csv")):
-            run_id = csv_path.stem
-            manifest_path = manifests_dir / f"{run_id}.json"
+        csv_files = sorted(raw_dir.glob("*.csv"))
+        
+        if csv_files:
+            # Use Ray Data to read all CSVs in parallel
+            print(f"Reading {len(csv_files)} CSV files using Ray Data")
             
-            if not manifest_path.exists():
-                print(f"WARNING: No manifest for {run_id}, skipping")
-                continue
-            
-            try:
-                df = pd.read_csv(csv_path)
-                with open(manifest_path) as f:
-                    manifest = json.load(f)
+            metrics = []
+            for csv_path in csv_files:
+                run_id = csv_path.stem
+                manifest_path = manifests_dir / f"{run_id}.json"
                 
-                m = aggregate_from_dataframe(
-                    df, 
-                    manifest["run_id"],
-                    manifest["config"],
-                )
-                metrics.append(m)
-                print(f"Aggregated {run_id}")
-            except Exception as e:
-                print(f"ERROR aggregating {run_id}: {e}")
+                if not manifest_path.exists():
+                    print(f"WARNING: No manifest for {run_id}, skipping")
+                    continue
+                
+                try:
+                    # Use Ray Data for reading
+                    ds = ray.data.read_csv(str(csv_path))
+                    df = ds.to_pandas()
+                    
+                    with open(manifest_path) as f:
+                        manifest = json.load(f)
+                    
+                    m = aggregate_from_dataframe(
+                        df, 
+                        manifest["run_id"],
+                        manifest["config"],
+                    )
+                    metrics.append(m)
+                    print(f"Aggregated {run_id}")
+                except Exception as e:
+                    print(f"ERROR aggregating {run_id}: {e}")
+        else:
+            metrics = []
 
     if not metrics:
         print("No results found to aggregate")

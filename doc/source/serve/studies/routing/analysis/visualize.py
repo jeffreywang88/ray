@@ -503,24 +503,24 @@ def plot_latency_breakdown(
                    label=label if alg_idx == 0 else "", edgecolor="white", linewidth=0.5)
             bottom += values
 
-        # Add algorithm label below bars
-        for i, x in enumerate(x_pos):
-            ax.text(x, -3, alg[0].upper(), ha="center", va="top", fontsize=9, color="#555")
+    # Create x-tick labels combining load level and algorithm
+    x_tick_positions = []
+    x_tick_labels = []
+    for ll_idx, ll in enumerate(load_levels):
+        for alg_idx, alg in enumerate(algorithms):
+            x_tick_positions.append(x_base[ll_idx] + alg_idx * bar_width)
+            alg_name = alg.replace("_", " ").title()
+            x_tick_labels.append(f"{int(ll * 100)}% - {alg_name}")
 
-    # X-axis labels (load levels)
-    ax.set_xticks(x_base + (n_alg - 1) * bar_width / 2)
-    ax.set_xticklabels([f"{int(ll * 100)}%" for ll in load_levels], fontsize=11)
-    ax.set_xlabel("Load Level", fontsize=12)
+    # X-axis labels (load level + algorithm)
+    ax.set_xticks(x_tick_positions)
+    ax.set_xticklabels(x_tick_labels, fontsize=9, rotation=45, ha="right")
+    ax.set_xlabel("Load Level / Algorithm", fontsize=12)
     ax.set_ylabel("Latency (ms)", fontsize=12)
     ax.set_title("End-to-End Latency Breakdown", fontsize=14)
 
     # Legend
     ax.legend(loc="upper left", fontsize=9, ncol=2)
-
-    # Algorithm key
-    alg_key = " | ".join([f"{a[0].upper()}={a.replace('_', ' ').title()}" for a in algorithms])
-    ax.text(0.99, 0.98, alg_key, transform=ax.transAxes, fontsize=9,
-            ha="right", va="top", color="#555")
 
     ax.grid(axis="y", alpha=0.3)
     plt.tight_layout()
