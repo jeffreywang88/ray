@@ -10,10 +10,13 @@ Defines all 135 experiment configurations across:
 - 3 load levels (50%, 75%, 100%)
 """
 
+import hashlib
+import math
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Generator, List, Optional
-import hashlib
 
 
 class Algorithm(Enum):
@@ -39,7 +42,7 @@ class Scale(Enum):
     SMALL = "small"
     MEDIUM = "medium"
     LARGE = "large"
-    # XLARGE = "xlarge" # disbale untill we convert script to anyscale service and then we can use anyscale SDK to launch service
+    XLARGE = "xlarge" # disbale untill we convert script to anyscale service and then we can use anyscale SDK to launch service
     # and hit the AWS ALB endpoint. For now we are always hitting the local endpoint, which hits the same HAProxy endpoint.
 
 
@@ -71,7 +74,7 @@ SCALE_REPLICAS = {
     Scale.SMALL: 8,
     Scale.MEDIUM: 32,
     Scale.LARGE: 128,
-    # Scale.XLARGE: 512, # disable untill we convert script to anyscale service and then we can use anyscale SDK to launch service
+    Scale.XLARGE: 512, # disable untill we convert script to anyscale service and then we can use anyscale SDK to launch service
     # and hit the AWS ALB endpoint. For now we are always hitting the local endpoint, which hits the same HAProxy endpoint.
 }
 
@@ -87,7 +90,14 @@ RPS_PER_REPLICA = 300
 
 # Concurrent users per replica for closed-loop load testing
 # This controls how much load we put on each replica
-CONCURRENT_PER_REPLICA = 8
+CONCURRENT_PER_REPLICA = 5
+
+# Maximum concurrent users per Ray task for load generation
+# Each task runs an async event loop with this many concurrent user coroutines
+MAX_USERS_PER_TASK = 96
+
+# CPU per replica (both Parent and Child deployments)
+CPU_PER_REPLICA = 1
 
 
 @dataclass(frozen=True)
@@ -155,9 +165,19 @@ class ExperimentConfig:
         return self.parent_replicas + self.child_replicas
 
     @property
-    def cpus_required(self) -> float:
-        """CPUs required for this configuration (0.25 per replica)."""
-        return self.total_replicas * 0.25
+    def cpus_required(self) -> int:
+        """CPUs required for deployments (1 CPU per replica)."""
+        return self.total_replicas * CPU_PER_REPLICA
+
+    @property
+    def num_tasks(self) -> int:
+        """Number of Ray tasks needed for load generation."""
+        return max(1, math.ceil(self.num_concurrent / MAX_USERS_PER_TASK))
+
+    @property
+    def ingress_cpus(self) -> int:
+        """CPUs needed for IngressDeployment (tasks + 1 for ingress itself)."""
+        return self.num_tasks + 1
 
     @property
     def config_hash(self) -> str:
@@ -180,8 +200,11 @@ class ExperimentConfig:
             "parent_replicas": self.parent_replicas,
             "child_replicas": self.child_replicas,
             "num_concurrent": self.num_concurrent,
+            "num_tasks": self.num_tasks,
+            "ingress_cpus": self.ingress_cpus,
             "target_rps": self.target_rps,
             "theoretical_max_rps": self.theoretical_max_rps,
+            "cpus_required": self.cpus_required,
             "config_hash": self.config_hash,
         }
 
@@ -189,6 +212,89 @@ class ExperimentConfig:
         return (
             f"Config[{self.algorithm.value}, {self.scale.value}, {self.ratio.value}, "
             f"{self.topology.value}, locality={self.locality}, load={self.load_level.value}]"
+        )
+
+
+@dataclass
+class ExperimentRunConfig:
+    """
+    Full configuration for an experiment run, including S3 output settings.
+    
+    Combines ExperimentConfig with runtime parameters like S3 bucket and run ID.
+    """
+    
+    # Experiment configuration
+    config: ExperimentConfig
+    
+    # Run identification
+    experiment_id: str  # Logical experiment name (e.g., "pow2_large_75pct")
+    run_id: str  # Unique run ID (generated if not provided)
+    repetition: int = 1
+    
+    # S3 output configuration
+    s3_bucket: str = "abrar-test-bucket-123"
+    s3_prefix: str = "routing-study"
+    
+    # Timing parameters
+    warmup_s: float = 10.0
+    duration_s: float = 60.0
+    
+    @property
+    def s3_experiment_path(self) -> str:
+        """S3 path for this experiment's results (all runs)."""
+        if not self.s3_bucket:
+            raise ValueError("s3_bucket must be set")
+        return f"s3://{self.s3_bucket}/{self.s3_prefix}/{self.experiment_id}"
+    
+    @property
+    def s3_output_path(self) -> str:
+        """S3 path for this specific experiment run's results."""
+        if not self.s3_bucket:
+            raise ValueError("s3_bucket must be set")
+        return f"s3://{self.s3_bucket}/{self.s3_prefix}/{self.experiment_id}/{self.run_id}"
+    
+    @property
+    def num_concurrent(self) -> int:
+        """Number of concurrent users."""
+        return self.config.num_concurrent
+    
+    @property
+    def num_tasks(self) -> int:
+        """Number of Ray tasks needed."""
+        return self.config.num_tasks
+    
+    @property
+    def ingress_cpus(self) -> int:
+        """CPUs needed for ingress deployment."""
+        return self.config.ingress_cpus
+    
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "experiment_id": self.experiment_id,
+            "run_id": self.run_id,
+            "repetition": self.repetition,
+            "s3_bucket": self.s3_bucket,
+            "s3_prefix": self.s3_prefix,
+            "s3_output_path": self.s3_output_path if self.s3_bucket else None,
+            "warmup_s": self.warmup_s,
+            "duration_s": self.duration_s,
+            "config": self.config.to_dict(),
+        }
+    
+    @staticmethod
+    def generate_run_id() -> str:
+        """Generate unique run ID."""
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        short_uuid = uuid.uuid4().hex[:6]
+        return f"{timestamp}_{short_uuid}"
+    
+    @staticmethod
+    def generate_experiment_id(config: ExperimentConfig) -> str:
+        """Generate experiment ID from config."""
+        return (
+            f"{config.algorithm.value}_{config.scale.value}_{config.ratio.value}_"
+            f"{config.topology.value}_loc{config.locality}_{int(config.load_level.value * 100)}pct"
         )
 
 
@@ -216,13 +322,13 @@ def generate_medium_scale_configs() -> Generator[ExperimentConfig, None, None]:
 
 def generate_other_scale_configs() -> Generator[ExperimentConfig, None, None]:
     """
-    Generate configurations for Small, Medium, XLarge scales.
+    Generate configurations for Small, Large, XLarge scales.
 
     These scales use fixed settings: 1:1 ratio, Packed topology, No locality.
     - 3 algorithms × 3 scales × 3 load levels = 27 configs
     """
     for algorithm in Algorithm:
-        for scale in [Scale.SMALL, Scale.LARGE]: #, Scale.XLARGE]:
+        for scale in [Scale.SMALL, Scale.LARGE, Scale.XLARGE]:
             for load_level in LoadLevel:
                 yield ExperimentConfig(
                     algorithm=algorithm,
@@ -244,6 +350,8 @@ def generate_all_configs() -> List[ExperimentConfig]:
     configs = []
     configs.extend(generate_medium_scale_configs())
     configs.extend(generate_other_scale_configs())
+    # Sort by CPUs required (descending) to run largest experiments first
+    configs.sort(key=lambda c: c.cpus_required, reverse=True)
     return configs
 
 

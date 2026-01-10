@@ -18,10 +18,12 @@ from ray import serve
 from ray.serve.config import RequestRouterConfig
 from ray.serve.handle import DeploymentHandle
 
+from src.configurations import CPU_PER_REPLICA
+
 
 @serve.deployment(
-    ray_actor_options={"num_cpus": 0.25},
-    max_ongoing_requests=1000,
+    ray_actor_options={"num_cpus": CPU_PER_REPLICA, "resources": {"deployments": 1}},
+    max_ongoing_requests=5,
     max_queued_requests=-1,
 )
 class ChildDeployment:
@@ -65,8 +67,8 @@ class ChildDeployment:
 
 
 @serve.deployment(
-    ray_actor_options={"num_cpus": 0.25},
-    max_ongoing_requests=1000,
+    ray_actor_options={"num_cpus": CPU_PER_REPLICA, "resources": {"deployments": 1}},
+    max_ongoing_requests=5,
     max_queued_requests=-1,
 )
 class ParentDeployment:
@@ -93,10 +95,35 @@ class ParentDeployment:
         self.node_id = ray.get_runtime_context().get_node_id()
         self.request_count = 0
 
-    async def __call__(self, request) -> dict:
+    def health(self) -> dict:
+        """Health check endpoint - returns replica info without calling child."""
+        return {
+            "status": "healthy",
+            "replica_id": self.replica_id,
+            "node_id": self.node_id,
+            "request_count": self.request_count,
+        }
+
+    async def __call__(self, client_send_time: float = None) -> dict:
+        """
+        Handle incoming request.
+        
+        Args:
+            client_send_time: Wall-clock time when client sent the request (for routing delay).
+        
+        Returns:
+            Response dict with parent/child replica and timing info.
+        """
+        # Record when parent receives the request (wall-clock for cross-process timing)
+        parent_receive_time = time.time()
         self.request_count += 1
 
-        # Record send time for routing delay measurement (wall-clock for cross-process timing)
+        # Calculate client → parent routing delay
+        client_to_parent_delay_ms = None
+        if client_send_time is not None:
+            client_to_parent_delay_ms = (parent_receive_time - client_send_time) * 1000
+
+        # Record send time for parent → child routing delay measurement
         parent_send_time = time.time()
         
         # Forward to child and get response
@@ -104,6 +131,9 @@ class ParentDeployment:
             self.replica_id, self.node_id, parent_send_time
         )
 
+        # Add client → parent delay to response
+        child_response["client_to_parent_delay_ms"] = client_to_parent_delay_ms
+        
         return child_response
 
 
@@ -173,7 +203,7 @@ def run_app(
         prefer_local_routing=prefer_local_routing,
         request_router_class=request_router_class,
     )
-    serve.run(app, blocking=blocking)
+    serve.run(app, blocking=blocking, name="routing-study")
     print(f"Application deployed with {parent_replicas} parent, {child_replicas} child replicas")
     print("Send requests to http://localhost:8000")
 

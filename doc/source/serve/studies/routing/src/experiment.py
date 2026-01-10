@@ -4,17 +4,15 @@ Experiment runner for routing algorithm study.
 Orchestrates a single experiment run:
 1. Configure environment (topology)
 2. Deploy Serve application
-3. Run load generator
-4. Collect results
-5. Write manifest
-6. Shutdown
+3. Run load generator via Ray tasks
+4. Write summary to S3
+5. Shutdown
 """
 
 import asyncio
 import json
 import os
 import time
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -23,157 +21,140 @@ import ray
 from ray import serve
 
 from src.app import build_app
-from src.configurations import ExperimentConfig, Topology
+from src.configurations import (
+    ExperimentConfig,
+    ExperimentRunConfig,
+    Topology,
+)
 from src.loadgen import (
-    LoadTestResult,
-    run_load_test_sync,
-    save_results_to_csv,
+    LoadTestSummary,
+    run_load_test,
 )
 
 
-# Default paths - use /tmp to avoid packaging large results with Ray runtime_env
-RESULTS_DIR = Path("/tmp/routing_results")
-RAW_DIR = RESULTS_DIR / "raw"
-MANIFESTS_DIR = RESULTS_DIR / "manifests"
-
-
-def generate_run_id() -> str:
-    """Generate unique run ID."""
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    short_uuid = uuid.uuid4().hex[:6]
-    return f"{timestamp}_{short_uuid}"
-
-
-def write_manifest(
-    run_id: str,
-    config: ExperimentConfig,
-    repetition: int,
-    output_dir: Path = MANIFESTS_DIR,
-) -> Path:
+def delete_s3_prefix(s3_path: str) -> int:
     """
-    Write manifest file for an experiment run.
-
+    Delete all objects under an S3 prefix.
+    
     Args:
-        run_id: Unique identifier for this run.
-        config: Experiment configuration.
-        repetition: Repetition number (1-indexed).
-        output_dir: Directory to write manifest to.
-
+        s3_path: S3 path prefix (e.g., "s3://bucket/prefix/")
+    
     Returns:
-        Path to the written manifest file.
+        Number of objects deleted.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
+    import boto3
+    
+    if not s3_path.startswith("s3://"):
+        raise ValueError(f"Invalid S3 path: {s3_path}")
+    
+    # Parse S3 path
+    path_parts = s3_path[5:].split("/", 1)
+    bucket = path_parts[0]
+    prefix = path_parts[1] if len(path_parts) > 1 else ""
+    
+    # Ensure prefix ends with /
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    
+    s3_client = boto3.client("s3")
+    
+    # List and delete all objects under the prefix
+    deleted_count = 0
+    paginator = s3_client.get_paginator("list_objects_v2")
+    
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        objects = page.get("Contents", [])
+        if not objects:
+            continue
+        
+        # Delete in batches of 1000 (S3 limit)
+        delete_keys = [{"Key": obj["Key"]} for obj in objects]
+        s3_client.delete_objects(
+            Bucket=bucket,
+            Delete={"Objects": delete_keys}
+        )
+        deleted_count += len(delete_keys)
+    
+    return deleted_count
 
-    manifest = {
-        "run_id": run_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "repetition": repetition,
-        "config": config.to_dict(),
-    }
 
-    manifest_path = output_dir / f"{run_id}.json"
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
-
-    print(f"Wrote manifest to {manifest_path}")
-    return manifest_path
-
-
-def write_results_summary(
-    run_id: str,
-    config: ExperimentConfig,
-    results: LoadTestResult,
-    output_dir: Path = RESULTS_DIR / "aggregated",
-) -> Path:
+def write_summary_to_s3(
+    run_config: ExperimentRunConfig,
+    load_summary: LoadTestSummary,
+) -> str:
     """
-    Write summary metrics for an experiment run.
-
+    Write experiment summary to S3.
+    
     Args:
-        run_id: Unique identifier for this run.
-        config: Experiment configuration.
-        results: Load test results.
-        output_dir: Directory to write summary to.
-
+        run_config: Experiment run configuration.
+        load_summary: Load test summary from tasks.
+    
     Returns:
-        Path to the written summary file.
+        S3 path to the summary file.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Compute latency percentiles from successful requests
-    successful_latencies = [
-        r.latency_ms for r in results.steady_state_results if r.success
-    ]
-
-    if successful_latencies:
-        successful_latencies.sort()
-        n = len(successful_latencies)
-        latency_stats = {
-            "p50": successful_latencies[int(n * 0.50)],
-            "p90": successful_latencies[int(n * 0.90)],
-            "p95": successful_latencies[int(n * 0.95)],
-            "p99": successful_latencies[int(n * 0.99)] if n >= 100 else successful_latencies[-1],
-            "max": successful_latencies[-1],
-            "min": successful_latencies[0],
-            "mean": sum(successful_latencies) / n,
-        }
-    else:
-        latency_stats = {}
-
+    import boto3
+    
     summary = {
-        "run_id": run_id,
-        "config": config.to_dict(),
-        "throughput": {
-            "num_concurrent": results.num_concurrent,
-            "achieved_rps": results.achieved_rps,
-            "goodput": results.goodput,
-            "total_requests": results.total_requests,
-            "successful_requests": results.successful_requests,
-            "failed_requests": results.failed_requests,
-            "error_rate": results.error_rate,
-        },
-        "latency_ms": latency_stats,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "run_config": run_config.to_dict(),
+        "load_summary": load_summary.to_dict(),
     }
-
-    summary_path = output_dir / f"{run_id}.json"
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-
-    print(f"Wrote summary to {summary_path}")
-    return summary_path
+    
+    s3_path = f"{run_config.s3_output_path}/summary.json"
+    
+    # Parse S3 path
+    path_parts = s3_path[5:].split("/", 1)
+    bucket = path_parts[0]
+    key = path_parts[1]
+    
+    s3_client = boto3.client("s3")
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(summary, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+    
+    print(f"Wrote summary to {s3_path}")
+    return s3_path
 
 
 async def wait_for_serve_ready(
-    url: str = "http://localhost:8000",
+    app_name: str = "routing-study",
     timeout_s: float = 120.0,
     check_interval_s: float = 2.0,
 ) -> bool:
     """
-    Wait for Serve application to be ready.
+    Wait for Serve application to be ready by trying to get the app handle.
 
     Args:
-        url: URL to health check.
+        app_name: Name of the app to check.
         timeout_s: Maximum time to wait.
         check_interval_s: Interval between checks.
 
     Returns:
         True if ready, False if timeout.
     """
-    import aiohttp
-
     start_time = time.time()
-    print(f"Waiting for Serve to be ready at {url}...")
+    print(f"Waiting for Serve app '{app_name}' to be ready...")
 
     while time.time() - start_time < timeout_s:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5.0)) as response:
-                    if response.status == 200:
-                        print(f"Serve is ready (took {time.time() - start_time:.1f}s)")
-                        return True
-                    else:
-                        print(f"  Health check returned status {response.status}")
+            # Try to get the app handle - this will work when the app is ready
+            handle = serve.get_app_handle(app_name)
+            
+            # Try calling the health endpoint to verify it's actually working
+            # This ensures replicas are ready, not just registered
+            response = handle.health.remote()
+            result = await response
+            
+            print(f"Serve is ready (took {time.time() - start_time:.1f}s)")
+            return True
         except Exception as e:
-            print(f"  Health check failed: {type(e).__name__}: {e}")
+            elapsed = time.time() - start_time
+            # Show more detail for debugging
+            error_msg = str(e)[:100] if str(e) else type(e).__name__
+            print(f"  [{elapsed:.1f}s] Not ready: {error_msg}")
 
         await asyncio.sleep(check_interval_s)
 
@@ -182,43 +163,47 @@ async def wait_for_serve_ready(
 
 
 async def run_experiment(
-    config: ExperimentConfig,
-    repetition: int = 1,
-    warmup_duration_s: float = 10.0,
-    steady_state_duration_s: float = 60.0,
-    results_dir: Path = RESULTS_DIR,
-    run_id: Optional[str] = None,
-) -> Optional[str]:
+    run_config: ExperimentRunConfig,
+    clear_s3: bool = False,
+) -> Optional[LoadTestSummary]:
     """
     Run a single experiment with the given configuration.
 
     Args:
-        config: Experiment configuration.
-        repetition: Repetition number (1-indexed).
-        warmup_duration_s: Duration of warmup period.
-        steady_state_duration_s: Duration of steady state measurement.
-        results_dir: Base directory for results.
-        run_id: Optional run ID (generated if not provided).
+        run_config: Full experiment run configuration including S3 settings.
+        clear_s3: If True, delete existing files at the S3 output path before running.
 
     Returns:
-        Run ID if successful, None if failed.
+        LoadTestSummary if successful, None if failed.
     """
-    run_id = run_id or generate_run_id()
-
+    config = run_config.config
+    
     print(f"\n{'='*60}")
-    print(f"Starting experiment: {run_id}")
+    print(f"Starting experiment: {run_config.experiment_id}")
+    print(f"Run ID: {run_config.run_id}")
     print(f"Configuration: {config}")
-    print(f"Repetition: {repetition}")
+    print(f"Repetition: {run_config.repetition}")
+    print(f"S3 Output: {run_config.s3_output_path}")
     print(f"{'='*60}\n")
 
     try:
+        # Step 0a: Clear existing S3 files if requested (clears ALL runs for this experiment)
+        if clear_s3:
+            print(f"Clearing existing files at {run_config.s3_experiment_path}...")
+            deleted = delete_s3_prefix(run_config.s3_experiment_path)
+            print(f"  Deleted {deleted} objects")
+        
+        # Step 0b: Set environment for faster shutdown (proxy drain period)
+        os.environ["RAY_SERVE_PROXY_MIN_DRAINING_PERIOD_S"] = "0"
+        
         # Step 1: Set environment for topology
         if config.topology == Topology.PACKED:
             os.environ["RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY"] = "1"
         else:
             os.environ["RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY"] = "0"
 
-        print(f"Set RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY={os.environ['RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY']}")
+        print(f"Set RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY="
+              f"{os.environ['RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY']}")
 
         # Step 2: Build and deploy application
         print(f"\nDeploying application with {config.parent_replicas} parent, "
@@ -230,67 +215,46 @@ async def run_experiment(
             prefer_local_routing=config.locality,
             request_router_class=config.algorithm.get_router_class(),
         )
-        serve.run(app)
+        serve.run(app, name="routing-study")
 
         # Step 3: Wait for application to be ready
-        ready = await wait_for_serve_ready()
+        ready = await wait_for_serve_ready(app_name="routing-study")
         if not ready:
             print("ERROR: Serve application failed to become ready")
             return None
 
-        # Step 4: Write manifest before running load test
-        write_manifest(
-            run_id=run_id,
-            config=config,
-            repetition=repetition,
-            output_dir=results_dir / "manifests",
+        # Step 4: Run load test using Ray tasks
+        print(f"\nRunning load test:")
+        print(f"  Concurrent users: {run_config.num_concurrent}")
+        print(f"  Tasks: {run_config.num_tasks}")
+        print(f"  Warmup: {run_config.warmup_s}s")
+        print(f"  Duration: {run_config.duration_s}s")
+        
+        load_summary = run_load_test(
+            parent_app_name="routing-study",
+            num_concurrent=run_config.num_concurrent,
+            duration_s=run_config.duration_s,
+            warmup_s=run_config.warmup_s,
+            s3_output_path=run_config.s3_output_path,
         )
 
-        # Step 5: Run load test (uses multi-process for high concurrency automatically)
-        print(f"\nRunning closed-loop load test with {config.num_concurrent} concurrent users...")
-        results = run_load_test_sync(
-            num_concurrent=config.num_concurrent,
-            warmup_duration_s=warmup_duration_s,
-            steady_state_duration_s=steady_state_duration_s,
-        )
+        # Step 5: Write summary to S3
+        write_summary_to_s3(run_config, load_summary)
 
-        # Step 6: Save raw results
-        raw_path = results_dir / "raw" / f"{run_id}.csv"
-        save_results_to_csv(results, raw_path)
-
-        # Step 7: Save summary
-        write_results_summary(
-            run_id=run_id,
-            config=config,
-            results=results,
-            output_dir=results_dir / "aggregated",
-        )
-
-        # Step 8: Print summary
+        # Step 6: Print summary
         print(f"\n{'='*60}")
-        print(f"Experiment {run_id} complete!")
+        print(f"Experiment {run_config.run_id} complete!")
         print(f"{'='*60}")
-        print(f"Concurrent users: {config.num_concurrent}")
-        print(f"Achieved RPS: {results.achieved_rps:.1f}")
-        print(f"Goodput: {results.goodput:.1f}")
-        print(f"Error rate: {results.error_rate:.2%}")
-        print(f"Total requests: {results.total_requests}")
-        
-        # Compute and print latency stats from successful requests
-        successful = [r for r in results.steady_state_results if r.success]
-        if successful:
-            latencies = [r.latency_ms for r in successful]
-            avg_latency = sum(latencies) / len(latencies)
-            print(f"Avg latency: {avg_latency:.2f}ms")
-            
-            routing_delays = [r.routing_delay_ms for r in successful if r.routing_delay_ms is not None]
-            if routing_delays:
-                avg_routing_delay = sum(routing_delays) / len(routing_delays)
-                print(f"Avg routing delay: {avg_routing_delay:.2f}ms")
-        
+        print(f"Concurrent users: {run_config.num_concurrent}")
+        print(f"Total requests: {load_summary.total_requests}")
+        print(f"Successful: {load_summary.total_successful}")
+        print(f"Failed: {load_summary.total_failed}")
+        print(f"Error rate: {load_summary.error_rate:.2%}")
+        print(f"Achieved RPS: {load_summary.achieved_rps:.1f}")
+        print(f"Results: {run_config.s3_output_path}")
         print(f"{'='*60}\n")
 
-        return run_id
+        return load_summary
 
     except Exception as e:
         print(f"ERROR: Experiment failed with exception: {e}")
@@ -299,43 +263,81 @@ async def run_experiment(
         return None
 
     finally:
-        # Step 9: Shutdown Serve and Ray for clean state between experiments
+        # Step 7: Shutdown Serve for clean state between experiments
         print("Shutting down Serve...")
         serve.shutdown()
-        print("Shutting down Ray...")
-        ray.shutdown()
         print("Shutdown complete")
 
 
 def run_experiment_sync(
-    config: ExperimentConfig,
-    repetition: int = 1,
-    warmup_duration_s: float = 10.0,
-    steady_state_duration_s: float = 60.0,
-    results_dir: Path = RESULTS_DIR,
-    run_id: Optional[str] = None,
-) -> Optional[str]:
+    run_config: ExperimentRunConfig,
+    clear_s3: bool = False,
+) -> Optional[LoadTestSummary]:
     """Synchronous wrapper for run_experiment."""
-    return asyncio.run(
-        run_experiment(
-            config=config,
-            repetition=repetition,
-            warmup_duration_s=warmup_duration_s,
-            steady_state_duration_s=steady_state_duration_s,
-            results_dir=results_dir,
-            run_id=run_id,
-        )
+    return asyncio.run(run_experiment(run_config, clear_s3=clear_s3))
+
+
+# ============================================================================
+# Convenience functions for creating run configs
+# ============================================================================
+
+def create_run_config(
+    config: ExperimentConfig,
+    s3_bucket: str,
+    s3_prefix: str = "routing-study",
+    repetition: int = 1,
+    warmup_s: float = 10.0,
+    duration_s: float = 60.0,
+    experiment_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> ExperimentRunConfig:
+    """
+    Create an ExperimentRunConfig from an ExperimentConfig.
+    
+    Args:
+        config: Base experiment configuration.
+        s3_bucket: S3 bucket for results.
+        s3_prefix: S3 prefix path.
+        repetition: Repetition number.
+        warmup_s: Warmup duration.
+        duration_s: Steady-state duration.
+        experiment_id: Optional experiment ID (generated if not provided).
+        run_id: Optional run ID (generated if not provided).
+    
+    Returns:
+        Complete ExperimentRunConfig.
+    """
+    return ExperimentRunConfig(
+        config=config,
+        experiment_id=experiment_id or ExperimentRunConfig.generate_experiment_id(config),
+        run_id=run_id or ExperimentRunConfig.generate_run_id(),
+        repetition=repetition,
+        s3_bucket=s3_bucket,
+        s3_prefix=s3_prefix,
+        warmup_s=warmup_s,
+        duration_s=duration_s,
     )
 
 
 if __name__ == "__main__":
-    # Quick test
+    # Quick test - requires S3 bucket to be set
+    import sys
+    
+    if len(sys.argv) < 2:
+        print("Usage: python -m src.experiment <s3_bucket>")
+        print("Example: python -m src.experiment my-routing-study-bucket")
+        sys.exit(1)
+    
+    s3_bucket = sys.argv[1]
+    
     from src.configurations import generate_quick_configs
-
+    
     config = generate_quick_configs()[0]
-    run_experiment_sync(
+    run_config = create_run_config(
         config=config,
-        warmup_duration_s=5.0,
-        steady_state_duration_s=10.0,
+        s3_bucket=s3_bucket,
+        warmup_s=5.0,
+        duration_s=10.0,
     )
-
+    
+    run_experiment_sync(run_config)

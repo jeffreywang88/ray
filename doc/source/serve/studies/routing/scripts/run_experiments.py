@@ -4,25 +4,28 @@ Main CLI for running routing algorithm study experiments.
 
 Usage examples:
     # Run quick test (3 configs, 1 repetition)
-    python scripts/run_experiments.py --run-type quick
+    python scripts/run_experiments.py --s3-bucket my-bucket --run-type quick
 
     # Run prioritized subset (36 configs at Large scale, 75% load)
-    python scripts/run_experiments.py --run-type prioritized --repetitions 3
+    python scripts/run_experiments.py --s3-bucket my-bucket --run-type prioritized --repetitions 3
 
     # Run full matrix (135 configs)
-    python scripts/run_experiments.py --run-type full --repetitions 3
+    python scripts/run_experiments.py --s3-bucket my-bucket --run-type full --repetitions 3
 
     # Run specific algorithm only
-    python scripts/run_experiments.py --run-type quick --algorithm pow2
+    python scripts/run_experiments.py --s3-bucket my-bucket --run-type quick --algorithm pow2
 
     # Custom durations for testing
-    python scripts/run_experiments.py --run-type quick --warmup 5 --duration 10
+    python scripts/run_experiments.py --s3-bucket my-bucket --run-type quick --warmup 5 --duration 10
 
     # Resume from a specific config index
-    python scripts/run_experiments.py --run-type prioritized --start-index 15
+    python scripts/run_experiments.py --s3-bucket my-bucket --run-type prioritized --start-index 15
 
     # Dry run to see what would be executed
-    python scripts/run_experiments.py --run-type full --dry-run
+    python scripts/run_experiments.py --s3-bucket my-bucket --run-type full --dry-run
+
+    # Clear S3 files before each experiment run (useful for re-running)
+    python scripts/run_experiments.py --s3-bucket my-bucket --run-type quick  
 """
 
 import argparse
@@ -39,10 +42,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.configurations import (
     Algorithm,
     ExperimentConfig,
+    ExperimentRunConfig,
     get_configs_by_run_type,
     print_config_summary,
 )
-from src.experiment import run_experiment_sync, RESULTS_DIR
+from src.experiment import run_experiment_sync, create_run_config
+
+
+# Default S3 prefix for results
+DEFAULT_S3_PREFIX = "routing-study"
 
 
 def filter_configs(
@@ -80,23 +88,34 @@ def filter_configs(
 def save_experiment_plan(
     configs: List[ExperimentConfig],
     repetitions: int,
-    output_path: Path,
+    s3_bucket: str,
+    s3_prefix: str,
 ) -> None:
-    """Save experiment plan to JSON for reference."""
+    """Save experiment plan to S3 for reference."""
+    import boto3
+    
     plan = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "total_configs": len(configs),
         "repetitions": repetitions,
         "total_runs": len(configs) * repetitions,
         "estimated_duration_hours": (len(configs) * repetitions * 1.5) / 60,
+        "s3_bucket": s3_bucket,
+        "s3_prefix": s3_prefix,
         "configs": [c.to_dict() for c in configs],
     }
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w") as f:
-        json.dump(plan, f, indent=2)
+    s3_path = f"s3://{s3_bucket}/{s3_prefix}/experiment_plan.json"
+    
+    s3_client = boto3.client("s3")
+    s3_client.put_object(
+        Bucket=s3_bucket,
+        Key=f"{s3_prefix}/experiment_plan.json",
+        Body=json.dumps(plan, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
 
-    print(f"Saved experiment plan to {output_path}")
+    print(f"Saved experiment plan to {s3_path}")
 
 
 def main():
@@ -104,6 +123,20 @@ def main():
         description="Run routing algorithm study experiments",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
+    )
+
+    # S3 configuration (required)
+    parser.add_argument(
+        "--s3-bucket",
+        type=str,
+        required=True,
+        help="S3 bucket for storing results (required)",
+    )
+    parser.add_argument(
+        "--s3-prefix",
+        type=str,
+        default=DEFAULT_S3_PREFIX,
+        help=f"S3 prefix path within bucket. Default: {DEFAULT_S3_PREFIX}",
     )
 
     # Run type selection
@@ -170,14 +203,6 @@ def main():
         help="Start from this configuration index (0-indexed). Useful for resuming.",
     )
 
-    # Output options
-    parser.add_argument(
-        "--results-dir",
-        type=Path,
-        default=RESULTS_DIR,
-        help=f"Directory to store results. Default: {RESULTS_DIR}",
-    )
-
     # Dry run
     parser.add_argument(
         "--dry-run",
@@ -185,11 +210,11 @@ def main():
         help="Show what would be run without actually running experiments",
     )
 
-    # Keep previous results
+    # Clear S3 before each run
     parser.add_argument(
-        "--keep-results",
+        "--clear-s3",
         action="store_true",
-        help="Keep previous results instead of clearing before run. Default: clear results.",
+        help="Delete existing files at S3 output path before each experiment run",
     )
 
     # Verbosity
@@ -230,7 +255,9 @@ def main():
     print(f"Total runs: {total_runs}")
     print(f"Warmup: {args.warmup}s, Duration: {args.duration}s")
     print(f"Estimated duration: {estimated_duration_mins:.1f} minutes ({estimated_duration_mins/60:.1f} hours)")
-    print(f"Results directory: {args.results_dir}")
+    print(f"S3 output: s3://{args.s3_bucket}/{args.s3_prefix}/")
+    if args.clear_s3:
+        print(f"Clear S3: ENABLED (will delete existing files before each run)")
 
     if args.start_index > 0:
         remaining = total_configs - args.start_index
@@ -244,35 +271,20 @@ def main():
     # Dry run mode
     if args.dry_run:
         print("DRY RUN - No experiments will be executed\n")
-        save_experiment_plan(
-            configs=configs,
-            repetitions=args.repetitions,
-            output_path=args.results_dir / "experiment_plan.json",
-        )
-
+        
         print("\nConfigurations to run:")
         for i, config in enumerate(configs[args.start_index:], start=args.start_index):
             print(f"  [{i}] {config}")
+            print(f"       Replicas: {config.parent_replicas} parent, {config.child_replicas} child")
+            print(f"       Concurrent users: {config.num_concurrent}, Tasks: {config.num_tasks}")
         return
 
-    # Clear previous results unless --keep-results is specified
-    if not args.keep_results:
-        import shutil
-        dirs_to_clear = ["raw", "manifests", "aggregated"]
-        print("Clearing previous results...")
-        for subdir in dirs_to_clear:
-            dir_path = args.results_dir / subdir
-            if dir_path.exists():
-                shutil.rmtree(dir_path)
-                print(f"  Cleared {dir_path}")
-            dir_path.mkdir(parents=True, exist_ok=True)
-        print()
-
-    # Save experiment plan
+    # Save experiment plan to S3
     save_experiment_plan(
         configs=configs,
         repetitions=args.repetitions,
-        output_path=args.results_dir / "experiment_plan.json",
+        s3_bucket=args.s3_bucket,
+        s3_prefix=args.s3_prefix,
     )
 
     # Run experiments
@@ -290,16 +302,21 @@ def main():
             print(f"# Remaining: {total_remaining} runs")
             print(f"{'#' * 60}")
 
-            run_id = run_experiment_sync(
+            # Create run config with S3 settings
+            run_config = create_run_config(
                 config=config,
+                s3_bucket=args.s3_bucket,
+                s3_prefix=args.s3_prefix,
                 repetition=rep,
-                warmup_duration_s=args.warmup,
-                steady_state_duration_s=args.duration,
-                results_dir=args.results_dir,
+                warmup_s=args.warmup,
+                duration_s=args.duration,
             )
 
-            if run_id:
+            result = run_experiment_sync(run_config, clear_s3=args.clear_s3)
+
+            if result:
                 successful_runs += 1
+                print(f"Results saved to: {run_config.s3_output_path}")
             else:
                 failed_runs += 1
                 print(f"WARNING: Run failed for config {config_idx}, rep {rep}")
@@ -322,11 +339,11 @@ def main():
     print(f"Total time: {total_time/60:.1f} minutes ({total_time/3600:.2f} hours)")
     print(f"Successful runs: {successful_runs}")
     print(f"Failed runs: {failed_runs}")
-    print(f"Success rate: {successful_runs/(successful_runs+failed_runs)*100:.1f}%")
-    print(f"Results saved to: {args.results_dir}")
+    if successful_runs + failed_runs > 0:
+        print(f"Success rate: {successful_runs/(successful_runs+failed_runs)*100:.1f}%")
+    print(f"Results saved to: s3://{args.s3_bucket}/{args.s3_prefix}/")
     print("=" * 60)
 
 
 if __name__ == "__main__":
     main()
-

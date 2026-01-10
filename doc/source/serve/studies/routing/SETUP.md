@@ -30,46 +30,65 @@ This study evaluates the effectiveness of Ray Serve's Power-of-Two Choices (Pow2
 
 ### Cluster Configuration
 
-| Component | Specification |
-|-----------|--------------|
-| Cloud Provider | AWS |
-| Worker Node Type | m7i.8xlarge (32 vCPU, 128 GiB RAM) |
-| Head Node | Same as worker (m7i.8xlarge) |
-| Autoscaling | 1 node minimum, scale up as needed |
-| Max Nodes | 12 (384 vCPU total capacity) |
+| Node Type | Spec | Count | Purpose |
+|-----------|------|-------|---------|
+| Head Node | 8 CPU, 32 GB | 1 | Ray head, cluster management |
+| Deployment Workers | 8 CPU, 32 GB | 20-200 (autoscaling) | Parent/Child deployment replicas (1 CPU each) |
+| Load Generator | 48 CPU, 192 GB | 1 (fixed) | IngressDeployment + load test tasks |
+
+**Why separate node types?**
+- **Deployment workers (8 CPU):** Each node fits 8 replicas (1 CPU each). Autoscaling adjusts capacity based on experiment scale.
+- **Load generator (48 CPU):** Single large node ensures all load test tasks run co-located with the `IngressDeployment`. With `num_tasks + 1` CPUs reserved, even the largest experiments (2048 users = 16 tasks = 17 CPUs) fit comfortably.
 
 ### Serve Application Architecture
 
 ```
-┌─────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│   HAProxy   │────▶│ ParentDeployment │────▶│ ChildDeployment  │
-│ (head node) │     │   (0.25 CPU)     │     │   (0.25 CPU)     │
-└─────────────┘     └──────────────────┘     └──────────────────┘
-                           │                        │
-                           ▼                        ▼
-                    Records: replica_id,      Records: replica_id,
-                    node_id, timestamp        node_id, request_count
+                                          ┌──────────────────┐     ┌──────────────────┐
+┌───────────────────────────┐             │ ParentDeployment │────▶│ ChildDeployment  │
+│  Ray Task 1 (≤128 users)  │──handle───▶│    (1 CPU)       │     │    (1 CPU)       │
+└───────────────────────────┘             └──────────────────┘     └──────────────────┘
+┌───────────────────────────┐                    │                        │
+│  Ray Task 2 (≤128 users)  │──handle───▶        ▼                        ▼
+└───────────────────────────┘             Records: replica_id,      Records: replica_id,
+             ...                          node_id, timestamp        node_id, request_count
+┌───────────────────────────┐
+│  Ray Task N (≤128 users)  │──handle───▶
+└───────────────────────────┘
+             │
+             └──── Orchestrated by IngressDeployment
 ```
 
-**Why HAProxy Mode?**
-- Isolates the study to replica-to-replica routing
-- Removes Serve's native proxy from the critical path
-- Single entry point simplifies traffic generation, need to watch out for bottlenecks here.
+**Architecture Components:**
+
+1. **IngressDeployment**: A single-replica Serve deployment that orchestrates the experiment. It receives experiment configuration and spawns Ray tasks to generate load.
+
+2. **Ray Tasks (Load Generators)**: Each task handles up to 128 concurrent "users" via asyncio. Users within a task share a DeploymentHandle and run closed-loop requests concurrently.
+
+3. **ParentDeployment**: Receives requests from load generator tasks and forwards to ChildDeployment.
+
+4. **ChildDeployment**: Performs simulated work with variable latency.
+
+**Why this architecture?**
+- Tests the actual DeploymentHandle routing (the core subject of this study)
+- Removes external components (no HAProxy, no HTTP layer)
+- Load generators scale naturally across the cluster with Ray tasks
+- Minimizes task scheduling overhead (128 users per task vs 1 user per task)
+- Eliminates single-entry-point bottleneck
 
 ### Deployment Configuration
 
 ```python
 @serve.deployment(
-    ray_actor_options={"num_cpus": 0.25},
+    ray_actor_options={"num_cpus": 1},
     max_ongoing_requests=5,      # Default, limits concurrency per replica
     max_queued_requests=-1,      # Unlimited queuing (default)
 )
 ```
 
 **Rationale:**
-- `0.25 CPU` per replica avoids CPU contention with trivial workload
+- `1 CPU` per replica provides consistent resource allocation
 - `max_ongoing_requests=5` (default) ensures routing decisions matter
-- At 512 replicas × 2 deployments = 256 CPUs required
+- At 512 replicas × 2 deployments = 1024 CPUs required for XLarge scale
 
 ### Workload
 
@@ -99,10 +118,10 @@ async def child_handler(parent_replica_id, parent_node_id):
 
 **Theoretical Throughput per Replica:**
 - Mean latency: 10ms (exponential distribution)
-- Concurrency: 5
+- Concurrency: 5 (`max_ongoing_requests`)
 - Max RPS per replica: ~500 req/s (based on mean)
 - Actual throughput varies due to latency variance
-- **Measured:** ~300 req/s per replica with 2 replicas ([Locust load test](locust_2_replicas.png))
+- **Expected:** ~300-400 req/s per replica under realistic conditions
 
 **Throughput Bottleneck by Ratio:**
 
@@ -131,25 +150,198 @@ The bottleneck is always the deployment with fewer replicas relative to load:
 
 ### 0. Load Generation Strategy
 
-**Approach: Closed-Loop with Fixed Concurrency**
+**Approach: Closed-Loop with Fixed Concurrency via Ray Tasks**
 
-We use closed-loop load generation where a fixed number of concurrent "users" each wait for a response before sending the next request. This approach:
+We use closed-loop load generation where a fixed number of concurrent "users" each wait for a response before sending the next request. Each user runs as an independent Ray task that calls ParentDeployment via DeploymentHandle.
+
+**Benefits of this approach:**
+- Tests the actual DeploymentHandle routing path (subject of this study)
 - Naturally limits load to match system capacity
 - Prevents queue buildup and timeouts at high scale
-- Provides stable, predictable throughput measurements
-- Matches behavior of tools like Locust for easier validation
+- Load generators distributed across cluster (no single bottleneck)
+- Minimizes Ray task overhead (128 users per task via asyncio)
+- Each task has its own handle, simulating independent callers
+
+**Experiment Configuration:**
 
 ```python
-async def closed_loop_user(
-    session: aiohttp.ClientSession,
-    end_time: float,
-    results: List[RequestResult],
-):
-    """Simulate a single user making requests in a loop."""
-    while time.time() < end_time:
-        result = await send_request(session)
-        results.append(result)
-        # Immediately send next request (closed-loop)
+@dataclass
+class ExperimentConfig:
+    # Experiment identification
+    experiment_id: str
+    run_id: str                  # Unique ID for this run (e.g., UUID or timestamp)
+    
+    # S3 output configuration
+    s3_bucket: str               # S3 bucket for storing results
+    s3_prefix: str = "results"   # Prefix path within bucket
+    
+    # Load parameters
+    num_concurrent_users: int    # Number of Ray tasks generating load
+    duration_s: float = 60.0     # Steady-state measurement duration
+    warmup_s: float = 10.0       # Warmup period (results discarded)
+    
+    # Deployment configuration (for reference/logging)
+    algorithm: str               # "pow2", "random", "round_robin"
+    parent_replicas: int
+    child_replicas: int
+    topology: str                # "packed" or "spread"
+    locality_preference: bool
+    
+    @property
+    def s3_output_path(self) -> str:
+        """S3 path for this experiment run's results."""
+        return f"s3://{self.s3_bucket}/{self.s3_prefix}/{self.experiment_id}/{self.run_id}"
+```
+
+**IngressDeployment Design:**
+
+The `IngressDeployment` is scheduled on the dedicated load generator node (48 CPU) using a custom resource label. It requests enough CPUs to run all load generator tasks plus itself, ensuring tasks co-locate on the same node.
+
+Each task writes its results directly to S3, avoiding large data transfers back to the ingress.
+
+```python
+MAX_USERS_PER_TASK = 128  # Maximum concurrent users per Ray task
+
+def get_ingress_num_cpus(num_concurrent_users: int) -> int:
+    """Calculate CPUs needed: 1 for ingress + 1 per task."""
+    num_tasks = math.ceil(num_concurrent_users / MAX_USERS_PER_TASK)
+    return num_tasks + 1
+
+# Scheduled on load generator node via custom resource
+# Node labeled with: ray.io/node-type: loadgen
+@serve.deployment(num_replicas=1)
+class IngressDeployment:
+    async def run_experiment(self, config: ExperimentConfig) -> ExperimentRunSummary:
+        """Orchestrate a load test experiment."""
+        # Calculate number of tasks needed
+        num_tasks = math.ceil(config.num_concurrent_users / MAX_USERS_PER_TASK)
+        users_per_task = config.num_concurrent_users // num_tasks
+        remainder = config.num_concurrent_users % num_tasks
+        
+        # Spawn Ray tasks, distributing users across tasks
+        # Each task writes directly to S3 (no data returned)
+        task_refs = []
+        for i in range(num_tasks):
+            task_users = users_per_task + (1 if i < remainder else 0)
+            task_refs.append(
+                run_load_generator_task.options(num_cpus=1).remote(
+                    task_id=i,
+                    parent_app_name="parent",
+                    num_users=task_users,
+                    duration_s=config.duration_s,
+                    warmup_s=config.warmup_s,
+                    s3_output_path=config.s3_output_path,
+                )
+            )
+        
+        # Wait for all tasks to complete (they write to S3, return only summary)
+        task_summaries = ray.get(task_refs)
+        
+        # Write experiment config and aggregated summary to S3
+        run_summary = ExperimentRunSummary(
+            config=config,
+            num_tasks=num_tasks,
+            task_summaries=task_summaries,
+            total_requests=sum(t.num_requests for t in task_summaries),
+            total_successful=sum(t.num_successful for t in task_summaries),
+            total_failed=sum(t.num_failed for t in task_summaries),
+        )
+        write_json_to_s3(run_summary, f"{config.s3_output_path}/summary.json")
+        
+        return run_summary
+```
+
+**Ray Task Load Generator:**
+
+Each Ray task runs an async event loop with multiple concurrent "users", similar to the existing `ClosedLoopLoadGenerator` design. Tasks write results directly to S3, returning only a lightweight summary.
+
+```python
+@dataclass
+class TaskSummary:
+    """Lightweight summary returned by each task (actual data goes to S3)."""
+    task_id: int
+    num_requests: int
+    num_successful: int
+    num_failed: int
+    s3_file_path: str
+
+@ray.remote
+def run_load_generator_task(
+    task_id: int,
+    parent_app_name: str,
+    num_users: int,
+    duration_s: float,
+    warmup_s: float,
+    s3_output_path: str,
+) -> TaskSummary:
+    """
+    Ray task that generates closed-loop traffic with multiple concurrent users.
+    
+    Each task handles up to MAX_USERS_PER_TASK concurrent users via asyncio.
+    Results are written directly to S3, avoiding data transfer back to ingress.
+    """
+    
+    async def run():
+        # Get DeploymentHandle for this task
+        parent_handle = serve.get_app_handle(parent_app_name)
+        
+        results: List[RequestResult] = []
+        results_lock = asyncio.Lock()
+        
+        start_time = time.time()
+        warmup_end = start_time + warmup_s
+        end_time = start_time + warmup_s + duration_s
+        
+        async def user_loop(user_id: int):
+            """Single user making closed-loop requests."""
+            while time.time() < end_time:
+                request_start = time.time()
+                try:
+                    response = await parent_handle.remote()
+                    request_end = time.time()
+                    
+                    # Only record after warmup period
+                    if request_start >= warmup_end:
+                        async with results_lock:
+                            results.append(RequestResult(
+                                start_time=request_start,
+                                end_time=request_end,
+                                latency_ms=(request_end - request_start) * 1000,
+                                parent_replica_id=response["parent_replica_id"],
+                                parent_node_id=response["parent_node_id"],
+                                child_replica_id=response["child_replica_id"],
+                                child_node_id=response["child_node_id"],
+                                success=True,
+                            ))
+                except Exception as e:
+                    if time.time() >= warmup_end:
+                        async with results_lock:
+                            results.append(RequestResult(
+                                start_time=request_start,
+                                end_time=time.time(),
+                                latency_ms=(time.time() - request_start) * 1000,
+                                success=False,
+                                error=str(e),
+                            ))
+        
+        # Run all users concurrently within this task
+        await asyncio.gather(*[user_loop(i) for i in range(num_users)])
+        return results
+    
+    results = asyncio.run(run())
+    
+    # Write results directly to S3 (CSV format for efficiency)
+    s3_file_path = f"{s3_output_path}/task_{task_id:04d}.csv"
+    write_results_to_s3(results, s3_file_path)
+    
+    # Return lightweight summary only
+    return TaskSummary(
+        task_id=task_id,
+        num_requests=len(results),
+        num_successful=sum(1 for r in results if r.success),
+        num_failed=sum(1 for r in results if not r.success),
+        s3_file_path=s3_file_path,
+    )
 ```
 
 **Calculating Concurrent Users by Load Level:**
@@ -173,12 +365,13 @@ CONCURRENT_PER_REPLICA = 4  (must be <= max_ongoing_requests to avoid timeouts)
 
 | Component | Specification |
 |-----------|--------------|
-| Load Generator Location | Head node (32 vCPU m7i.8xlarge has capacity) |
-| Client Library | aiohttp with connection pooling |
-| Multi-Process | Yes, max 500 concurrent users per process |
-| Connection Pool | Keepalive enabled |
+| Load Generator | Ray tasks spawned by IngressDeployment |
+| Request Method | DeploymentHandle.remote() |
+| Max Users per Task | 128 (uses asyncio for concurrency within task) |
+| IngressDeployment CPUs | `num_tasks + 1` (ensures tasks co-locate with ingress) |
+| Task Scheduling | `num_cpus=1` per task |
 | Request Timeout | 30s (capture extreme tail latency) |
-| Warmup Handling | Discard first 10s of measurements |
+| Warmup Handling | Discard first 10s of measurements per task |
 
 **Note:** Closed-loop prevents overloading the system. With `max_ongoing_requests=5` per replica and `CONCURRENT_PER_REPLICA=4`, we stay under server capacity and avoid request timeouts.
 
@@ -199,19 +392,20 @@ We test four scale levels, each with three Parent:Child ratios (1:1, 1:2, 2:1).
 - **1:2** — Parent fans out to more child replicas (common in inference pipelines)
 - **2:1** — Multiple parents share fewer child replicas (resource-constrained child)
 
-| Scale | Ratio | Parent Replicas | Child Replicas | Total Replicas | CPUs Required |
-|-------|-------|-----------------|----------------|----------------|---------------|
-| Small | 1:1 | 8 | 8 | 16 | 4 |
-| Medium | 1:1 | 32 | 32 | 64 | 16 |
-| Large | 1:1 | 128 | 128 | 256 | 64 |
-| Large | 1:2 | 128 | 256 | 384 | 96 |
-| Large | 2:1 | 256 | 128 | 384 | 96 |
-| XLarge | 1:1 | 512 | 512 | 1024 | 256 |
+| Scale | Ratio | Parent | Child | Total Replicas | Deployment CPUs | Worker Nodes (8 CPU) |
+|-------|-------|--------|-------|----------------|-----------------|----------------------|
+| Small | 1:1 | 8 | 8 | 16 | 16 | 2 |
+| Medium | 1:1 | 32 | 32 | 64 | 64 | 8 |
+| Large | 1:1 | 128 | 128 | 256 | 256 | 32 |
+| Large | 1:2 | 128 | 256 | 384 | 384 | 48 |
+| Large | 2:1 | 256 | 128 | 384 | 384 | 48 |
+| XLarge | 1:1 | 512 | 512 | 1024 | 1024 | 128 |
 
-**Note:** 
+**Notes:** 
 - Ratio (1:2, 2:1), Topology, and Locality variations only tested at Large scale
 - Small, Medium, XLarge use fixed config: 1:1 ratio, Packed topology, No locality preference
 - This focuses detailed analysis at Large scale while still capturing scaling trends
+- Load generator node (48 CPU) handles all scales: max 17 CPUs needed (2048 users at XLarge)
 
 ### 3. Replica Topology
 
@@ -246,11 +440,11 @@ We test four scale levels, each with three Parent:Child ratios (1:1, 1:2, 2:1).
 
 | Metric | Description | Collection Method |
 |--------|-------------|-------------------|
-| **E2E Latency p50** | Median request latency | Client-side timestamps |
-| **E2E Latency p90** | 90th percentile latency | Client-side timestamps |
-| **E2E Latency p95** | 95th percentile latency | Client-side timestamps |
-| **E2E Latency p99** | 99th percentile latency (tail) | Client-side timestamps |
-| **E2E Latency max** | Maximum observed latency | Client-side timestamps |
+| **E2E Latency p50** | Median request latency | Task-side timestamps |
+| **E2E Latency p90** | 90th percentile latency | Task-side timestamps |
+| **E2E Latency p95** | 95th percentile latency | Task-side timestamps |
+| **E2E Latency p99** | 99th percentile latency (tail) | Task-side timestamps |
+| **E2E Latency max** | Maximum observed latency | Task-side timestamps |
 
 ### 2. Throughput Metrics
 
@@ -259,7 +453,7 @@ We test four scale levels, each with three Parent:Child ratios (1:1, 1:2, 2:1).
 | **Concurrent Users** | Number of simultaneous users | Configuration parameter |
 | **Achieved RPS** | Actual requests per second | Completed requests / actual duration |
 | **Goodput** | Successful requests per second | Successful requests / actual duration |
-| **Error Rate** | Percentage of failed requests | Client-side |
+| **Error Rate** | Percentage of failed requests | Task-side |
 
 ### 3. Fairness Metrics
 
@@ -274,26 +468,54 @@ All fairness metrics are computed from the distribution of request counts across
 **Primary metric:** Jain's Fairness Index (single number, widely used in literature)
 **Secondary metrics:** CV (for spread), Min/Max (for worst-case)
 
+### 4. Utilization Metrics
+
+Replica utilization measures how much of a replica's processing capacity was actually used during the experiment. Low utilization despite pending requests indicates router-side bottlenecks (e.g., head-of-line blocking from queue length probing).
+
+| Metric | Formula | Interpretation |
+|--------|---------|----------------|
+| **Replica Utilization** | `total_work_time / (duration × max_ongoing_requests)` | Range [0, 1]; 1 = fully utilized |
+| **Mean Utilization** | Mean across all replicas | Overall system efficiency |
+| **Min Utilization** | Minimum across replicas | Identifies starved replicas |
+
+**Calculation:**
+```python
+# For each child replica:
+total_work_time_ms = sum(simulated_latency_ms for all requests handled)
+max_capacity_ms = duration_s * 1000 * max_ongoing_requests  # e.g., 60s * 1000 * 5 = 300,000ms
+utilization = total_work_time_ms / max_capacity_ms
+```
+
+**Example:**
+- Duration: 60s, `max_ongoing_requests=5` → max capacity = 300,000ms of work per replica
+- If a replica did 150,000ms of simulated work → 50% utilization
+- 50% utilization means the replica was idle half the time (capacity wasted)
+
+**Interpretation:**
+- **High utilization + low routing delay** = system is efficient
+- **Low utilization + high routing delay** = router is the bottleneck (requests queued at router while replicas idle)
+- **Low utilization + low routing delay** = insufficient load (not enough concurrent users)
+
 ---
 
 ## Experiment Methodology
 
-### Phase 1: Warm-Up
+### Phase 1: Warm-up
 
 **Duration:** 10 seconds
 
 **Purpose:**
 - Populate queue length caches
-- Establish baseline connections
-- Allow routing tasks to stabilize
+- Allow DeploymentHandle routing to stabilize
+- Warm up replica actor pools
 
 **Precondition:** Application must be fully deployed and ready before starting (verified via health check).
 
-**Traffic Pattern:** All concurrent users start immediately
+**Traffic Pattern:** All Ray task users start simultaneously and begin making requests via DeploymentHandle.
 
-**Data:** Discarded (not included in analysis)
+**Data:** Each task discards results recorded before `warmup_end` timestamp. This happens within each task, not as a post-processing step.
 
-### Phase 2: Steady State Measurement
+### Phase 2: Steady-state measurement
 
 **Duration:** 60 seconds
 
@@ -301,13 +523,87 @@ All fairness metrics are computed from the distribution of request counts across
 - Collect primary metrics under stable conditions
 - Sufficient for statistical significance with high request rates
 
-**Traffic Pattern:** Fixed number of concurrent users, each sending requests continuously
+**Traffic Pattern:** Fixed number of Ray task users, each making closed-loop requests via DeploymentHandle.
 
-**Data:** Primary analysis dataset
+**Data:** Primary analysis dataset. All tasks return their collected `RequestResult` lists to the `IngressDeployment` for aggregation.
 
 ### Repetitions
 
 Each configuration combination is run **3 times** to account for variance. Results are reported as mean ± standard deviation across runs.
+
+### Running an Experiment
+
+**Step 1: Deploy IngressDeployment on load generator node**
+
+The `IngressDeployment` is deployed on the dedicated 48 CPU load generator node. Use node affinity to ensure placement:
+
+```python
+import math
+from ray import serve
+
+MAX_USERS_PER_TASK = 128
+
+def deploy_ingress(num_concurrent_users: int):
+    """Deploy IngressDeployment on load generator node with CPUs for all tasks."""
+    num_tasks = math.ceil(num_concurrent_users / MAX_USERS_PER_TASK)
+    num_cpus = num_tasks + 1  # +1 for the ingress itself
+    
+    ingress = IngressDeployment.options(
+        ray_actor_options={
+            "num_cpus": num_cpus,
+            # Schedule on the 48 CPU load generator node
+            "resources": {"loadgen": 1},
+        }
+    ).bind()
+    serve.run(ingress, name="ingress")
+
+# Example: 384 users → 3 tasks → 4 CPUs (fits easily on 48 CPU node)
+deploy_ingress(num_concurrent_users=384)
+
+# Example: 2048 users → 16 tasks → 17 CPUs (still fits on 48 CPU node)
+deploy_ingress(num_concurrent_users=2048)
+```
+
+**Note:** The 48 CPU load generator node should be configured with custom resource `loadgen: 48` to enable affinity scheduling.
+
+**Step 2: Run the experiment**
+
+```python
+import ray
+import uuid
+from ray import serve
+
+# Connect to the running Serve application
+ingress_handle = serve.get_app_handle("ingress")
+
+# Configure and run the experiment
+config = ExperimentConfig(
+    experiment_id="pow2_large_75pct",
+    run_id=str(uuid.uuid4())[:8],  # Unique run ID
+    s3_bucket="my-routing-study-bucket",
+    s3_prefix="experiments",
+    num_concurrent_users=384,  # 75% load at Large scale
+    duration_s=60.0,
+    warmup_s=10.0,
+    algorithm="pow2",
+    parent_replicas=128,
+    child_replicas=128,
+    topology="packed",
+    locality_preference=False,
+)
+
+# Run the experiment (blocks until complete)
+# Raw data is written directly to S3 by tasks
+summary: ExperimentRunSummary = ray.get(ingress_handle.run_experiment.remote(config))
+
+print(f"Experiment complete!")
+print(f"  Total requests: {summary.total_requests}")
+print(f"  Success rate: {summary.total_successful / summary.total_requests:.2%}")
+print(f"  Data location: {config.s3_output_path}")
+
+# Compute detailed metrics from S3 data (can be done later/offline)
+metrics = compute_metrics(config.s3_output_path)
+```
 
 ---
 
@@ -361,31 +657,99 @@ Focus on Large scale at 75% load to compare algorithms across all variations:
 
 ## Data Collection
 
-### Client-Side Logging
+### S3 Storage Structure
 
-Each request logs:
-```json
-{
-  "request_id": "uuid",
-  "start_time": 1234567890.123,
-  "end_time": 1234567890.456,
-  "latency_ms": 333.0,
-  "parent_replica_id": "parent-abc123",
-  "parent_node_id": "node-xyz",
-  "child_replica_id": "child-def456",
-  "child_node_id": "node-xyz",
-  "success": true,
-  "error": null
-}
+Each experiment run writes data to S3 with the following structure:
+
+```
+s3://{bucket}/{prefix}/{experiment_id}/{run_id}/
+├── summary.json          # Experiment config + aggregated summary
+├── task_0000.csv         # Raw results from task 0
+├── task_0001.csv         # Raw results from task 1
+├── task_0002.csv         # Raw results from task 2
+└── ...
 ```
 
-### Aggregation
+**Why S3?**
+- Raw result data can be large (millions of requests at high scale)
+- Avoids data transfer overhead between tasks and ingress
+- Tasks write in parallel for efficient I/O
+- Data persists immediately (no loss if aggregation fails)
+- Easy to analyze with tools that support S3 (pandas, Spark, etc.)
 
-Post-experiment aggregation computes from client-side logs:
-1. Per-replica request counts (for fairness metrics)
-2. Latency percentiles (p50, p90, p95, p99, max)
-3. Throughput (total requests / duration)
-4. All fairness metrics from per-replica counts
+### Per-Request Data (CSV Files)
+
+Each task writes its results to a CSV file in S3:
+
+```python
+@dataclass
+class RequestResult:
+    start_time: float        # Unix timestamp when request started
+    end_time: float          # Unix timestamp when request completed
+    latency_ms: float        # End-to-end latency in milliseconds
+    parent_replica_id: str   # ID of parent replica that handled the request
+    parent_node_id: str      # Node where parent replica runs
+    child_replica_id: str    # ID of child replica that handled the request
+    child_node_id: str       # Node where child replica runs
+    success: bool            # Whether the request succeeded
+    error: Optional[str]     # Error message if request failed
+```
+
+### Experiment Run Summary (JSON)
+
+The `IngressDeployment` writes a summary file after all tasks complete:
+
+```python
+@dataclass
+class ExperimentRunSummary:
+    config: ExperimentConfig
+    num_tasks: int
+    task_summaries: List[TaskSummary]  # Summary from each task
+    
+    # Aggregated counts (computed from task summaries)
+    total_requests: int
+    total_successful: int
+    total_failed: int
+    
+    # S3 paths for raw data files
+    @property
+    def data_files(self) -> List[str]:
+        return [t.s3_file_path for t in self.task_summaries]
+```
+
+### Post-Experiment Aggregation
+
+Detailed metrics (latency percentiles, fairness) are computed offline from the S3 data:
+
+```python
+def compute_metrics(s3_output_path: str) -> ExperimentMetrics:
+    """Load all task CSVs from S3 and compute metrics."""
+    # Load all task results
+    all_results = []
+    for csv_path in list_s3_files(f"{s3_output_path}/task_*.csv"):
+        df = pd.read_csv(csv_path)
+        all_results.append(df)
+    
+    combined = pd.concat(all_results)
+    
+    return ExperimentMetrics(
+        # Latency percentiles
+        latency_p50=combined["latency_ms"].quantile(0.50),
+        latency_p90=combined["latency_ms"].quantile(0.90),
+        latency_p95=combined["latency_ms"].quantile(0.95),
+        latency_p99=combined["latency_ms"].quantile(0.99),
+        latency_max=combined["latency_ms"].max(),
+        
+        # Throughput
+        achieved_rps=len(combined) / (combined["end_time"].max() - combined["start_time"].min()),
+        
+        # Fairness metrics from child replica distribution
+        child_replica_counts=combined["child_replica_id"].value_counts().to_dict(),
+        jains_fairness_index=compute_jains_index(combined["child_replica_id"]),
+        coefficient_of_variation=compute_cv(combined["child_replica_id"]),
+        min_max_ratio=compute_min_max_ratio(combined["child_replica_id"]),
+    )
+```
 
 ---
 
@@ -406,27 +770,33 @@ Post-experiment aggregation computes from client-side logs:
 
 1. **Synthetic Workload:** Exponential latency distribution (mean 10ms) is a simplification. Real inference workloads may have bimodal distributions (cache hit/miss), heavier tails, or correlated latencies.
 
-2. **Single Entry Point:** All traffic through one HAProxy instance may become a bottleneck at high scale.
+2. **No Autoscaling:** Replica counts are fixed; real deployments may autoscale.
 
-3. **No Autoscaling:** Replica counts are fixed; real deployments may autoscale.
+3. **Queue Length Cache Always On:** Can't disable the cache in non-Ray-Client contexts; this is the production configuration.
 
-4. **Queue Length Cache Always On:** Cannot disable cache in non-Ray-Client contexts; this is the production configuration.
+4. **No Multiplexing:** Study doesn't cover multiplexed model routing which has different behavior.
 
-5. **No Multiplexing:** Study doesn't cover multiplexed model routing which has different behavior.
+5. **Network Homogeneity:** All nodes are same type in same AZ; cross-AZ routing not tested.
 
-6. **Network Homogeneity:** All nodes are same type in same AZ; cross-AZ routing not tested.
+6. **Ray Task Overhead:** Load generator tasks have scheduling overhead. With 128 users per task, this is minimized but may still introduce some variance at very high scale (thousands of users requiring dozens of tasks).
 
 ---
 
 ## Output Artifacts
 
-1. **Raw Data:** CSV files with per-request logs
-2. **Aggregated Metrics:** JSON files with computed metrics per configuration
-3. **Visualizations:**
+All artifacts are stored in S3 under the configured bucket and prefix.
+
+**Per-Run Artifacts (in `s3://{bucket}/{prefix}/{experiment_id}/{run_id}/`):**
+1. **Raw Data:** CSV files with per-request logs (`task_XXXX.csv`)
+2. **Run Summary:** JSON file with config and task summaries (`summary.json`)
+
+**Aggregated Artifacts (generated by post-processing):**
+1. **Aggregated Metrics:** JSON files with computed metrics per configuration
+2. **Visualizations:**
    - Latency CDFs by algorithm
    - Fairness metrics bar charts
    - Heatmaps of metrics across configuration space
-4. **Summary Report:** Key findings and recommendations
+3. **Summary Report:** Key findings and recommendations
 
 ---
 

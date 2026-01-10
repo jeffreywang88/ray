@@ -1,28 +1,23 @@
 """
 Closed-loop load generator for routing algorithm study.
 
-Implements closed-loop load generation where a fixed number of concurrent "users"
-each wait for a response before sending the next request. This naturally limits
-load and prevents queue buildup.
-
-Supports multi-process mode with max 100 concurrent requests per process.
+Uses Ray tasks to generate load via DeploymentHandle, with results written directly to S3.
+Each Ray task handles up to MAX_USERS_PER_TASK concurrent users via asyncio.
 """
 
 import asyncio
 import csv
+import io
 import math
-import multiprocessing as mp
 import time
 import uuid
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, asdict
 from typing import List, Optional
 
-import aiohttp
+import ray
+from ray import serve
 
-
-# Maximum concurrent requests per worker process
-MAX_CONCURRENT_PER_WORKER = 128
+from src.configurations import MAX_USERS_PER_TASK
 
 
 @dataclass
@@ -40,560 +35,351 @@ class RequestResult:
     child_replica_id: Optional[str] = None
     child_node_id: Optional[str] = None
     simulated_latency_ms: Optional[float] = None
-    routing_delay_ms: Optional[float] = None
+    client_to_parent_delay_ms: Optional[float] = None  # Client → Parent routing
+    routing_delay_ms: Optional[float] = None  # Parent → Child routing
 
 
 @dataclass
-class LoadTestResult:
-    """Aggregated results from a load test."""
+class TaskSummary:
+    """Lightweight summary returned by each task (actual data goes to S3)."""
+    
+    task_id: int
+    num_requests: int
+    num_successful: int
+    num_failed: int
+    s3_file_path: str
+    start_time: float
+    end_time: float
 
-    results: List[RequestResult]
-    warmup_duration_s: float
-    steady_state_duration_s: float
-    num_concurrent: int  # Total concurrent users
 
-    @property
-    def steady_state_results(self) -> List[RequestResult]:
-        """Results from steady state period only (excludes warmup)."""
-        if not self.results:
-            return []
-        start_time = min(r.start_time for r in self.results)
-        warmup_end = start_time + self.warmup_duration_s
-        return [r for r in self.results if r.start_time >= warmup_end]
-
+@dataclass 
+class LoadTestSummary:
+    """Aggregated summary from all tasks."""
+    
+    task_summaries: List[TaskSummary]
+    num_concurrent: int
+    num_tasks: int
+    warmup_s: float
+    duration_s: float
+    
     @property
     def total_requests(self) -> int:
-        return len(self.steady_state_results)
-
+        return sum(t.num_requests for t in self.task_summaries)
+    
     @property
-    def successful_requests(self) -> int:
-        return sum(1 for r in self.steady_state_results if r.success)
-
+    def total_successful(self) -> int:
+        return sum(t.num_successful for t in self.task_summaries)
+    
     @property
-    def failed_requests(self) -> int:
-        return sum(1 for r in self.steady_state_results if not r.success)
-
+    def total_failed(self) -> int:
+        return sum(t.num_failed for t in self.task_summaries)
+    
     @property
     def error_rate(self) -> float:
         if self.total_requests == 0:
             return 0.0
-        return self.failed_requests / self.total_requests
-
-    @property
-    def offered_rps(self) -> float:
-        """Rate at which requests were completed (same as achieved for closed-loop)."""
-        return self.achieved_rps
-
+        return self.total_failed / self.total_requests
+    
     @property
     def achieved_rps(self) -> float:
-        """True throughput: completed requests / actual time span."""
-        results = self.steady_state_results
-        if not results:
+        """Approximate RPS based on task timings."""
+        if not self.task_summaries:
             return 0.0
-        first_start = min(r.start_time for r in results)
-        last_end = max(r.end_time for r in results)
-        actual_duration = last_end - first_start
-        if actual_duration == 0:
+        first_start = min(t.start_time for t in self.task_summaries)
+        last_end = max(t.end_time for t in self.task_summaries)
+        duration = last_end - first_start
+        if duration <= 0:
             return 0.0
-        return len(results) / actual_duration
-
-    @property
-    def goodput(self) -> float:
-        """Successful requests per second (true throughput of successes)."""
-        results = self.steady_state_results
-        if not results:
-            return 0.0
-        first_start = min(r.start_time for r in results)
-        last_end = max(r.end_time for r in results)
-        actual_duration = last_end - first_start
-        if actual_duration == 0:
-            return 0.0
-        return self.successful_requests / actual_duration
-
-    # Keep target_rps for backwards compatibility
-    @property
-    def target_rps(self) -> int:
-        """Backwards compatibility - returns num_concurrent."""
-        return self.num_concurrent
+        return self.total_requests / duration
+    
+    def to_dict(self) -> dict:
+        return {
+            "num_concurrent": self.num_concurrent,
+            "num_tasks": self.num_tasks,
+            "warmup_s": self.warmup_s,
+            "duration_s": self.duration_s,
+            "total_requests": self.total_requests,
+            "total_successful": self.total_successful,
+            "total_failed": self.total_failed,
+            "error_rate": self.error_rate,
+            "achieved_rps": self.achieved_rps,
+            "task_summaries": [asdict(t) for t in self.task_summaries],
+        }
 
 
-def _worker_run_load_test(
-    worker_id: int,
-    num_concurrent: int,
-    warmup_duration_s: float,
-    steady_state_duration_s: float,
-    target_url: str,
-    start_barrier_time: float,
-    result_queue: mp.Queue,
-) -> None:
+def write_results_to_s3(results: List[RequestResult], s3_path: str) -> None:
     """
-    Worker function that runs in a separate process.
+    Write results to S3 as CSV.
     
     Args:
-        worker_id: Unique identifier for this worker.
-        num_concurrent: Number of concurrent users for this worker.
-        warmup_duration_s: Warmup duration.
-        steady_state_duration_s: Steady state duration.
-        target_url: URL to send requests to.
-        start_barrier_time: Wall-clock time when all workers should start.
-        result_queue: Queue to put results into.
+        results: List of RequestResult to write.
+        s3_path: S3 path (e.g., "s3://bucket/prefix/task_0000.csv").
     """
-    # Wait until the barrier time to synchronize all workers
-    wait_time = start_barrier_time - time.time()
-    if wait_time > 0:
-        time.sleep(wait_time)
+    import boto3
+    
+    # Parse S3 path
+    if not s3_path.startswith("s3://"):
+        raise ValueError(f"Invalid S3 path: {s3_path}")
+    
+    path_parts = s3_path[5:].split("/", 1)
+    bucket = path_parts[0]
+    key = path_parts[1] if len(path_parts) > 1 else ""
+    
+    # Create CSV content in memory
+    fieldnames = [
+        "request_id", "start_time", "end_time", "latency_ms", "success", "error",
+        "parent_replica_id", "parent_node_id", "child_replica_id", "child_node_id",
+        "simulated_latency_ms", "client_to_parent_delay_ms", "routing_delay_ms",
+    ]
+    
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    
+    for result in results:
+        writer.writerow({
+            "request_id": result.request_id,
+            "start_time": result.start_time,
+            "end_time": result.end_time,
+            "latency_ms": result.latency_ms,
+            "success": result.success,
+            "error": result.error,
+            "parent_replica_id": result.parent_replica_id,
+            "parent_node_id": result.parent_node_id,
+            "child_replica_id": result.child_replica_id,
+            "child_node_id": result.child_node_id,
+            "simulated_latency_ms": result.simulated_latency_ms,
+            "client_to_parent_delay_ms": result.client_to_parent_delay_ms,
+            "routing_delay_ms": result.routing_delay_ms,
+        })
+    
+    # Upload to S3
+    s3_client = boto3.client("s3")
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=output.getvalue().encode("utf-8"),
+        ContentType="text/csv",
+    )
+    
+    print(f"Wrote {len(results)} results to {s3_path}")
+
+
+@ray.remote
+def run_load_generator_task(
+    task_id: int,
+    parent_app_name: str,
+    num_users: int,
+    duration_s: float,
+    warmup_s: float,
+    s3_output_path: str,
+) -> TaskSummary:
+    """
+    Ray task that generates closed-loop traffic with multiple concurrent users.
+    
+    Each task handles up to MAX_USERS_PER_TASK concurrent users via asyncio.
+    Results are written directly to S3, avoiding data transfer back to caller.
+    
+    Args:
+        task_id: Unique identifier for this task.
+        parent_app_name: Name of the parent Serve app to call.
+        num_users: Number of concurrent users for this task.
+        duration_s: Duration of steady-state measurement.
+        warmup_s: Duration of warmup period (results discarded).
+        s3_output_path: S3 path prefix for results.
+    
+    Returns:
+        TaskSummary with counts and S3 file path.
+    """
+    
+    # Progress logging interval in seconds
+    PROGRESS_INTERVAL_S = 10.0
     
     async def run():
-        generator = ClosedLoopLoadGenerator(
-            target_url=target_url,
-            request_timeout_s=30.0,
-        )
-        return await generator.run(
-            num_concurrent=num_concurrent,
-            warmup_duration_s=warmup_duration_s,
-            steady_state_duration_s=steady_state_duration_s,
-            progress_interval_s=10.0,
-            worker_id=worker_id,
-        )
-    
-    result = asyncio.run(run())
-    
-    # Convert results to serializable format for queue
-    serialized_results = [
-        {
-            "request_id": r.request_id,
-            "start_time": r.start_time,
-            "end_time": r.end_time,
-            "latency_ms": r.latency_ms,
-            "success": r.success,
-            "error": r.error,
-            "parent_replica_id": r.parent_replica_id,
-            "parent_node_id": r.parent_node_id,
-            "child_replica_id": r.child_replica_id,
-            "child_node_id": r.child_node_id,
-            "simulated_latency_ms": r.simulated_latency_ms,
-            "routing_delay_ms": r.routing_delay_ms,
-        }
-        for r in result.results
-    ]
-    
-    result_queue.put((worker_id, serialized_results))
-
-
-class MultiProcessLoadGenerator:
-    """
-    Multi-process closed-loop load generator.
-    
-    Distributes concurrent users across worker processes,
-    with max MAX_CONCURRENT_PER_WORKER users per process.
-    """
-    
-    def __init__(
-        self,
-        target_url: str = "http://localhost:8000",
-        max_concurrent_per_worker: int = MAX_CONCURRENT_PER_WORKER,
-    ):
-        self.target_url = target_url
-        self.max_concurrent_per_worker = max_concurrent_per_worker
-    
-    def run(
-        self,
-        num_concurrent: int,
-        warmup_duration_s: float = 10.0,
-        steady_state_duration_s: float = 60.0,
-    ) -> LoadTestResult:
-        """
-        Run closed-loop load test using multiple worker processes.
+        # Get DeploymentHandle for this task
+        parent_handle = serve.get_app_handle(parent_app_name)
         
-        Args:
-            num_concurrent: Total number of concurrent users.
-            warmup_duration_s: Warmup duration.
-            steady_state_duration_s: Steady state duration.
-        
-        Returns:
-            Combined LoadTestResult from all workers.
-        """
-        # Calculate number of workers needed
-        num_workers = max(1, math.ceil(num_concurrent / self.max_concurrent_per_worker))
-        users_per_worker = num_concurrent // num_workers
-        remainder = num_concurrent % num_workers
-        
-        print(f"Multi-process closed-loop load generator:")
-        print(f"  Total concurrent users: {num_concurrent}")
-        print(f"  Workers: {num_workers}")
-        print(f"  ~{users_per_worker} users per worker")
-        
-        # Create result queue
-        result_queue = mp.Queue()
-        
-        # Schedule start time (give workers time to spawn)
-        start_barrier_time = time.time() + 2.0
-        
-        # Start worker processes
-        workers = []
-        for i in range(num_workers):
-            # Distribute remainder across first workers
-            worker_users = users_per_worker + (1 if i < remainder else 0)
-            
-            p = mp.Process(
-                target=_worker_run_load_test,
-                args=(
-                    i,
-                    worker_users,
-                    warmup_duration_s,
-                    steady_state_duration_s,
-                    self.target_url,
-                    start_barrier_time,
-                    result_queue,
-                ),
-            )
-            p.start()
-            workers.append(p)
-            print(f"  Started worker {i}: {worker_users} concurrent users")
-        
-        # Collect results from all workers
-        all_results: List[RequestResult] = []
-        for _ in range(num_workers):
-            worker_id, serialized_results = result_queue.get()
-            print(f"  Worker {worker_id} complete: {len(serialized_results)} results")
-            
-            # Deserialize results
-            for r in serialized_results:
-                all_results.append(RequestResult(**r))
-        
-        # Wait for all workers to finish
-        for p in workers:
-            p.join()
-        
-        print(f"All workers complete. Total results: {len(all_results)}")
-        
-        return LoadTestResult(
-            results=all_results,
-            warmup_duration_s=warmup_duration_s,
-            steady_state_duration_s=steady_state_duration_s,
-            num_concurrent=num_concurrent,
-        )
-
-
-class ClosedLoopLoadGenerator:
-    """
-    Closed-loop load generator with fixed concurrency.
-
-    Each "user" runs in a loop: send request → wait for response → repeat.
-    This naturally limits load based on system capacity and prevents queue buildup.
-    """
-
-    def __init__(
-        self,
-        target_url: str = "http://localhost:8000",
-        request_timeout_s: float = 30.0,
-    ):
-        """
-        Initialize load generator.
-
-        Args:
-            target_url: URL to send requests to.
-            request_timeout_s: Timeout for individual requests.
-        """
-        self.target_url = target_url
-        self.request_timeout_s = request_timeout_s
-
-    async def _send_request(
-        self,
-        session: aiohttp.ClientSession,
-    ) -> RequestResult:
-        """Send a single request and record result."""
-        request_id = str(uuid.uuid4())
-        start_time = time.time()
-
-        try:
-            async with session.get(
-                self.target_url,
-                timeout=aiohttp.ClientTimeout(total=self.request_timeout_s),
-            ) as response:
-                end_time = time.time()
-                latency_ms = (end_time - start_time) * 1000
-
-                if response.status == 200:
-                    data = await response.json()
-                    return RequestResult(
-                        request_id=request_id,
-                        start_time=start_time,
-                        end_time=end_time,
-                        latency_ms=latency_ms,
-                        success=True,
-                        parent_replica_id=data.get("parent_replica_id"),
-                        parent_node_id=data.get("parent_node_id"),
-                        child_replica_id=data.get("child_replica_id"),
-                        child_node_id=data.get("child_node_id"),
-                        simulated_latency_ms=data.get("simulated_latency_ms"),
-                        routing_delay_ms=data.get("routing_delay_ms"),
-                    )
-                else:
-                    return RequestResult(
-                        request_id=request_id,
-                        start_time=start_time,
-                        end_time=end_time,
-                        latency_ms=latency_ms,
-                        success=False,
-                        error=f"HTTP {response.status}",
-                    )
-        except asyncio.TimeoutError:
-            end_time = time.time()
-            return RequestResult(
-                request_id=request_id,
-                start_time=start_time,
-                end_time=end_time,
-                latency_ms=(end_time - start_time) * 1000,
-                success=False,
-                error="Timeout",
-            )
-        except Exception as e:
-            end_time = time.time()
-            return RequestResult(
-                request_id=request_id,
-                start_time=start_time,
-                end_time=end_time,
-                latency_ms=(end_time - start_time) * 1000,
-                success=False,
-                error=str(e),
-            )
-
-    async def _user_loop(
-        self,
-        user_id: int,
-        session: aiohttp.ClientSession,
-        end_time: float,
-        results: List[RequestResult],
-        results_lock: asyncio.Lock,
-    ) -> None:
-        """
-        Simulate a single user making requests in a loop.
-        
-        Each user waits for response before sending next request (closed-loop).
-        """
-        while time.time() < end_time:
-            result = await self._send_request(session)
-            async with results_lock:
-                results.append(result)
-
-    async def run(
-        self,
-        num_concurrent: int,
-        warmup_duration_s: float = 10.0,
-        steady_state_duration_s: float = 60.0,
-        progress_interval_s: float = 5.0,
-        worker_id: Optional[int] = None,
-    ) -> LoadTestResult:
-        """
-        Run closed-loop load test with fixed concurrency.
-
-        Args:
-            num_concurrent: Number of concurrent users (each sends requests in a loop).
-            warmup_duration_s: Duration of warmup period (data discarded).
-            steady_state_duration_s: Duration of steady state measurement.
-            progress_interval_s: Interval for progress logging.
-            worker_id: Optional worker ID for multi-process mode logging.
-
-        Returns:
-            LoadTestResult containing all request results.
-        """
-        total_duration_s = warmup_duration_s + steady_state_duration_s
-        log_prefix = f"[Worker {worker_id}] " if worker_id is not None else ""
-
-        # Configure connection pool
-        connector = aiohttp.TCPConnector(
-            limit=num_concurrent + 10,  # Slightly more than concurrent users
-            keepalive_timeout=30,
-            force_close=False,
-        )
-
         results: List[RequestResult] = []
         results_lock = asyncio.Lock()
-
-        async with aiohttp.ClientSession(connector=connector) as session:
-            start_time = time.time()
-            end_time = start_time + total_duration_s
-
-            print(f"{log_prefix}Starting closed-loop load test:")
-            print(f"{log_prefix}  Concurrent users: {num_concurrent}")
-            print(f"{log_prefix}  Duration: {total_duration_s}s "
-                  f"({warmup_duration_s}s warmup + {steady_state_duration_s}s steady state)")
-
-            # Start progress logging task
-            async def log_progress():
-                last_count = 0
-                last_time = start_time
-                while time.time() < end_time:
-                    await asyncio.sleep(progress_interval_s)
-                    current_time = time.time()
-                    elapsed = current_time - start_time
-                    async with results_lock:
-                        current_count = len(results)
+        
+        task_start_time = time.perf_counter()
+        warmup_end = task_start_time + warmup_s
+        end_time = task_start_time + warmup_s + duration_s
+        
+        # Track last progress log time
+        last_progress_time = task_start_time
+        last_progress_count = 0
+        
+        async def user_loop(user_id: int):
+            """Single user making closed-loop requests."""
+            nonlocal last_progress_time, last_progress_count
+            
+            while time.perf_counter() < end_time:
+                request_id = str(uuid.uuid4())
+                request_start = time.perf_counter()
+                
+                try:
+                    # Use wall-clock time for cross-process timing
+                    client_send_time = time.time()
+                    response = await parent_handle.remote(client_send_time)
+                    request_end = time.perf_counter()
                     
-                    # Calculate RPS for this interval
-                    interval_requests = current_count - last_count
-                    interval_duration = current_time - last_time
-                    interval_rps = interval_requests / interval_duration if interval_duration > 0 else 0
-                    
-                    in_warmup = elapsed < warmup_duration_s
-                    phase = "warmup" if in_warmup else "steady"
-                    print(f"{log_prefix}  [{phase}] {elapsed:.1f}s: {current_count} requests "
-                          f"(RPS: {interval_rps:.1f})")
-                    
-                    last_count = current_count
-                    last_time = current_time
-
-            # Start all user tasks
-            progress_task = asyncio.create_task(log_progress())
-            user_tasks = [
-                asyncio.create_task(
-                    self._user_loop(i, session, end_time, results, results_lock)
-                )
-                for i in range(num_concurrent)
-            ]
-
-            # Wait for all users to complete
-            await asyncio.gather(*user_tasks)
-            progress_task.cancel()
-            try:
-                await progress_task
-            except asyncio.CancelledError:
-                pass
-
-        print(f"{log_prefix}Load test complete: {len(results)} total requests")
-
-        return LoadTestResult(
-            results=results,
-            warmup_duration_s=warmup_duration_s,
-            steady_state_duration_s=steady_state_duration_s,
-            num_concurrent=num_concurrent,
-        )
-
-
-def save_results_to_csv(results: LoadTestResult, output_path: Path) -> None:
-    """
-    Save load test results to CSV file.
-
-    Args:
-        results: LoadTestResult to save.
-        output_path: Path to output CSV file.
-    """
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    fieldnames = [
-        "request_id",
-        "start_time",
-        "end_time",
-        "latency_ms",
-        "success",
-        "error",
-        "parent_replica_id",
-        "parent_node_id",
-        "child_replica_id",
-        "child_node_id",
-        "simulated_latency_ms",
-        "routing_delay_ms",
-    ]
-
-    with open(output_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-
-        for result in results.steady_state_results:
-            writer.writerow({
-                "request_id": result.request_id,
-                "start_time": result.start_time,
-                "end_time": result.end_time,
-                "latency_ms": result.latency_ms,
-                "success": result.success,
-                "error": result.error,
-                "parent_replica_id": result.parent_replica_id,
-                "parent_node_id": result.parent_node_id,
-                "child_replica_id": result.child_replica_id,
-                "child_node_id": result.child_node_id,
-                "simulated_latency_ms": result.simulated_latency_ms,
-                "routing_delay_ms": result.routing_delay_ms,
-            })
-
-    print(f"Saved {len(results.steady_state_results)} results to {output_path}")
-
-
-def run_load_test_sync(
-    num_concurrent: int,
-    warmup_duration_s: float = 10.0,
-    steady_state_duration_s: float = 60.0,
-    target_url: str = "http://localhost:8000",
-) -> LoadTestResult:
-    """
-    Run a closed-loop load test using multi-process mode.
-
-    Always uses multi-process mode to avoid event loop conflicts when called
-    from async contexts (e.g., run_experiment).
-
-    Args:
-        num_concurrent: Number of concurrent users.
-        warmup_duration_s: Duration of warmup period.
-        steady_state_duration_s: Duration of steady state measurement.
-        target_url: URL to send requests to.
-
-    Returns:
-        LoadTestResult containing all request results.
-    """
-    # Always use multi-process mode to avoid asyncio.run() conflicts
-    # when called from within an existing event loop
-    generator = MultiProcessLoadGenerator(target_url=target_url)
-    return generator.run(
-        num_concurrent=num_concurrent,
-        warmup_duration_s=warmup_duration_s,
-        steady_state_duration_s=steady_state_duration_s,
+                    # Only record after warmup period
+                    if request_start >= warmup_end:
+                        async with results_lock:
+                            results.append(RequestResult(
+                                request_id=request_id,
+                                start_time=request_start,
+                                end_time=request_end,
+                                latency_ms=(request_end - request_start) * 1000,
+                                parent_replica_id=response.get("parent_replica_id"),
+                                parent_node_id=response.get("parent_node_id"),
+                                child_replica_id=response.get("child_replica_id"),
+                                child_node_id=response.get("child_node_id"),
+                                simulated_latency_ms=response.get("simulated_latency_ms"),
+                                client_to_parent_delay_ms=response.get("client_to_parent_delay_ms"),
+                                routing_delay_ms=response.get("routing_delay_ms"),
+                                success=True,
+                            ))
+                            
+                            # Log progress periodically (only from user 0 to avoid spam)
+                            if user_id == 0:
+                                now = time.perf_counter()
+                                if now - last_progress_time >= PROGRESS_INTERVAL_S:
+                                    elapsed = now - task_start_time
+                                    count = len(results)
+                                    delta_count = count - last_progress_count
+                                    delta_time = now - last_progress_time
+                                    rps = delta_count / delta_time if delta_time > 0 else 0
+                                    
+                                    phase = "warmup" if now < warmup_end else "steady"
+                                    remaining = end_time - now
+                                    
+                                    print(f"[Task {task_id}] {elapsed:.0f}s elapsed, "
+                                          f"{phase}, {count} reqs, ~{rps:.0f} rps, "
+                                          f"{remaining:.0f}s remaining")
+                                    
+                                    last_progress_time = now
+                                    last_progress_count = count
+                                    
+                except Exception as e:
+                    request_end = time.perf_counter()
+                    if request_start >= warmup_end:
+                        async with results_lock:
+                            results.append(RequestResult(
+                                request_id=request_id,
+                                start_time=request_start,
+                                end_time=request_end,
+                                latency_ms=(request_end - request_start) * 1000,
+                                success=False,
+                                error=str(e),
+                            ))
+        
+        print(f"[Task {task_id}] Starting with {num_users} users, "
+              f"{warmup_s}s warmup + {duration_s}s steady state")
+        
+        # Run all users concurrently within this task
+        await asyncio.gather(*[user_loop(i) for i in range(num_users)])
+        
+        task_end_time = time.perf_counter()
+        total_duration = task_end_time - task_start_time
+        avg_rps = len(results) / duration_s if duration_s > 0 else 0
+        print(f"[Task {task_id}] Complete: {len(results)} requests in {total_duration:.1f}s "
+              f"(~{avg_rps:.0f} rps avg)")
+        
+        return results, task_start_time, task_end_time
+    
+    results, task_start_time, task_end_time = asyncio.run(run())
+    
+    # Write results directly to S3
+    s3_file_path = f"{s3_output_path}/task_{task_id:04d}.csv"
+    write_results_to_s3(results, s3_file_path)
+    
+    # Return lightweight summary only
+    return TaskSummary(
+        task_id=task_id,
+        num_requests=len(results),
+        num_successful=sum(1 for r in results if r.success),
+        num_failed=sum(1 for r in results if not r.success),
+        s3_file_path=s3_file_path,
+        start_time=task_start_time,
+        end_time=task_end_time,
     )
 
 
-async def run_load_test(
+def run_load_test(
+    parent_app_name: str,
     num_concurrent: int,
-    warmup_duration_s: float = 10.0,
-    steady_state_duration_s: float = 60.0,
-    target_url: str = "http://localhost:8000",
-) -> LoadTestResult:
+    duration_s: float,
+    warmup_s: float,
+    s3_output_path: str,
+) -> LoadTestSummary:
     """
-    Async convenience function to run a closed-loop load test (single-process only).
-
-    For high concurrency (>100), use run_load_test_sync() instead which supports
-    multi-process mode.
-
+    Run a closed-loop load test using Ray tasks.
+    
+    Distributes concurrent users across Ray tasks, with each task handling
+    up to MAX_USERS_PER_TASK users. Results are written directly to S3.
+    
+    Tasks are scheduled on nodes with the "load_test" custom resource.
+    Each task requests 1/num_tasks of the resource to ensure all tasks
+    fit on the designated load generator node.
+    
     Args:
-        num_concurrent: Number of concurrent users.
-        warmup_duration_s: Duration of warmup period.
-        steady_state_duration_s: Duration of steady state measurement.
-        target_url: URL to send requests to.
-
+        parent_app_name: Name of the parent Serve app to call.
+        num_concurrent: Total number of concurrent users.
+        duration_s: Duration of steady-state measurement.
+        warmup_s: Duration of warmup period.
+        s3_output_path: S3 path prefix for results.
+    
     Returns:
-        LoadTestResult containing all request results.
+        LoadTestSummary with aggregated counts and task details.
     """
-    generator = ClosedLoopLoadGenerator(target_url=target_url)
-    return await generator.run(
-        num_concurrent=num_concurrent,
-        warmup_duration_s=warmup_duration_s,
-        steady_state_duration_s=steady_state_duration_s,
-    )
-
-
-if __name__ == "__main__":
-    # Quick test with low concurrency
-    async def main():
-        results = await run_load_test(
-            num_concurrent=10,
-            warmup_duration_s=2.0,
-            steady_state_duration_s=5.0,
+    # Calculate number of tasks needed
+    num_tasks = max(1, math.ceil(num_concurrent / MAX_USERS_PER_TASK))
+    users_per_task = num_concurrent // num_tasks
+    remainder = num_concurrent % num_tasks
+    
+    # Each task requests 1/num_tasks of the "load_test" resource
+    # This ensures all tasks fit on a node with load_test: 1
+    load_test_resource = 1.0 / num_tasks
+    
+    print(f"Load test configuration:")
+    print(f"  Total concurrent users: {num_concurrent}")
+    print(f"  Number of tasks: {num_tasks}")
+    print(f"  Users per task: ~{users_per_task}")
+    print(f"  Resource per task: load_test={load_test_resource:.4f}")
+    print(f"  S3 output: {s3_output_path}")
+    
+    # Spawn Ray tasks with custom resource for node affinity
+    task_refs = []
+    for i in range(num_tasks):
+        # Distribute remainder across first tasks
+        task_users = users_per_task + (1 if i < remainder else 0)
+        task_refs.append(
+            run_load_generator_task.options(
+                num_cpus=1,
+                resources={"load_test": load_test_resource},
+            ).remote(
+                task_id=i,
+                parent_app_name=parent_app_name,
+                num_users=task_users,
+                duration_s=duration_s,
+                warmup_s=warmup_s,
+                s3_output_path=s3_output_path,
+            )
         )
-        print(f"\nResults summary:")
-        print(f"  Concurrent users: {results.num_concurrent}")
-        print(f"  Total requests: {results.total_requests}")
-        print(f"  Successful: {results.successful_requests}")
-        print(f"  Failed: {results.failed_requests}")
-        print(f"  Error rate: {results.error_rate:.2%}")
-        print(f"  Achieved RPS: {results.achieved_rps:.1f}")
-        print(f"  Goodput: {results.goodput:.1f}")
-
-    asyncio.run(main())
+        print(f"  Started task {i}: {task_users} users")
+    
+    # Wait for all tasks to complete
+    print("Waiting for tasks to complete...")
+    task_summaries = ray.get(task_refs)
+    
+    print(f"All {num_tasks} tasks complete")
+    
+    return LoadTestSummary(
+        task_summaries=task_summaries,
+        num_concurrent=num_concurrent,
+        num_tasks=num_tasks,
+        warmup_s=warmup_s,
+        duration_s=duration_s,
+    )
