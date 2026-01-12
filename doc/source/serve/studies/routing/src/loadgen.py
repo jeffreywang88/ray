@@ -12,7 +12,7 @@ import math
 import time
 import uuid
 from dataclasses import dataclass, asdict
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import ray
 from ray import serve
@@ -209,32 +209,49 @@ def run_load_generator_task(
     
     async def run():
         # Get DeploymentHandle for this task
+        print(f"[Task {task_id}] Getting app handle...")
         parent_handle = serve.get_app_handle(parent_app_name)
-        
-        results: List[RequestResult] = []
-        results_lock = asyncio.Lock()
+        print(f"[Task {task_id}] Got app handle")
         
         task_start_time = time.perf_counter()
         warmup_end = task_start_time + warmup_s
         end_time = task_start_time + warmup_s + duration_s
         
-        # Track last progress log time
+        # Track last progress log time (only accessed by user 0)
         last_progress_time = task_start_time
         last_progress_count = 0
         
-        async def user_loop(user_id: int):
-            """Single user making closed-loop requests."""
+        async def user_loop(user_id: int) -> Tuple[List[RequestResult], int, int, int]:
+            """Single user making closed-loop requests.
+            
+            Returns per-user results and counters to avoid lock contention.
+            Each user maintains its own list, aggregated at the end.
+            """
             nonlocal last_progress_time, last_progress_count
             
+            # Per-user state (no locks needed)
+            user_results: List[RequestResult] = []
+            user_started = 0
+            user_completed = 0
+            user_failed = 0
+            
+            loop_count = 0
             while time.perf_counter() < end_time:
+                loop_count += 1
                 request_id = str(uuid.uuid4())
                 request_start = time.perf_counter()
+                user_started += 1
+                
+                # Log first request and periodically for user 0
+                if user_id == 0 and (loop_count == 1 or loop_count % 100 == 0):
+                    print(f"[Task {task_id}] User 0 loop {loop_count}")
                 
                 try:
                     # Use wall-clock time for cross-process timing
                     client_send_time = time.time()
                     response = await parent_handle.remote(client_send_time)
                     request_end = time.perf_counter()
+                    user_completed += 1
                     
                     # Capture wall-clock receive time for return path timing
                     client_receive_time = time.time()
@@ -245,78 +262,122 @@ def run_load_generator_task(
                     
                     # Only record after warmup period
                     if request_start >= warmup_end:
-                        async with results_lock:
-                            results.append(RequestResult(
-                                request_id=request_id,
-                                start_time=request_start,
-                                end_time=request_end,
-                                latency_ms=(request_end - request_start) * 1000,
-                                parent_replica_id=response.get("parent_replica_id"),
-                                parent_node_id=response.get("parent_node_id"),
-                                child_replica_id=response.get("child_replica_id"),
-                                child_node_id=response.get("child_node_id"),
-                                simulated_latency_ms=response.get("simulated_latency_ms"),
-                                # Forward path
-                                client_to_parent_delay_ms=response.get("client_to_parent_delay_ms"),
-                                parent_to_child_delay_ms=response.get("parent_to_child_delay_ms"),
-                                # Return path
-                                child_to_parent_delay_ms=response.get("child_to_parent_delay_ms"),
-                                parent_to_client_delay_ms=parent_to_client_delay_ms,
-                                success=True,
-                            ))
-                            
-                            # Log progress periodically (only from user 0 to avoid spam)
-                            if user_id == 0:
-                                now = time.perf_counter()
-                                if now - last_progress_time >= PROGRESS_INTERVAL_S:
-                                    elapsed = now - task_start_time
-                                    count = len(results)
-                                    delta_count = count - last_progress_count
-                                    delta_time = now - last_progress_time
-                                    rps = delta_count / delta_time if delta_time > 0 else 0
-                                    
-                                    phase = "warmup" if now < warmup_end else "steady"
-                                    remaining = end_time - now
-                                    
-                                    print(f"[Task {task_id}] {elapsed:.0f}s elapsed, "
-                                          f"{phase}, {count} reqs, ~{rps:.0f} rps, "
-                                          f"{remaining:.0f}s remaining")
-                                    
-                                    last_progress_time = now
-                                    last_progress_count = count
-                                    
+                        user_results.append(RequestResult(
+                            request_id=request_id,
+                            start_time=request_start,
+                            end_time=request_end,
+                            latency_ms=(request_end - request_start) * 1000,
+                            parent_replica_id=response.get("parent_replica_id"),
+                            parent_node_id=response.get("parent_node_id"),
+                            child_replica_id=response.get("child_replica_id"),
+                            child_node_id=response.get("child_node_id"),
+                            simulated_latency_ms=response.get("simulated_latency_ms"),
+                            # Forward path
+                            client_to_parent_delay_ms=response.get("client_to_parent_delay_ms"),
+                            parent_to_child_delay_ms=response.get("parent_to_child_delay_ms"),
+                            # Return path
+                            child_to_parent_delay_ms=response.get("child_to_parent_delay_ms"),
+                            parent_to_client_delay_ms=parent_to_client_delay_ms,
+                            success=True,
+                        ))
+                        
+                        # Log progress periodically (only from user 0 to avoid spam)
+                        if user_id == 0:
+                            now = time.perf_counter()
+                            if now - last_progress_time >= PROGRESS_INTERVAL_S:
+                                elapsed = now - task_start_time
+                                count = len(user_results)
+                                delta_count = count - last_progress_count
+                                delta_time = now - last_progress_time
+                                rps = delta_count / delta_time if delta_time > 0 else 0
+                                
+                                phase = "warmup" if now < warmup_end else "steady"
+                                remaining = end_time - now
+                                
+                                print(f"[Task {task_id}] {elapsed:.0f}s elapsed, "
+                                      f"{phase}, user0 has {count} reqs, ~{rps:.0f} rps, "
+                                      f"{remaining:.0f}s remaining")
+                                
+                                last_progress_time = now
+                                last_progress_count = count
+                                
                 except Exception as e:
                     request_end = time.perf_counter()
+                    user_failed += 1
+                    
+                    # Log errors (but not too many)
+                    if user_failed <= 5 or user_failed % 100 == 0:
+                        print(f"[Task {task_id}] User {user_id} request failed ({user_failed} total): {str(e)[:100]}")
+                    
                     if request_start >= warmup_end:
-                        async with results_lock:
-                            results.append(RequestResult(
-                                request_id=request_id,
-                                start_time=request_start,
-                                end_time=request_end,
-                                latency_ms=(request_end - request_start) * 1000,
-                                success=False,
-                                error=str(e),
-                            ))
+                        user_results.append(RequestResult(
+                            request_id=request_id,
+                            start_time=request_start,
+                            end_time=request_end,
+                            latency_ms=(request_end - request_start) * 1000,
+                            success=False,
+                            error=str(e),
+                        ))
+            
+            return user_results, user_started, user_completed, user_failed
         
         print(f"[Task {task_id}] Starting with {num_users} users, "
-              f"{warmup_s}s warmup + {duration_s}s steady state")
+              f"{warmup_s}s warmup + {duration_s}s steady state, "
+              f"end_time={end_time - task_start_time:.1f}s from now")
         
         # Run all users concurrently within this task
-        await asyncio.gather(*[user_loop(i) for i in range(num_users)])
+        # Each user returns its own results list - no lock contention!
+        print(f"[Task {task_id}] Launching {num_users} user loops...")
+        user_outputs = await asyncio.gather(*[user_loop(i) for i in range(num_users)])
+        print(f"[Task {task_id}] All user loops finished")
+        await parent_handle.shutdown_async()
+        
+        # Aggregate results from all users (single-threaded, no locks needed)
+        results: List[RequestResult] = []
+        requests_started = 0
+        requests_completed = 0
+        requests_failed = 0
+        for user_results, user_started, user_completed, user_failed in user_outputs:
+            results.extend(user_results)
+            requests_started += user_started
+            requests_completed += user_completed
+            requests_failed += user_failed
         
         task_end_time = time.perf_counter()
         total_duration = task_end_time - task_start_time
         avg_rps = len(results) / duration_s if duration_s > 0 else 0
         print(f"[Task {task_id}] Complete: {len(results)} requests in {total_duration:.1f}s "
-              f"(~{avg_rps:.0f} rps avg)")
+              f"(~{avg_rps:.0f} rps avg), "
+              f"started={requests_started}, completed={requests_completed}, failed={requests_failed}")
         
+        # # Shutdown the Serve handle's async resources before asyncio.run() closes the loop
+        # # This is critical when RAY_SERVE_USE_CENTRALIZED_ROUTING=1 is enabled
+        # print(f"[Task {task_id}] Shutting down handle resources...")
+        # try:
+        #     # Cancel any pending tasks in the current event loop
+        #     loop = asyncio.get_event_loop()
+        #     pending = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
+        #     if pending:
+        #         print(f"[Task {task_id}] Cancelling {len(pending)} pending tasks...")
+        #         for task in pending:
+        #             task.cancel()
+        #         # Wait for cancellation with timeout
+        #         await asyncio.wait(pending, timeout=2.0)
+        # except Exception as e:
+        #     print(f"[Task {task_id}] Handle shutdown error (non-fatal): {e}")
+        
+        print(f"[Task {task_id}] Returning from async run()")
         return results, task_start_time, task_end_time
     
+    print(f"[Task {task_id}] Calling asyncio.run()...")
     results, task_start_time, task_end_time = asyncio.run(run())
+    print(f"[Task {task_id}] asyncio.run() returned with {len(results)} results")
     
     # Write results directly to S3
     s3_file_path = f"{s3_output_path}/task_{task_id:04d}.csv"
+    print(f"[Task {task_id}] Writing to S3: {s3_file_path}")
     write_results_to_s3(results, s3_file_path)
+    print(f"[Task {task_id}] S3 write complete, returning TaskSummary")
     
     # Return lightweight summary only
     return TaskSummary(

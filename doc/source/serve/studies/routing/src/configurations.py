@@ -25,16 +25,22 @@ class Algorithm(Enum):
     POW2 = "pow2"  # Default Power-of-Two Choices
     RANDOM = "random"
     ROUND_ROBIN = "round_robin"
+    CENTRALIZED_POW2 = "centralized_pow2"
 
     def get_router_class(self) -> Optional[str]:
         """Return import path for custom router, or None for default Pow2."""
         if self == Algorithm.POW2:
-            return None
+            print("Using Pow2 Router")
+            return "ray.serve._private.request_router.pow_2_router:PowerOfTwoChoicesRequestRouter"
         elif self == Algorithm.RANDOM:
+            print("Using Random Router")
             return "src.routers.RandomRequestRouter"
         elif self == Algorithm.ROUND_ROBIN:
+            print("Using Round Robin Router")
             return "src.routers.RoundRobinRequestRouter"
-
+        elif self == Algorithm.CENTRALIZED_POW2:
+            print("Using Centralized Pow2 Router")
+            return "ray.serve._private.request_router.centralized_router:CentralizedPow2Router"
 
 class Scale(Enum):
     """Cluster scale options."""
@@ -93,8 +99,11 @@ RPS_PER_REPLICA = 300
 CONCURRENT_PER_REPLICA = 5
 
 # Maximum concurrent users per Ray task for load generation
-# Each task runs an async event loop with this many concurrent user coroutines
-MAX_USERS_PER_TASK = 96
+# Each task runs an async event loop with this many concurrent user coroutines.
+# The load generator uses lock-free per-user result collection, so this can be
+# set relatively high without lock contention issues. The main limit is memory
+# for per-user result lists before aggregation.
+MAX_USERS_PER_TASK = 48
 
 # CPU per replica (both Parent and Child deployments)
 CPU_PER_REPLICA = 1

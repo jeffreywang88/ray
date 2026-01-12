@@ -165,7 +165,7 @@ def main():
     parser.add_argument(
         "--algorithm",
         type=str,
-        choices=["pow2", "random", "round_robin"],
+        choices=[alg.value for alg in Algorithm],
         help="Run only configurations with this algorithm",
     )
     parser.add_argument(

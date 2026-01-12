@@ -73,43 +73,122 @@ WARNING: Failed to get queue length from Replica(...) within 1.0s
 
 A two-tier architecture that addresses both problems:
 
-1. **Central Service (Ray Actor)**: One per deployment, probes replicas in background
-2. **Process-Level Singleton Cache**: Shared by all routers in same process, pulls from central service
+1. **Central Service (Ray Actor)**: One per deployment, maintains queue lengths with timestamps
+2. **Router-Level Cache**: Each router maintains its own cache, pulls deltas from central service
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │   Queue Length Service (Ray Actor)  │
-                    │   (One per deployment)              │
-                    │                                     │
-                    │   - Background probing loop         │
-                    │   - Probes each replica periodically│
-                    │   - Caches all queue lengths        │
-                    └─────────────────────────────────────┘
-                           │                    ↑
-                      Probe replicas       Pull (periodic)
-                           ↓                    │
-┌─────────────┐    ┌─────────────────────────────────────────────────┐
-│   Replica   │    │              Process (Task/Actor)               │
-│   Replica   │    │  ┌─────────────────────────────────────────┐   │
-│   Replica   │    │  │  Singleton Cache (process-level)        │   │
-└─────────────┘    │  │  - Shared by all routers in process     │   │
-                   │  │  - Pulls from central service (async)   │   │
-                   │  │  - Zero probe latency for routers       │   │
-                   │  └─────────────────────────────────────────┘   │
-                   │         ↑              ↑              ↑        │
-                   │    ┌────┴────┐    ┌────┴────┐    ┌────┴────┐   │
-                   │    │ Router  │    │ Router  │    │ Router  │   │
-                   │    │(Handle) │    │(Handle) │    │(Handle) │   │
-                   │    └─────────┘    └─────────┘    └─────────┘   │
-                   └─────────────────────────────────────────────────┘
+                         ┌─────────────────────────────────────┐
+                         │   Queue Length Service (Ray Actor)  │
+                         │   (One per deployment)              │
+                         │                                     │
+                         │   State: {replica_id: (queue_len,   │
+                         │                        timestamp)}  │
+                         │                                     │
+                         │   - Lazy probing (only if stale)    │
+                         │   - Returns only changed replicas   │
+                         └─────────────────────────────────────┘
+                              ↓ │              ↑         ↑         ↑
+               Probe (if stale) │       Pull (when router needs probe)
+                                │              │         │         │
+┌─────────────┐ ←───────────────┘              │         │         │
+│   Replica   │                                │         │         │
+│   Replica   │                           ┌────┴───┐ ┌───┴────┐ ┌──┴─────┐
+│   Replica   │                           │ Router │ │ Router │ │ Router │
+└─────────────┘                           │ Cache  │ │ Cache  │ │ Cache  │
+                                          └────────┘ └────────┘ └────────┘
+                                               │          │          │
+                                          (Process 1) (Process 2) (Process 3)
 ```
 
 ### Key Design Points
 
-1. **Background probing** - Probing happens in central service, completely out of request path
-2. **Process-level batching** - All routers in a process share one cache, no per-router probing
-3. **One actor per deployment** - Central service scales with deployments, not with handles
-4. **Pull model** - Singleton cache pulls from central actor periodically (in background)
+1. **Async background pulls** - Router pulls from service in background (not in request path):
+   - Request path reads from local cache immediately
+   - Background task pulls from service when cache needs refresh
+2. **Pull triggered on need** - Router uses existing logic to decide when to pull:
+   - Cache miss (no entry for replica), OR
+   - Cache entry expired (TTL), OR
+   - Replica at `max_ongoing_requests` (full queue)
+3. **Lazy probing by service** - Service only probes replica if its own data is stale:
+   - No record exists, OR
+   - No update for 10s, OR
+   - Replica at `max_ongoing_requests`
+4. **Delta updates** - Router sends timestamps, service returns only changed replicas
+
+### Pull Protocol
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                              Router                                      │
+│                                                                          │
+│  REQUEST PATH (sync):                    BACKGROUND TASK (always running):│
+│  ┌─────────────────────────┐            ┌─────────────────────────────┐ │
+│  │ 1. Check cache          │            │ while True:                 │ │
+│  │ 2. If hit → route       │            │   await work_queue.get()    │ │
+│  │ 3. If miss → use stale  │ ─enqueue─> │   # wakes up when work added│ │
+│  │    or random, then      │            │   pull(replicas_to_refresh) │ │
+│  │    enqueue refresh work │            │   update_cache(response)    │ │
+│  └─────────────────────────┘            └─────────┼───────────────────┘ │
+└──────────────────────────────────────────────────┼──────────────────────┘
+                                                   │
+                                                   ▼
+                                    ┌─────────────────────────────┐
+                                    │   Queue Length Service      │
+                                    │                             │
+                                    │ For each replica requested: │
+                                    │ - If service data stale:    │
+                                    │   probe replica first       │
+                                    │ - Return (queue_len, ts)    │
+                                    │   if newer than client's    │
+                                    └─────────────────────────────┘
+```
+
+### Lazy Probing Logic
+
+```python
+class QueueLengthService:
+    def __init__(self, replica_info: Dict[ReplicaID, ReplicaInfo]):
+        self.state: Dict[ReplicaID, (int, float)] = {}  # {replica: (queue_len, timestamp)}
+        self.replica_info = replica_info  # {replica: max_ongoing_requests, ...}
+        self.staleness_threshold_s = 10.0  # 10 seconds
+    
+    def _should_probe(self, replica_id: ReplicaID) -> bool:
+        entry = self.state.get(replica_id)
+        
+        # No record exists
+        if entry is None:
+            return True
+        
+        queue_len, timestamp = entry
+        
+        # No update for 10s
+        if (time.time() - timestamp) > self.staleness_threshold_s:
+            return True
+        
+        # Replica is at max_ongoing_requests (full queue)
+        max_ongoing = self.replica_info[replica_id].max_ongoing_requests
+        if queue_len >= max_ongoing:
+            return True
+        
+        return False
+    
+    async def pull(self, client_timestamps: Dict[ReplicaID, float]) -> Dict[ReplicaID, Tuple[int, float]]:
+        updates = {}
+        for replica_id, client_ts in client_timestamps.items():
+            # Probe if needed
+            if self._should_probe(replica_id):
+                queue_len = await self._probe_replica(replica_id)
+                service_ts = time.time()
+                self.state[replica_id] = (queue_len, service_ts)
+            else:
+                queue_len, service_ts = self.state[replica_id]
+            
+            # Only return if service has newer data
+            if service_ts > client_ts:
+                updates[replica_id] = (queue_len, service_ts)
+        
+        return updates
+```
 
 ### Existing Router Optimizations (to preserve)
 
@@ -129,55 +208,21 @@ Each router has an important optimization for keeping the cache accurate without
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-This prevents the "thundering herd to one replica" problem:
-- Without: 10 rapid requests all see queue_len=0, all route to same replica
-- With: 1st sees 0, 2nd sees 1, 3rd sees 2... requests spread out
-
-**Code locations:**
-- `on_send_request()` - `request_router.py` lines 687-693
-- `on_new_queue_len_info()` - `request_router.py` lines 675-685  
-- Called from `router.py` lines 796 and 817
+This prevents the "stale cache thundering herd" problem:
+- Without increment: If 10 requests all happen to select replica A before any probe returns, they all see queue_len=0 and may all route to A
+- With increment: After routing to A, cache[A] becomes 1. Next request selecting A sees queue_len=1, making other replicas more attractive
 
 **With centralized service, routers will:**
 - Continue incrementing shared cache on `on_send_request()`
 - Receive accurate updates from central service instead of per-router probes
 - Maintain locality routing, pow2 selection, and other existing optimizations
 
-### Scaling Analysis: One Actor Per Deployment
-
 **Variables:**
 - R = number of replicas
-- P = number of processes with routers (tasks/actors making requests)
-- I = probe interval (how often central actor probes replicas)
-- Q = query interval (how often singleton caches pull from central actor)
+- H = number of routers/handles (each has its own cache)
+- RPS = total requests per second across all routers
+- Cache hit rate = % of requests where router cache is fresh
 
-**Central Actor Workload:**
-
-| Operation | Rate | Example (R=512, P=100, I=Q=100ms) |
-|-----------|------|-----------------------------------|
-| Probe replicas | R / I | 512 / 0.1s = **5,120 RPCs/sec** |
-| Serve cache queries | P / Q | 100 / 0.1s = **1,000 RPCs/sec** |
-| **Total** | (R + P) / I | **6,120 RPCs/sec** |
-
-**Comparison to Current (per-router probing):**
-
-| Metric | Current (per-router) | Centralized |
-|--------|---------------------|-------------|
-| Probe RPCs/sec | P × 2 × (requests/sec) | R / I |
-| Example: 100 processes, 1000 RPS each, 512 replicas | 100 × 2 × 1000 = **200,000** | 512 / 0.1 = **5,120** |
-| **Reduction** | - | **~40x fewer probes** |
-
-**Actor Capacity:**
-- A Ray actor can handle **10,000-50,000+ simple RPCs/sec** (depending on payload size)
-- Queue length response is tiny (~100 bytes for 512 replicas)
-- At 6,120 RPCs/sec, the actor is well under capacity
-
-**Scaling Limits:**
-- **R < 5,000 replicas**: Single actor handles easily
-- **R > 5,000 replicas**: Consider sharding by replica ID range or hierarchical aggregation
-- **P > 1,000 processes**: Consider per-node aggregator actors
-
-**Conclusion:** One actor per deployment scales comfortably to ~1,000 replicas and ~500 processes. Beyond that, add per-node aggregators as a second tier.
 
 ### Benefits
 
@@ -186,5 +231,83 @@ This prevents the "thundering herd to one replica" problem:
 - **No event loop contention** - No probe tasks competing with request handling
 - **Consistent view** - All routers see the same queue length data
 - **Graceful degradation** - If cache is stale, fallback to random selection
+
+---
+
+## Alternative: Push-Based Design (JBT-d)
+
+Instead of the service probing replicas, replicas can **push** their queue length to the central service. This is known as "Join Below Threshold D" (JBT-d) in the literature.
+
+### How It Works
+
+```
+┌─────────────┐   push(queue_len, ts)    ┌─────────────────────────────┐
+│   Replica   │ ───────────────────────> │   Queue Length Service      │
+│   Replica   │   when has capacity      │                             │
+│   Replica   │   (ongoing < max)        │   State: {replica: (q, ts)} │
+└─────────────┘                          └─────────────────────────────┘
+                                                       ↑
+                                                  pull (same as before)
+                                                       │
+                                                 ┌─────┴─────┐
+                                                 │  Routers  │
+                                                 └───────────┘
+```
+
+### Key Benefits
+
+1. **No probing overhead** - Service never probes; replicas push. Eliminates probe RPCs entirely.
+2. **Natural backpressure** - Full replicas (`ongoing >= max`) stop pushing. Silence = at capacity.
+3. **Fresher data for available replicas** - Replicas with capacity actively announce it.
+4. **Simpler service** - Just stores pushes, no probe scheduling or timeout handling.
+
+### Replica Push Logic
+
+```python
+class ReplicaActor:
+    async def _push_loop(self):
+        """Push queue length when replica has capacity."""
+        last_pushed_queue_len = None
+        
+        while True:
+            current = self._num_ongoing_requests
+            max_ongoing = self._max_ongoing_requests
+            
+            # Push when:
+            # 1. Have capacity (current < max), AND
+            # 2. Queue length changed since last push
+            if current < max_ongoing and current != last_pushed_queue_len:
+                await self._queue_length_service.receive_push(
+                    self.replica_id, 
+                    current, 
+                    time.time()
+                )
+                last_pushed_queue_len = current
+            
+            await asyncio.sleep(0.01)  # 10ms check interval
+```
+
+### Router Side Unchanged
+
+The router-side design remains the same:
+- Local cache with timestamps
+- Optimistic increment on `on_send_request()`
+- Background pull from service when cache needs refresh
+- Existing pow2 selection, locality routing, etc.
+
+---
+
+## Considered: Token-Based Tracking
+
+Another approach is **token-based tracking** where the dispatcher maintains tokens representing each replica's capacity. Routers acquire a token before routing and release it when the request completes.
+
+**Why not chosen:**
+- **Adds latency to request path** - Token acquisition requires RPC to dispatcher before routing
+- **Token leak on failure** - If router crashes, tokens are stuck until timeout/lease expires
+- **Centralized bottleneck** - All routers compete for dispatcher on every request
+- **Batching doesn't help** - Can't know how many tokens to fetch (pow2 picks random replicas each time). Fetching too many hoards tokens from other routers; too few requires frequent refills
+- **Optimistic increment already provides similar benefit** - `on_send_request()` gives us approximate token semantics locally without RPC
+
+Token-based is more **accurate** (exact tracking) but the queue-length caching approach is **faster** (local cache reads) and sufficient for load balancing purposes where approximate data is acceptable.
 
 ---

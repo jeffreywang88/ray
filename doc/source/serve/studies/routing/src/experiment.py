@@ -196,8 +196,8 @@ async def run_experiment(
         # Step 0b: Set environment for faster shutdown (proxy drain period)
         os.environ["RAY_SERVE_PROXY_MIN_DRAINING_PERIOD_S"] = "0"
         
-        # Increase runtime env package expiration to avoid GCS race conditions
         os.environ["RAY_RUNTIME_ENV_TEMPORARY_REFERENCE_EXPIRATION_S"] = "1800"
+        os.environ["RAY_SERVE_DISABLE_SHUTTING_DOWN_INGRESS_REPLICAS_FORCEFULLY"] = "1"
         
         # Step 1: Set environment for topology
         if config.topology == Topology.PACKED:
@@ -275,10 +275,21 @@ async def run_experiment(
     finally:
         # Step 7: Shutdown Serve for clean state between experiments
         print("Shutting down Serve...")
-        await serve.shutdown_async()
+        try:
+            await asyncio.wait_for(serve.shutdown_async(), timeout=60.0)
+            print("Serve shutdown complete")
+        except asyncio.TimeoutError:
+            print("WARNING: Serve shutdown timed out after 60s, continuing...")
+        except Exception as e:
+            print(f"WARNING: Serve shutdown error: {e}")
+        
+        print("Disconnecting Ray...")
+        try:
+            ray.shutdown()
+        except Exception as e:
+            print(f"WARNING: Ray shutdown error: {e}")
         print("Shutdown complete")
-        ray.shutdown()
-        await asyncio.sleep(3)
+        await asyncio.sleep(1)
 
 
 def run_experiment_sync(

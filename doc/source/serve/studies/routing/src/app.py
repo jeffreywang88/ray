@@ -194,6 +194,10 @@ def build_app(
     parent_config = {
         "num_replicas": parent_replicas,
     }
+    if request_router_class:
+        parent_config["request_router_config"] = RequestRouterConfig(
+            request_router_class=request_router_class,
+        )
 
     # Pass locality preference to ParentDeployment constructor
     # The handle._init() call happens inside the deployment's __init__

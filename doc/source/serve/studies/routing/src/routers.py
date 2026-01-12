@@ -17,7 +17,6 @@ from ray.serve.request_router import (
     RunningReplica,
 )
 
-
 class RandomRequestRouter(FIFOMixin, RequestRouter):
     """
     Random request router that selects replicas uniformly at random.
@@ -45,7 +44,6 @@ class RandomRequestRouter(FIFOMixin, RequestRouter):
         """
         if not candidate_replicas:
             return [[]]
-
         selected = random.choice(candidate_replicas)
         return [[selected]]
 
