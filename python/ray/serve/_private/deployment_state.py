@@ -75,6 +75,7 @@ from ray.serve.schema import (
     ReplicaRank,
     _deployment_info_to_schema,
 )
+from ray.serve.gang import GangRuntimeFailurePolicy, GangSchedulingConfig
 from ray.util import metrics as ray_metrics
 from ray.util.placement_group import PlacementGroup
 
@@ -1443,6 +1444,10 @@ class DeploymentReplica:
         if not graceful:
             timeout_s = 0
         self._shutdown_deadline = time.time() + timeout_s
+
+    def force_stop(self, log_shutdown_message: bool = False) -> None:
+        """Force stop the replica immediately."""
+        self._actor.force_stop(log_shutdown_message=log_shutdown_message)
 
     def check_stopped(self) -> bool:
         """Check if the replica has finished stopping."""
@@ -3181,6 +3186,53 @@ class DeploymentState:
             },
         )
 
+    def _get_gang_scheduling_config(self) -> Optional[GangSchedulingConfig]:
+        info = self._target_state.info
+        if info is None:
+            return None
+        gang_config = getattr(info, "gang_scheduling_config", None)
+        if gang_config is None:
+            return None
+        if isinstance(gang_config, dict):
+            return GangSchedulingConfig.parse_obj(gang_config)
+        return gang_config
+
+    @staticmethod
+    def _get_gang_id_for_replica(
+        replica: DeploymentReplica, gang_size: int
+    ) -> Optional[int]:
+        rank = replica.rank
+        if rank is None or gang_size <= 0:
+            return None
+        return rank.rank // gang_size
+
+    def _get_gang_replicas_for_restart(
+        self,
+        replica: DeploymentReplica,
+        running_replicas: List[DeploymentReplica],
+        gang_config: Optional[GangSchedulingConfig],
+    ) -> Tuple[Optional[int], List[DeploymentReplica]]:
+        if (
+            gang_config is None
+            or gang_config.runtime_failure_policy
+            != GangRuntimeFailurePolicy.RESTART_GANG
+        ):
+            return None, []
+
+        gang_id = self._get_gang_id_for_replica(replica, gang_config.gang_size)
+        if gang_id is None:
+            return None, []
+
+        gang_replicas = []
+        for candidate in running_replicas:
+            candidate_gang_id = self._get_gang_id_for_replica(
+                candidate, gang_config.gang_size
+            )
+            if candidate_gang_id == gang_id:
+                gang_replicas.append(candidate)
+
+        return gang_id, gang_replicas
+
     def check_and_update_replicas(self):
         """
         Check current state of all DeploymentReplica being tracked, and compare
@@ -3188,9 +3240,17 @@ class DeploymentState:
         transition happened.
         """
 
-        for replica in self._replicas.pop(
-            states=[ReplicaState.RUNNING, ReplicaState.PENDING_MIGRATION]
-        ):
+        running_replicas = list(
+            self._replicas.pop(
+                states=[ReplicaState.RUNNING, ReplicaState.PENDING_MIGRATION]
+            )
+        )
+        gang_config = self._get_gang_scheduling_config()
+        skipped_replica_ids: Set[ReplicaID] = set()
+
+        for replica in running_replicas:
+            if replica.replica_id in skipped_replica_ids:
+                continue
             is_healthy = replica.check_health()
 
             # Record health check latency and failure metrics.
@@ -3215,6 +3275,35 @@ class DeploymentState:
                 routing_stats = replica.pull_routing_stats()
                 replica.record_routing_stats(routing_stats)
             else:
+                gang_id, gang_replicas = self._get_gang_replicas_for_restart(
+                    replica, running_replicas, gang_config
+                )
+                if gang_replicas:
+                    skipped_replica_ids.update(
+                        gang_replica.replica_id for gang_replica in gang_replicas
+                    )
+                    logger.warning(
+                        f"Replica {replica.replica_id} failed health check. "
+                        f"Restarting gang {gang_id} with "
+                        f"{len(gang_replicas)} replicas."
+                    )
+                    for gang_replica in gang_replicas:
+                        self._stop_replica(gang_replica, graceful_stop=False)
+                        gang_replica.force_stop(log_shutdown_message=False)
+                    # If any replica in the gang is of the target version,
+                    # mark deployment UNHEALTHY until recovery or redeploy.
+                    if any(
+                        gang_replica.version == self._target_state.version
+                        for gang_replica in gang_replicas
+                    ):
+                        self._curr_status_info = self._curr_status_info.handle_transition(
+                            trigger=DeploymentStatusInternalTrigger.HEALTH_CHECK_FAILED,
+                            message="A replica's health check failed and its gang "
+                            "was force restarted. This deployment will be UNHEALTHY "
+                            "until the gang recovers or a new deploy happens.",
+                        )
+                    continue
+
                 logger.warning(
                     f"Replica {replica.replica_id} failed health check, stopping it."
                 )

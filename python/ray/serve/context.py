@@ -25,6 +25,7 @@ from ray.serve.exceptions import RayServeException
 from ray.serve.grpc_util import RayServegRPCContext
 from ray.serve.schema import ReplicaRank
 from ray.util.annotations import DeveloperAPI
+from ray.serve.gang import GangContext
 
 logger = logging.getLogger(SERVE_LOGGER_NAME)
 
@@ -52,6 +53,7 @@ class ReplicaContext:
     rank: ReplicaRank
     world_size: int
     _handle_registration_callback: Optional[Callable[[DeploymentID], None]] = None
+    gang: Optional[GangContext] = None
 
     @property
     def app_name(self) -> str:

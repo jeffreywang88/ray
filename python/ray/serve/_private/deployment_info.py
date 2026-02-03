@@ -23,6 +23,7 @@ class DeploymentInfo:
         ingress: bool = False,
         target_capacity: Optional[float] = None,
         target_capacity_direction: Optional[TargetCapacityDirection] = None,
+        gang_scheduling_config: Optional[Any] = None,
     ):
         self.deployment_config = deployment_config
         self.replica_config = replica_config
@@ -42,6 +43,7 @@ class DeploymentInfo:
 
         self.target_capacity = target_capacity
         self.target_capacity_direction = target_capacity_direction
+        self.gang_scheduling_config = gang_scheduling_config
 
     def __getstate__(self) -> Dict[Any, Any]:
         clean_dict = self.__dict__.copy()
@@ -71,6 +73,7 @@ class DeploymentInfo:
             ingress=self.ingress,
             target_capacity=self.target_capacity,
             target_capacity_direction=self.target_capacity_direction,
+            gang_scheduling_config=self.gang_scheduling_config,
         )
 
     def set_target_capacity(
@@ -181,4 +184,5 @@ class DeploymentInfo:
             "actor_name": self.actor_name,
             "version": self.version,
             "end_time_ms": self.end_time_ms,
+            "gang_scheduling_config": self.gang_scheduling_config,
         }

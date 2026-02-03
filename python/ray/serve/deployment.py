@@ -15,6 +15,7 @@ from ray.serve._private.utils import DEFAULT, Default
 from ray.serve.config import AutoscalingConfig
 from ray.serve.schema import DeploymentSchema, LoggingConfig, RayActorOptionsSchema
 from ray.util.annotations import PublicAPI
+from ray.serve.gang import GangSchedulingConfig
 
 logger = logging.getLogger(SERVE_LOGGER_NAME)
 
@@ -237,6 +238,7 @@ class Deployment:
         _init_kwargs: Default[Dict[Any, Any]] = DEFAULT.VALUE,
         _internal: bool = False,
         max_constructor_retry_count: Default[int] = DEFAULT.VALUE,
+        gang_scheduling_config: Default[Union[Dict, GangSchedulingConfig, None]] = DEFAULT.VALUE,
     ) -> "Deployment":
         """Return a copy of this deployment with updated options.
 
