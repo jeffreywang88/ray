@@ -141,12 +141,40 @@ def _shared_serve_instance():
     # os.environ["SERVE_DEBUG_LOG"] = "1" <- Do not uncomment this.
 
     # Overriding task_retry_delay_ms to relaunch actors more quickly
-    ray.init(
-        num_cpus=36,
-        namespace="default_test_namespace",
-        _metrics_export_port=9999,
-        _system_config={"metrics_report_interval_ms": 1000, "task_retry_delay_ms": 50},
-    )
+    # ray.init(
+    #     num_cpus=36,
+    #     namespace="default_test_namespace",
+    #     _metrics_export_port=9999,
+    #     _system_config={"metrics_report_interval_ms": 1000, "task_retry_delay_ms": 50},
+    # )
+    # Check if we're connecting to an existing cluster
+    # If RAY_ADDRESS is set or there's an existing cluster, don't pass num_cpus or _system_config
+    ray_address = os.environ.get("RAY_ADDRESS")
+    init_kwargs = {
+        "namespace": "default_test_namespace",
+        "_metrics_export_port": 9999,
+    }
+    
+    # Only pass num_cpus and _system_config if we're starting a new cluster (not connecting to existing)
+    is_connecting_to_existing = False
+    if ray_address is not None:
+        is_connecting_to_existing = True
+    else:
+        # Check if there's an existing cluster by trying to find bootstrap address
+        try:
+            from ray._private.services import find_bootstrap_address
+            bootstrap_addr = find_bootstrap_address(None)
+            if bootstrap_addr is not None:
+                is_connecting_to_existing = True
+        except Exception:
+            pass  # If we can't determine, assume new cluster
+    
+    if not is_connecting_to_existing:
+        # Only set these when starting a new cluster
+        init_kwargs["num_cpus"] = 36
+        init_kwargs["_system_config"] = {"metrics_report_interval_ms": 1000, "task_retry_delay_ms": 50}
+    
+    ray.init(**init_kwargs)
     serve.start(
         proxy_location=ProxyLocation.HeadOnly,
         http_options={"host": "0.0.0.0"},

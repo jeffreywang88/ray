@@ -952,6 +952,66 @@ class TestGangSchedulerMethods:
         result = scheduler.get_gang_context_for_replica(replica_id)
         assert result is None
 
+    def test_replacement_replica_gets_gang_context(self):
+        """Test that a replacement replica is assigned to the gang with the empty slot."""
+        cluster_node_info_cache = MockClusterNodeInfoCache()
+        scheduler = DefaultDeploymentScheduler(
+            cluster_node_info_cache, "head_node", lambda *args, **kwargs: None
+        )
+
+        d_id = DeploymentID(name="test_deployment", app_name="test_app")
+        scheduler.on_deployment_created(d_id, SpreadDeploymentSchedulingPolicy())
+
+        # Create gang config with size 2
+        gang_config = GangSchedulingConfig(
+            gang_size=2,
+            runtime_failure_policy=GangRuntimeFailurePolicy.RESTART_REPLICA,
+        )
+        replica_config = ReplicaConfig.create(lambda: None)
+        scheduler.on_deployment_deployed(d_id, replica_config, gang_config)
+
+        # Create two replicas and assign them to a gang
+        replica1 = ReplicaID(unique_id="replica-1", deployment_id=d_id)
+        replica2 = ReplicaID(unique_id="replica-2", deployment_id=d_id)
+
+        scheduler._assign_replicas_to_gangs(d_id, [replica1, replica2])
+
+        # Verify both replicas are in the same gang
+        context1 = scheduler.get_gang_context_for_replica(replica1)
+        context2 = scheduler.get_gang_context_for_replica(replica2)
+        assert context1 is not None
+        assert context2 is not None
+        assert context1.gang_id == context2.gang_id
+        assert context1.world_size == 2
+        assert context2.world_size == 2
+        assert context1.rank == 0
+        assert context2.rank == 1
+
+        # Now simulate replica2 being stopped (creates empty slot)
+        scheduler.on_replica_stopping(replica2)
+
+        # Verify replica2 is no longer in the gang mapping
+        context2_after_stop = scheduler.get_gang_context_for_replica(replica2)
+        assert context2_after_stop is None
+
+        # Create a replacement replica
+        replica3 = ReplicaID(unique_id="replica-3", deployment_id=d_id)
+
+        # Assign the replacement replica - it should fill the empty slot
+        scheduler._assign_replicas_to_gangs(d_id, [replica3])
+
+        # Verify replica3 is now in the same gang as replica1
+        context3 = scheduler.get_gang_context_for_replica(replica3)
+        assert context3 is not None
+        assert context3.gang_id == context1.gang_id  # Same gang as replica1
+        assert context3.world_size == 2
+        assert context3.rank == 1  # Took over replica2's rank
+
+        # Verify member_replica_ids now includes replica1 and replica3
+        assert replica1.unique_id in context3.member_replica_ids
+        assert replica3.unique_id in context3.member_replica_ids
+        assert replica2.unique_id not in context3.member_replica_ids
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main(["-v", "-s", __file__]))

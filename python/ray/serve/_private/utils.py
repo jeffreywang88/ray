@@ -25,7 +25,7 @@ from ray._raylet import MessagePackSerializer
 from ray.actor import ActorHandle
 from ray.serve._private.common import RequestMetadata, ServeComponentType
 from ray.serve._private.constants import HTTP_PROXY_TIMEOUT, SERVE_LOGGER_NAME
-from ray.types import ObjectRef
+from ray import ObjectRef
 from ray.util.serialization import StandaloneSerializationContext
 
 try:

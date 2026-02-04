@@ -14,7 +14,6 @@ from ray import cloudpickle
 from ray._common.utils import import_attr, import_module_and_attr
 from ray.exceptions import RuntimeEnvSetupError
 from ray.serve._private.autoscaling_state import AutoscalingStateManager
-from ray.serve._private.build_app import BuiltApplication, build_app
 from ray.serve._private.common import (
     DeploymentID,
     DeploymentStatus,
@@ -67,7 +66,7 @@ from ray.serve.schema import (
     LoggingConfig,
     ServeApplicationSchema,
 )
-from ray.types import ObjectRef
+from ray import ObjectRef
 from ray.util import metrics as ray_metrics
 
 logger = logging.getLogger(SERVE_LOGGER_NAME)
@@ -1524,6 +1523,7 @@ def build_serve_application(
 
     try:
         from ray.serve._private.api import call_user_app_builder_with_args_if_necessary
+        from ray.serve._private.build_app import BuiltApplication, build_app
 
         # Import and build the application.
         args_info_str = f" with arguments {args}" if args else ""

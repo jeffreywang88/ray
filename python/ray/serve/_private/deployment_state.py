@@ -9,7 +9,10 @@ from collections import defaultdict
 from copy import copy
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
+
+if TYPE_CHECKING:
+    from ray.serve.context import GangContext
 
 import ray
 from ray import ObjectRef, cloudpickle
@@ -35,7 +38,6 @@ from ray.serve._private.common import (
 )
 from ray.serve._private.config import DeploymentConfig
 from ray.serve.config import GangRuntimeFailurePolicy
-from ray.serve.context import GangContext
 from ray.serve._private.constants import (
     DEFAULT_LATENCY_BUCKET_MS,
     MAX_PER_REPLICA_RETRY_COUNT,
@@ -1240,14 +1242,14 @@ class DeploymentReplica:
         self._logged_shutdown_message = False
         # Gang context for replicas that are part of a gang.
         # Set when the replica is assigned to a gang by the scheduler.
-        self._gang_context: Optional[GangContext] = None
+        self._gang_context: Optional["GangContext"] = None
 
     @property
-    def gang_context(self) -> Optional[GangContext]:
+    def gang_context(self) -> Optional["GangContext"]:
         """Get the gang context for this replica, if part of a gang."""
         return self._gang_context
 
-    def set_gang_context(self, gang_context: GangContext) -> None:
+    def set_gang_context(self, gang_context: "GangContext") -> None:
         """Set the gang context for this replica."""
         self._gang_context = gang_context
 

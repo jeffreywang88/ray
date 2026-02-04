@@ -26,7 +26,6 @@ from ray.serve._private.constants import (
     SERVE_LOGGER_NAME,
 )
 from ray.serve.config import GangRuntimeFailurePolicy, GangSchedulingConfig
-from ray.serve.context import GangContext
 from ray.util.scheduling_strategies import (
     LabelMatchExpressionsT,
     NodeAffinitySchedulingStrategy,
@@ -46,7 +45,9 @@ class GangSchedulingState:
 
     gang_id: str  # Unique identifier for this gang (deployment_id + gang_index)
     deployment_id: DeploymentID
-    replica_ids: List[ReplicaID]  # Ordered list of replica IDs in this gang
+    # Ordered list of replica IDs in this gang. None values indicate empty slots
+    # that need to be filled (e.g., after a replica restart with RESTART_REPLICA policy)
+    replica_ids: List[Optional[ReplicaID]]
     gang_size: int
     start_time: float = field(default_factory=time.time)  # When scheduling started
     retry_count: int = 0  # Number of scheduling retry attempts
@@ -427,10 +428,14 @@ class DeploymentScheduler(ABC):
         if gang_id and gang_id in self._gang_states[deployment_id]:
             gang_state = self._gang_states[deployment_id][gang_id]
             if replica_id in gang_state.replica_ids:
-                # If any replica in a gang is stopped, the whole gang needs to be
-                # rescheduled (based on runtime_failure_policy, but for now we
-                # just clean up)
-                pass
+                # Remove this replica from the gang's replica_ids list
+                # This marks a "slot" as needing replacement
+                idx = gang_state.replica_ids.index(replica_id)
+                gang_state.replica_ids[idx] = None  # Mark slot as empty
+                logger.info(
+                    f"Replica {replica_id} stopped, gang {gang_id} now has "
+                    f"an empty slot at rank {idx}"
+                )
 
     def on_replica_running(self, replica_id: ReplicaID, node_id: str) -> None:
         """Called whenever a deployment replica is running with a known node id."""
@@ -454,13 +459,15 @@ class DeploymentScheduler(ABC):
 
     def get_gang_context_for_replica(
         self, replica_id: ReplicaID
-    ) -> Optional[GangContext]:
+    ) -> Optional["GangContext"]:
         """Get the GangContext for a replica if it's part of a gang.
 
         Returns None if the replica is not part of a gang.
         The GangContext includes the gang_id, rank, world_size, and
         member_replica_ids which can be used to find adjacent replicas.
         """
+        from ray.serve.context import GangContext
+
         deployment_id = replica_id.deployment_id
         gang_id = self._replica_to_gang.get(deployment_id, {}).get(replica_id)
         if not gang_id:
@@ -476,11 +483,16 @@ class DeploymentScheduler(ABC):
         except ValueError:
             return None
 
+        # Build member_replica_ids, filtering out None (empty slots)
+        member_replica_ids = [
+            r.unique_id for r in gang_state.replica_ids if r is not None
+        ]
+
         return GangContext(
             gang_id=gang_id,
             rank=rank,
             world_size=gang_state.gang_size,
-            member_replica_ids=[r.unique_id for r in gang_state.replica_ids],
+            member_replica_ids=member_replica_ids,
         )
 
     def get_gang_runtime_failure_policy(
@@ -762,6 +774,9 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
         This groups replicas into gangs of size gang_size. Each gang must be
         scheduled atomically - either all replicas in a gang are scheduled
         or none of them are.
+
+        For replacement replicas (e.g., from RESTART_REPLICA policy), we first
+        try to fill empty slots in existing gangs before creating new gangs.
         """
         info = self._deployments.get(deployment_id)
         if not info or not info.gang_scheduling_config:
@@ -774,7 +789,26 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
             r for r in replica_ids if r not in self._replica_to_gang[deployment_id]
         ]
 
-        # Group unassigned replicas into new gangs
+        if not unassigned_replicas:
+            return
+
+        # First, fill empty slots in existing gangs (for replacement replicas)
+        for gang_id, gang_state in self._gang_states[deployment_id].items():
+            if not unassigned_replicas:
+                break
+            # Find empty slots (None values) in this gang
+            for idx, member in enumerate(gang_state.replica_ids):
+                if member is None and unassigned_replicas:
+                    # Fill this empty slot with an unassigned replica
+                    new_replica = unassigned_replicas.pop(0)
+                    gang_state.replica_ids[idx] = new_replica
+                    self._replica_to_gang[deployment_id][new_replica] = gang_id
+                    logger.info(
+                        f"Assigned replacement replica {new_replica} to gang "
+                        f"{gang_id} at rank {idx}"
+                    )
+
+        # Then, group remaining unassigned replicas into new gangs
         for i in range(0, len(unassigned_replicas), gang_size):
             gang_replicas = unassigned_replicas[i : i + gang_size]
             if len(gang_replicas) < gang_size:
@@ -837,6 +871,12 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
                     )
                     continue
 
+            # Check if gang has no empty slots (all replica_ids are filled)
+            has_empty_slots = any(r is None for r in gang_state.replica_ids)
+            if has_empty_slots:
+                # Gang has empty slots, not ready to be scheduled yet
+                continue
+
             # Check if all replicas in this gang are pending
             all_pending = all(
                 r in self._pending_replicas[deployment_id]
@@ -850,6 +890,8 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
             gang_state = self._gang_states[deployment_id].pop(gang_id, None)
             if gang_state:
                 for replica_id in gang_state.replica_ids:
+                    if replica_id is None:
+                        continue  # Skip empty slots
                     self._replica_to_gang[deployment_id].pop(replica_id, None)
                     if replica_id in self._pending_replicas[deployment_id]:
                         request = self._pending_replicas[deployment_id][replica_id]
@@ -870,6 +912,9 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
         scheduled_replicas = []
 
         for replica_id in gang_state.replica_ids:
+            if replica_id is None:
+                # Empty slot - should not happen if gang is ready to schedule
+                continue
             if replica_id not in self._pending_replicas[deployment_id]:
                 # Replica was already scheduled or removed
                 continue
@@ -980,12 +1025,21 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
                     # all replicas in the gang together
                     self._schedule_gang(gang_state, "PACK")
 
-        # For non-gang deployments, flatten and sort by resource size
+        # For non-gang deployments AND unassigned replicas in gang deployments
+        # (e.g., replacement replicas that can't form a complete gang),
+        # schedule them individually
         non_gang_requests = []
         for deployment_id, pending in self._pending_replicas.items():
             info = self._deployments.get(deployment_id)
             if not info or not info.gang_scheduling_config:
+                # Non-gang deployment: schedule all pending replicas
                 non_gang_requests.extend(pending.values())
+            else:
+                # Gang deployment: schedule replicas not assigned to any gang
+                # These are likely replacement replicas (RESTART_REPLICA policy)
+                for replica_id, request in pending.items():
+                    if replica_id not in self._replica_to_gang.get(deployment_id, {}):
+                        non_gang_requests.append(request)
 
         all_scheduling_requests = sorted(
             non_gang_requests,
@@ -1016,6 +1070,15 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
                 schedulable_gangs = self._get_schedulable_gangs(deployment_id)
                 for gang_state in schedulable_gangs:
                     self._schedule_gang(gang_state, "SPREAD")
+
+                # Also schedule any unassigned replicas individually
+                # (e.g., replacement replicas from RESTART_REPLICA policy)
+                for replica_id, scheduling_request in list(pending_replicas.items()):
+                    if replica_id not in self._replica_to_gang.get(deployment_id, {}):
+                        self._schedule_replica(
+                            scheduling_request=scheduling_request,
+                            default_scheduling_strategy="SPREAD",
+                        )
             else:
                 # Regular scheduling for non-gang deployments
                 for scheduling_request in list(pending_replicas.values()):
