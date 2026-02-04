@@ -9,13 +9,19 @@ from ray._raylet import GcsClient
 from ray.serve._private import default_impl
 from ray.serve._private.common import DeploymentID, ReplicaID
 from ray.serve._private.constants import RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY
+from ray.serve._private.config import ReplicaConfig
 from ray.serve._private.deployment_scheduler import (
+    DefaultDeploymentScheduler,
     ReplicaSchedulingRequest,
     SpreadDeploymentSchedulingPolicy,
 )
-from ray.serve._private.test_utils import check_apps_running, get_node_id
+from ray.serve._private.test_utils import (
+    MockClusterNodeInfoCache,
+    check_apps_running,
+    get_node_id,
+)
 from ray.serve._private.utils import get_head_node_id
-from ray.serve.config import GangSchedulingConfig
+from ray.serve.config import GangRuntimeFailurePolicy, GangSchedulingConfig
 from ray.tests.conftest import *  # noqa
 
 
@@ -888,6 +894,63 @@ class TestGangScheduling:
 
         serve.delete("partial_gang_app")
         serve.shutdown()
+
+
+class TestGangSchedulerMethods:
+    """Unit tests for gang-related scheduler methods."""
+
+    def test_get_gang_runtime_failure_policy_no_gang_config(self):
+        """Test get_gang_runtime_failure_policy returns None when no gang config."""
+        cluster_node_info_cache = MockClusterNodeInfoCache()
+        scheduler = DefaultDeploymentScheduler(
+            cluster_node_info_cache, "head_node", lambda *args, **kwargs: None
+        )
+
+        d_id = DeploymentID(name="test_deployment", app_name="test_app")
+        scheduler.on_deployment_created(d_id, SpreadDeploymentSchedulingPolicy())
+
+        # No gang config set
+        policy = scheduler.get_gang_runtime_failure_policy(d_id)
+        assert policy is None
+
+    def test_get_gang_runtime_failure_policy_with_gang_config(self):
+        """Test get_gang_runtime_failure_policy returns correct policy."""
+        cluster_node_info_cache = MockClusterNodeInfoCache()
+        scheduler = DefaultDeploymentScheduler(
+            cluster_node_info_cache, "head_node", lambda *args, **kwargs: None
+        )
+
+        d_id = DeploymentID(name="test_deployment", app_name="test_app")
+        scheduler.on_deployment_created(d_id, SpreadDeploymentSchedulingPolicy())
+
+        # Set gang config with RESTART_GANG policy
+        replica_config = ReplicaConfig.create(lambda: None, ray_actor_options={})
+        gang_config = GangSchedulingConfig(
+            gang_size=2,
+            runtime_failure_policy=GangRuntimeFailurePolicy.RESTART_GANG,
+        )
+        scheduler.on_deployment_deployed(d_id, replica_config, gang_config)
+
+        policy = scheduler.get_gang_runtime_failure_policy(d_id)
+        assert policy == GangRuntimeFailurePolicy.RESTART_GANG
+
+    def test_get_gang_context_for_replica_not_in_gang(self):
+        """Test get_gang_context_for_replica returns None for non-gang replica."""
+        cluster_node_info_cache = MockClusterNodeInfoCache()
+        scheduler = DefaultDeploymentScheduler(
+            cluster_node_info_cache, "head_node", lambda *args, **kwargs: None
+        )
+
+        d_id = DeploymentID(name="test_deployment", app_name="test_app")
+        scheduler.on_deployment_created(d_id, SpreadDeploymentSchedulingPolicy())
+
+        replica_id = ReplicaID(
+            unique_id="test-replica-1", deployment_id=d_id
+        )
+
+        # No gang assigned
+        result = scheduler.get_gang_context_for_replica(replica_id)
+        assert result is None
 
 
 if __name__ == "__main__":

@@ -201,6 +201,74 @@ class TestGangSchedulingE2E:
         serve.delete("gang_retries_app")
         serve.shutdown()
 
+    @pytest.mark.asyncio
+    async def test_gang_with_restart_gang_policy(self, ray_cluster):
+        """
+        Verifies runtime_failure_policy=RESTART_GANG is accepted and deployment runs.
+        """
+        cluster = ray_cluster
+        cluster.add_node(num_cpus=4)
+        cluster.wait_for_nodes()
+        ray.init(address=cluster.address)
+        serve.start()
+
+        @serve.deployment(
+            num_replicas=2,
+            ray_actor_options={"num_cpus": 1},
+            gang_scheduling_config=GangSchedulingConfig(
+                gang_size=2,
+                runtime_failure_policy=GangRuntimeFailurePolicy.RESTART_GANG,
+            ),
+        )
+        class GangDeployment:
+            def __call__(self):
+                return "ok"
+
+        handle = serve.run(GangDeployment.bind(), name="gang_restart_policy_app")
+        wait_for_condition(
+            check_apps_running, apps=["gang_restart_policy_app"], timeout=60
+        )
+
+        result = await handle.remote()
+        assert result == "ok"
+
+        serve.delete("gang_restart_policy_app")
+        serve.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_gang_with_restart_replica_policy(self, ray_cluster):
+        """
+        Verifies runtime_failure_policy=RESTART_REPLICA is accepted and deployment runs.
+        """
+        cluster = ray_cluster
+        cluster.add_node(num_cpus=4)
+        cluster.wait_for_nodes()
+        ray.init(address=cluster.address)
+        serve.start()
+
+        @serve.deployment(
+            num_replicas=2,
+            ray_actor_options={"num_cpus": 1},
+            gang_scheduling_config=GangSchedulingConfig(
+                gang_size=2,
+                runtime_failure_policy=GangRuntimeFailurePolicy.RESTART_REPLICA,
+            ),
+        )
+        class GangDeployment:
+            def __call__(self):
+                return "ok"
+
+        handle = serve.run(GangDeployment.bind(), name="gang_replica_policy_app")
+        wait_for_condition(
+            check_apps_running, apps=["gang_replica_policy_app"], timeout=60
+        )
+
+        result = await handle.remote()
+        assert result == "ok"
+
+        serve.delete("gang_replica_policy_app")
+        serve.shutdown()
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main(["-v", "-s", __file__]))

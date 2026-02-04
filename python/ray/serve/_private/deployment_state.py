@@ -34,6 +34,8 @@ from ray.serve._private.common import (
     RunningReplicaInfo,
 )
 from ray.serve._private.config import DeploymentConfig
+from ray.serve.config import GangRuntimeFailurePolicy
+from ray.serve.context import GangContext
 from ray.serve._private.constants import (
     DEFAULT_LATENCY_BUCKET_MS,
     MAX_PER_REPLICA_RETRY_COUNT,
@@ -1236,6 +1238,18 @@ class DeploymentReplica:
         self._multiplexed_model_ids: List[str] = []
         self._routing_stats: Dict[str, Any] = {}
         self._logged_shutdown_message = False
+        # Gang context for replicas that are part of a gang.
+        # Set when the replica is assigned to a gang by the scheduler.
+        self._gang_context: Optional[GangContext] = None
+
+    @property
+    def gang_context(self) -> Optional[GangContext]:
+        """Get the gang context for this replica, if part of a gang."""
+        return self._gang_context
+
+    def set_gang_context(self, gang_context: GangContext) -> None:
+        """Set the gang context for this replica."""
+        self._gang_context = gang_context
 
     def get_running_replica_info(
         self, cluster_node_info_cache: ClusterNodeInfoCache
@@ -3192,9 +3206,19 @@ class DeploymentState:
         transition happened.
         """
 
-        for replica in self._replicas.pop(
+        # Track replicas that need to be stopped due to gang failure policy.
+        # Set of replica_ids that should be stopped.
+        replicas_to_stop_for_gang: Set[ReplicaID] = set()
+
+        # First pass: check health and identify unhealthy replicas and their gangs
+        all_replicas = self._replicas.pop(
             states=[ReplicaState.RUNNING, ReplicaState.PENDING_MIGRATION]
-        ):
+        )
+        replica_map: Dict[ReplicaID, DeploymentReplica] = {
+            r.replica_id: r for r in all_replicas
+        }
+
+        for replica in all_replicas:
             is_healthy = replica.check_health()
 
             # Record health check latency and failure metrics.
@@ -3208,39 +3232,125 @@ class DeploymentState:
             if replica.last_health_check_failed:
                 self.health_check_failures_counter.inc(tags=metric_tags)
 
-            if is_healthy:
-                self._replicas.add(replica.actor_details.state, replica)
-                self.health_check_gauge.set(
-                    1,
-                    tags={
-                        "replica": replica.replica_id.unique_id,
-                    },
+            # Ensure replica has gang_context set if it's part of a gang
+            if replica.gang_context is None:
+                gang_context = (
+                    self._deployment_scheduler.get_gang_context_for_replica(
+                        replica.replica_id
+                    )
                 )
-                routing_stats = replica.pull_routing_stats()
-                replica.record_routing_stats(routing_stats)
-            else:
+                if gang_context is not None:
+                    replica.set_gang_context(gang_context)
+
+            if not is_healthy:
+                # Check if this replica is part of a gang using its gang_context
+                if replica.gang_context is None:
+                    # Replica is NOT part of a gang - proceed as normal
+                    # (graceful stop just this replica)
+                    replicas_to_stop_for_gang.add(replica.replica_id)
+                else:
+                    # Replica IS part of a gang - check the failure policy
+                    failure_policy = (
+                        self._deployment_scheduler.get_gang_runtime_failure_policy(
+                            self._id
+                        )
+                    )
+                    if failure_policy == GangRuntimeFailurePolicy.RESTART_GANG:
+                        # Use gang_context.member_replica_ids to find adjacent replicas
+                        member_ids = replica.gang_context.member_replica_ids
+                        logger.warning(
+                            f"Replica {replica.replica_id} failed health check. "
+                            f"Gang failure policy is RESTART_GANG, force-stopping "
+                            f"all {len(member_ids)} replicas in the gang."
+                        )
+                        # Mark all gang replicas for force-stopping
+                        # member_replica_ids are unique_id strings
+                        for member_unique_id in member_ids:
+                            for r in all_replicas:
+                                if r.replica_id.unique_id == member_unique_id:
+                                    replicas_to_stop_for_gang.add(r.replica_id)
+                                    break
+                    else:
+                        # RESTART_REPLICA policy - proceed as normal
+                        # (graceful stop just this replica)
+                        logger.warning(
+                            f"Replica {replica.replica_id} failed health check. "
+                            f"Gang failure policy is RESTART_REPLICA, stopping "
+                            "only the failed replica."
+                        )
+                        replicas_to_stop_for_gang.add(replica.replica_id)
+
+        # Track which replicas are being force-stopped due to gang restart
+        # (vs just the failed replica itself)
+        gang_restart_replica_ids: Set[ReplicaID] = set()
+        for replica_id in replicas_to_stop_for_gang:
+            # Find the replica object to check its gang_context
+            replica_obj = None
+            for r in all_replicas:
+                if r.replica_id == replica_id:
+                    replica_obj = r
+                    break
+            if replica_obj is not None and replica_obj.gang_context is not None:
+                failure_policy = (
+                    self._deployment_scheduler.get_gang_runtime_failure_policy(self._id)
+                )
+                if failure_policy == GangRuntimeFailurePolicy.RESTART_GANG:
+                    # This replica is part of a gang with RESTART_GANG policy
+                    gang_restart_replica_ids.add(replica_id)
+
+        # Second pass: process all replicas - add healthy ones back or stop them
+        for replica in all_replicas:
+            replica_id = replica.replica_id
+            if replica_id in replicas_to_stop_for_gang:
+                # This replica needs to be stopped
                 logger.warning(
-                    f"Replica {replica.replica_id} failed health check, stopping it."
+                    f"Replica {replica_id} stopping "
+                    f"(health check failed or gang member failed)."
                 )
                 self.health_check_gauge.set(
                     0,
                     tags={
-                        "replica": replica.replica_id.unique_id,
+                        "replica": replica_id.unique_id,
                     },
                 )
-                self._stop_replica(
-                    replica, graceful_stop=not self.FORCE_STOP_UNHEALTHY_REPLICAS
+                # Force stop (graceful=False) for gang restart,
+                # graceful stop for single replica failure
+                is_gang_restart = replica_id in gang_restart_replica_ids
+                graceful_stop = (
+                    not self.FORCE_STOP_UNHEALTHY_REPLICAS and not is_gang_restart
                 )
-                # If this is a replica of the target version, the deployment
-                # enters the "UNHEALTHY" status until the replica is
-                # recovered or a new deploy happens.
-                if replica.version == self._target_state.version:
-                    self._curr_status_info = self._curr_status_info.handle_transition(
-                        trigger=DeploymentStatusInternalTrigger.HEALTH_CHECK_FAILED,
-                        message="A replica's health check failed. This "
-                        "deployment will be UNHEALTHY until the replica "
-                        "recovers or a new deploy happens.",
-                    )
+                self._stop_replica(replica, graceful_stop=graceful_stop)
+            else:
+                # This replica is healthy and not part of a failed gang
+                self._replicas.add(replica.actor_details.state, replica)
+                self.health_check_gauge.set(
+                    1,
+                    tags={
+                        "replica": replica_id.unique_id,
+                    },
+                )
+                routing_stats = replica.pull_routing_stats()
+                replica.record_routing_stats(routing_stats)
+
+        # Update deployment status if any replicas were stopped
+        if replicas_to_stop_for_gang:
+            if gang_restart_replica_ids:
+                # Gang restart actually happened
+                message = (
+                    f"Gang restart triggered: {len(replicas_to_stop_for_gang)} "
+                    "replicas force-stopped. Deployment will be UNHEALTHY until "
+                    "the gang is rescheduled."
+                )
+            else:
+                # Normal single-replica failure
+                message = (
+                    "A replica's health check failed. This deployment will be "
+                    "UNHEALTHY until the replica recovers or a new deploy happens."
+                )
+            self._curr_status_info = self._curr_status_info.handle_transition(
+                trigger=DeploymentStatusInternalTrigger.HEALTH_CHECK_FAILED,
+                message=message,
+            )
 
         slow_start_replicas = []
         slow_start = self._check_startup_replicas(ReplicaState.STARTING)

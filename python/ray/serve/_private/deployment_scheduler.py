@@ -25,7 +25,8 @@ from ray.serve._private.constants import (
     RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY,
     SERVE_LOGGER_NAME,
 )
-from ray.serve.config import GangSchedulingConfig
+from ray.serve.config import GangRuntimeFailurePolicy, GangSchedulingConfig
+from ray.serve.context import GangContext
 from ray.util.scheduling_strategies import (
     LabelMatchExpressionsT,
     NodeAffinitySchedulingStrategy,
@@ -450,6 +451,49 @@ class DeploymentScheduler(ABC):
         assert replica_id not in self._recovering_replicas[deployment_id]
 
         self._recovering_replicas[deployment_id].add(replica_id)
+
+    def get_gang_context_for_replica(
+        self, replica_id: ReplicaID
+    ) -> Optional[GangContext]:
+        """Get the GangContext for a replica if it's part of a gang.
+
+        Returns None if the replica is not part of a gang.
+        The GangContext includes the gang_id, rank, world_size, and
+        member_replica_ids which can be used to find adjacent replicas.
+        """
+        deployment_id = replica_id.deployment_id
+        gang_id = self._replica_to_gang.get(deployment_id, {}).get(replica_id)
+        if not gang_id:
+            return None
+
+        gang_state = self._gang_states.get(deployment_id, {}).get(gang_id)
+        if not gang_state:
+            return None
+
+        # Find this replica's rank within the gang
+        try:
+            rank = gang_state.replica_ids.index(replica_id)
+        except ValueError:
+            return None
+
+        return GangContext(
+            gang_id=gang_id,
+            rank=rank,
+            world_size=gang_state.gang_size,
+            member_replica_ids=[r.unique_id for r in gang_state.replica_ids],
+        )
+
+    def get_gang_runtime_failure_policy(
+        self, deployment_id: DeploymentID
+    ) -> Optional[GangRuntimeFailurePolicy]:
+        """Get the runtime failure policy for a deployment's gang config.
+
+        Returns None if the deployment doesn't have gang scheduling configured.
+        """
+        info = self._deployments.get(deployment_id)
+        if not info or not info.gang_scheduling_config:
+            return None
+        return info.gang_scheduling_config.runtime_failure_policy
 
     def _on_replica_launching(
         self,
