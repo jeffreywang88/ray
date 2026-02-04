@@ -22,6 +22,9 @@ from ray.serve.autoscaling_policy import default_autoscaling_policy
 from ray.serve.config import (
     AutoscalingConfig,
     DeploymentMode,
+    GangPlacementStrategy,
+    GangRuntimeFailurePolicy,
+    GangSchedulingConfig,
     HTTPOptions,
     ProxyLocation,
     RequestRouterConfig,
@@ -1132,6 +1135,81 @@ class TestProtoToDict:
 
         # Optional field should not be filled.
         assert "initial_replicas" not in result
+
+
+def test_gang_scheduling_config_validation():
+    """Test GangSchedulingConfig field validation."""
+
+    # gang_size is required
+    with pytest.raises(ValidationError):
+        GangSchedulingConfig()
+
+    # gang_size must be >= 1
+    with pytest.raises(ValidationError):
+        GangSchedulingConfig(gang_size=0)
+    with pytest.raises(ValidationError):
+        GangSchedulingConfig(gang_size=-1)
+
+    # Valid gang_size
+    config = GangSchedulingConfig(gang_size=1)
+    assert config.gang_size == 1
+    config = GangSchedulingConfig(gang_size=4)
+    assert config.gang_size == 4
+
+    # gang_timeout_s must be > 0
+    with pytest.raises(ValidationError):
+        GangSchedulingConfig(gang_size=4, gang_timeout_s=0)
+    with pytest.raises(ValidationError):
+        GangSchedulingConfig(gang_size=4, gang_timeout_s=-1)
+
+    # max_retries must be >= 0
+    with pytest.raises(ValidationError):
+        GangSchedulingConfig(gang_size=4, max_retries=-1)
+
+    # Valid max_retries including 0
+    config = GangSchedulingConfig(gang_size=4, max_retries=0)
+    assert config.max_retries == 0
+
+
+def test_gang_scheduling_config_defaults():
+    """Test GangSchedulingConfig default values."""
+    config = GangSchedulingConfig(gang_size=4)
+
+    assert config.gang_timeout_s == 300.0
+    assert config.max_retries == 3
+    assert config.gang_placement_strategy == GangPlacementStrategy.PACK
+    assert config.runtime_failure_policy == GangRuntimeFailurePolicy.RESTART_GANG
+
+
+def test_gang_scheduling_config_custom_values():
+    """Test GangSchedulingConfig with custom values."""
+    config = GangSchedulingConfig(
+        gang_size=8,
+        gang_timeout_s=120.0,
+        gang_placement_strategy=GangPlacementStrategy.STRICT_SPREAD,
+        max_retries=5,
+        runtime_failure_policy=GangRuntimeFailurePolicy.RESTART_REPLICA,
+    )
+
+    assert config.gang_size == 8
+    assert config.gang_timeout_s == 120.0
+    assert config.gang_placement_strategy == GangPlacementStrategy.STRICT_SPREAD
+    assert config.max_retries == 5
+    assert config.runtime_failure_policy == GangRuntimeFailurePolicy.RESTART_REPLICA
+
+
+def test_gang_placement_strategy_options():
+    """Test all GangPlacementStrategy options are valid."""
+    for strategy in GangPlacementStrategy:
+        config = GangSchedulingConfig(gang_size=4, gang_placement_strategy=strategy)
+        assert config.gang_placement_strategy == strategy
+
+
+def test_gang_runtime_failure_policy_options():
+    """Test all GangRuntimeFailurePolicy options are valid."""
+    for policy in GangRuntimeFailurePolicy:
+        config = GangSchedulingConfig(gang_size=4, runtime_failure_policy=policy)
+        assert config.runtime_failure_policy == policy
 
 
 if __name__ == "__main__":

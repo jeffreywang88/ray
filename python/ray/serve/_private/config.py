@@ -32,6 +32,9 @@ from ray.serve.config import (
     AggregationFunction,
     AutoscalingConfig,
     DeploymentMode,
+    GangPlacementStrategy,
+    GangRuntimeFailurePolicy,
+    GangSchedulingConfig,
     HTTPOptions,
     ProxyLocation,
     RequestRouterConfig,
@@ -41,6 +44,9 @@ from ray.serve.generated.serve_pb2 import (
     DeploymentConfig as DeploymentConfigProto,
     DeploymentLanguage,
     EncodingType as EncodingTypeProto,
+    GangPlacementStrategy as GangPlacementStrategyProto,
+    GangRuntimeFailurePolicy as GangRuntimeFailurePolicyProto,
+    GangSchedulingConfig as GangSchedulingConfigProto,
     LoggingConfig as LoggingConfigProto,
     ReplicaConfig as ReplicaConfigProto,
     RequestRouterConfig as RequestRouterConfigProto,
@@ -200,6 +206,11 @@ class DeploymentConfig(BaseModel):
         update_type=DeploymentOptionUpdateType.NeedsReconfigure,
     )
 
+    gang_scheduling_config: Optional[GangSchedulingConfig] = Field(
+        default=None,
+        update_type=DeploymentOptionUpdateType.HeavyWeight,
+    )
+
     # Contains the names of deployment options manually set by the user
     user_configured_option_names: Set[str] = set()
 
@@ -243,6 +254,26 @@ class DeploymentConfig(BaseModel):
             raise ValueError(
                 "max_queued_requests must be -1 (no limit) or a positive integer."
             )
+
+        return v
+
+    @validator("gang_scheduling_config", always=True)
+    def validate_gang_scheduling_config(cls, v, values):
+        if v is None:
+            return v
+
+        # Convert dict to GangSchedulingConfig if needed
+        if isinstance(v, dict):
+            v = GangSchedulingConfig(**v)
+
+        # Validate that num_replicas is a multiple of gang_size
+        num_replicas = values.get("num_replicas")
+        if num_replicas is not None and num_replicas > 0:
+            if num_replicas % v.gang_size != 0:
+                raise ValueError(
+                    f"num_replicas ({num_replicas}) must be a multiple of "
+                    f"gang_size ({v.gang_size})."
+                )
 
         return v
 
@@ -295,6 +326,33 @@ class DeploymentConfig(BaseModel):
         data["user_configured_option_names"] = list(
             data["user_configured_option_names"]
         )
+        # Convert gang_scheduling_config to proto
+        if data.get("gang_scheduling_config"):
+            gang_config = data["gang_scheduling_config"]
+            # Map Python enum to proto enum values
+            placement_strategy_map = {
+                "PACK": GangPlacementStrategyProto.GANG_PACK,
+                "SPREAD": GangPlacementStrategyProto.GANG_SPREAD,
+                "STRICT_PACK": GangPlacementStrategyProto.GANG_STRICT_PACK,
+                "STRICT_SPREAD": GangPlacementStrategyProto.GANG_STRICT_SPREAD,
+            }
+            failure_policy_map = {
+                "RESTART_GANG": GangRuntimeFailurePolicyProto.RESTART_GANG,
+                "RESTART_REPLICA": GangRuntimeFailurePolicyProto.RESTART_REPLICA,
+            }
+            data["gang_scheduling_config"] = GangSchedulingConfigProto(
+                gang_size=gang_config["gang_size"],
+                gang_timeout_s=gang_config["gang_timeout_s"],
+                gang_placement_strategy=placement_strategy_map.get(
+                    gang_config["gang_placement_strategy"],
+                    GangPlacementStrategyProto.GANG_PACK,
+                ),
+                max_retries=gang_config["max_retries"],
+                runtime_failure_policy=failure_policy_map.get(
+                    gang_config["runtime_failure_policy"],
+                    GangRuntimeFailurePolicyProto.RESTART_GANG,
+                ),
+            )
         return DeploymentConfigProto(**data)
 
     def to_proto_bytes(self):
@@ -374,6 +432,36 @@ class DeploymentConfig(BaseModel):
                 data["logging_config"]["encoding"] = EncodingTypeProto.Name(
                     data["logging_config"]["encoding"]
                 )
+
+        # Convert gang_scheduling_config proto to Python object
+        if "gang_scheduling_config" in data and data["gang_scheduling_config"]:
+            gang_config = data["gang_scheduling_config"]
+            # Map proto enum values to Python enum
+            placement_strategy_map = {
+                GangPlacementStrategyProto.GANG_PACK: GangPlacementStrategy.PACK,
+                GangPlacementStrategyProto.GANG_SPREAD: GangPlacementStrategy.SPREAD,
+                GangPlacementStrategyProto.GANG_STRICT_PACK: GangPlacementStrategy.STRICT_PACK,
+                GangPlacementStrategyProto.GANG_STRICT_SPREAD: GangPlacementStrategy.STRICT_SPREAD,
+            }
+            failure_policy_map = {
+                GangRuntimeFailurePolicyProto.RESTART_GANG: GangRuntimeFailurePolicy.RESTART_GANG,
+                GangRuntimeFailurePolicyProto.RESTART_REPLICA: GangRuntimeFailurePolicy.RESTART_REPLICA,
+            }
+            data["gang_scheduling_config"] = GangSchedulingConfig(
+                gang_size=gang_config.get("gang_size", 1),
+                gang_timeout_s=gang_config.get("gang_timeout_s", 300.0),
+                gang_placement_strategy=placement_strategy_map.get(
+                    gang_config.get("gang_placement_strategy"),
+                    GangPlacementStrategy.PACK,
+                ),
+                max_retries=gang_config.get("max_retries", 3),
+                runtime_failure_policy=failure_policy_map.get(
+                    gang_config.get("runtime_failure_policy"),
+                    GangRuntimeFailurePolicy.RESTART_GANG,
+                ),
+            )
+        else:
+            data.pop("gang_scheduling_config", None)
 
         return cls(**data)
 

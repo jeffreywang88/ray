@@ -24,9 +24,30 @@ from ray.serve._private.replica_result import ReplicaResult
 from ray.serve.exceptions import RayServeException
 from ray.serve.grpc_util import RayServegRPCContext
 from ray.serve.schema import ReplicaRank
-from ray.util.annotations import DeveloperAPI
+from ray.util.annotations import DeveloperAPI, PublicAPI
 
 logger = logging.getLogger(SERVE_LOGGER_NAME)
+
+
+@PublicAPI(stability="alpha")
+@dataclass
+class GangContext:
+    """Context information for a replica that is part of a gang.
+
+    This context provides information about the gang membership, including
+    the replica's rank within the gang and the identities of all gang members.
+
+    Attributes:
+        gang_id: Unique identifier for this gang.
+        rank: This replica's rank within the gang (0-indexed).
+        world_size: Total number of replicas in this gang.
+        member_replica_ids: List of replica IDs in this gang, ordered by rank.
+    """
+
+    gang_id: str  # Unique identifier for this gang
+    rank: int  # This replica's rank within the gang (0-indexed)
+    world_size: int  # Total number of replicas in this gang
+    member_replica_ids: List[str]  # List of replica IDs in this gang, ordered by rank
 
 _INTERNAL_REPLICA_CONTEXT: "ReplicaContext" = None
 _global_client: ServeControllerClient = None
@@ -52,6 +73,7 @@ class ReplicaContext:
     rank: ReplicaRank
     world_size: int
     _handle_registration_callback: Optional[Callable[[DeploymentID], None]] = None
+    gang_context: Optional[GangContext] = None
 
     @property
     def app_name(self) -> str:

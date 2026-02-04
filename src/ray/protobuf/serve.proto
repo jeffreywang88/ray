@@ -126,6 +126,40 @@ message RequestRouterConfig {
 }
 //[End] ROUTING CONFIG
 
+//[Begin] GANG SCHEDULING CONFIG
+// Placement strategy for replicas within a gang.
+enum GangPlacementStrategy {
+  GANG_PACK = 0;
+  GANG_SPREAD = 1;
+  GANG_STRICT_PACK = 2;
+  GANG_STRICT_SPREAD = 3;
+}
+
+// Policy for handling runtime failures of replicas in a gang.
+enum GangRuntimeFailurePolicy {
+  RESTART_GANG = 0;
+  RESTART_REPLICA = 1;
+}
+
+// Configuration for gang scheduling of deployment replicas.
+message GangSchedulingConfig {
+  // Number of replicas per gang. num_replicas must be a multiple of gang_size.
+  int32 gang_size = 1;
+
+  // Maximum time to wait for gang scheduling (seconds).
+  double gang_timeout_s = 2;
+
+  // Placement strategy for replicas within a gang.
+  GangPlacementStrategy gang_placement_strategy = 3;
+
+  // Maximum gang scheduling retry attempts.
+  int32 max_retries = 4;
+
+  // What to do when a replica fails after gang is running.
+  GangRuntimeFailurePolicy runtime_failure_policy = 5;
+}
+//[End] GANG SCHEDULING CONFIG
+
 // Configuration options for a deployment, to be set by the user.
 message DeploymentConfig {
   // The number of processes to start up that will handle requests to this deployment.
@@ -175,6 +209,9 @@ message DeploymentConfig {
 
   // The maximum number of retries in case the deployment constructor results in failure
   int32 max_constructor_retry_count = 20;
+
+  // Gang scheduling configuration for atomic replica scheduling.
+  GangSchedulingConfig gang_scheduling_config = 21;
 }
 
 // Deployment language.

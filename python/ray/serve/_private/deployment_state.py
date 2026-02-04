@@ -2311,7 +2311,9 @@ class DeploymentState:
         logger.info(f"Recovering target state for {self._id} from checkpoint.")
         self._target_state = target_state_checkpoint
         self._deployment_scheduler.on_deployment_deployed(
-            self._id, self._target_state.info.replica_config
+            self._id,
+            self._target_state.info.replica_config,
+            self._target_state.info.deployment_config.gang_scheduling_config,
         )
         if self._target_state.info.deployment_config.autoscaling_config:
             self._autoscaling_state_manager.register_deployment(
@@ -2638,7 +2640,9 @@ class DeploymentState:
         old_target_state = self._target_state
         self._set_target_state(deployment_info, target_num_replicas=target_num_replicas)
         self._deployment_scheduler.on_deployment_deployed(
-            self._id, deployment_info.replica_config
+            self._id,
+            deployment_info.replica_config,
+            deployment_info.deployment_config.gang_scheduling_config,
         )
 
         # Determine if the updated target state simply scales the current state.

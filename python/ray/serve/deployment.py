@@ -12,7 +12,7 @@ from ray.serve._private.config import (
 from ray.serve._private.constants import SERVE_LOGGER_NAME
 from ray.serve._private.usage import ServeUsageTag
 from ray.serve._private.utils import DEFAULT, Default
-from ray.serve.config import AutoscalingConfig
+from ray.serve.config import AutoscalingConfig, GangSchedulingConfig
 from ray.serve.schema import DeploymentSchema, LoggingConfig, RayActorOptionsSchema
 from ray.util.annotations import PublicAPI
 
@@ -237,6 +237,7 @@ class Deployment:
         _init_kwargs: Default[Dict[Any, Any]] = DEFAULT.VALUE,
         _internal: bool = False,
         max_constructor_retry_count: Default[int] = DEFAULT.VALUE,
+        gang_scheduling_config: Default[Union[Dict, GangSchedulingConfig, None]] = DEFAULT.VALUE,
     ) -> "Deployment":
         """Return a copy of this deployment with updated options.
 
@@ -384,6 +385,11 @@ class Deployment:
             if isinstance(logging_config, LoggingConfig):
                 logging_config = logging_config.dict()
             new_deployment_config.logging_config = logging_config
+
+        if gang_scheduling_config is not DEFAULT.VALUE:
+            if isinstance(gang_scheduling_config, dict):
+                gang_scheduling_config = GangSchedulingConfig(**gang_scheduling_config)
+            new_deployment_config.gang_scheduling_config = gang_scheduling_config
 
         new_replica_config = ReplicaConfig.create(
             func_or_class,

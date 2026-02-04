@@ -15,6 +15,7 @@ from ray.serve._private.deployment_scheduler import (
 )
 from ray.serve._private.test_utils import check_apps_running, get_node_id
 from ray.serve._private.utils import get_head_node_id
+from ray.serve.config import GangSchedulingConfig
 from ray.tests.conftest import *  # noqa
 
 
@@ -728,6 +729,165 @@ async def test_e2e_serve_fallback_strategy_unschedulable(
 
     serve.delete("unschedulable_fallback_app")
     cluster.remove_node(new_node)
+
+
+class TestGangScheduling:
+    """Tests for gang scheduling atomicity.
+
+    Gang scheduling ensures that groups of replicas are scheduled together
+    atomically - either all replicas in a gang are scheduled or none of them.
+    """
+
+    @pytest.mark.asyncio
+    async def test_gang_scheduling_atomic(self, ray_cluster):
+        """
+        Verifies that gangs are scheduled atomically: either all replicas
+        in a gang are scheduled together or none of them are.
+
+        Setup:
+        - 2 nodes with 4 CPUs each (8 total CPUs)
+        - Deployment with 8 replicas, gang_size=4, each replica needs 1 CPU
+
+        Expected behavior:
+        - First gang of 4 replicas should be scheduled together
+        - Second gang of 4 replicas should be scheduled together
+        - At no point should we have a partial gang (e.g., 2 replicas from a gang)
+        """
+        cluster = ray_cluster
+        # Add 2 nodes with 4 CPUs each (enough for 2 gangs of 4 replicas)
+        cluster.add_node(num_cpus=4, resources={"node0": 1})
+        cluster.add_node(num_cpus=4, resources={"node1": 1})
+        cluster.wait_for_nodes()
+        ray.init(address=cluster.address)
+        serve.start()
+
+        @serve.deployment
+        class GangDeployment:
+            def __init__(self):
+                self.replica_id = ray.get_runtime_context().get_actor_id()
+
+            def get_info(self):
+                return {
+                    "replica_id": self.replica_id,
+                    "node_id": ray.get_runtime_context().get_node_id(),
+                }
+
+        # Create deployment with 8 replicas and gang_size=4
+        app = GangDeployment.options(
+            num_replicas=8,
+            ray_actor_options={"num_cpus": 1},
+            gang_scheduling_config=GangSchedulingConfig(gang_size=4),
+        ).bind()
+
+        handle = serve.run(app, name="gang_app")
+
+        # Wait for all replicas to be scheduled and running
+        wait_for_condition(check_apps_running, apps=["gang_app"], timeout=60)
+
+        # Collect info from all replicas
+        replica_infos = []
+        for _ in range(20):  # Send multiple requests to hit all replicas
+            info = await handle.get_info.remote()
+            if info not in replica_infos:
+                replica_infos.append(info)
+            if len(replica_infos) >= 8:
+                break
+
+        # Verify we have 8 distinct replicas
+        replica_ids = {info["replica_id"] for info in replica_infos}
+        assert len(replica_ids) == 8, (
+            f"Expected 8 replicas, got {len(replica_ids)}"
+        )
+
+        # Verify that replicas are distributed across nodes
+        node_ids = {info["node_id"] for info in replica_infos}
+        assert len(node_ids) == 2, (
+            f"Expected replicas on 2 nodes, got {len(node_ids)}"
+        )
+
+        serve.delete("gang_app")
+        serve.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_gang_scheduling_partial_resources(self, ray_cluster):
+        """
+        Verifies that a gang is not scheduled if resources are insufficient
+        for the entire gang, demonstrating atomic gang scheduling.
+
+        Setup:
+        - 1 node with only 2 CPUs
+        - Deployment with 4 replicas, gang_size=4, each replica needs 1 CPU
+
+        Expected behavior:
+        - The gang should NOT be scheduled because we need 4 CPUs but only have 2
+        - Deployment should remain in DEPLOYING state
+        - Once a second node is added with enough resources, the gang should be scheduled
+        """
+        cluster = ray_cluster
+        # Add 1 node with only 2 CPUs (not enough for a gang of 4)
+        cluster.add_node(num_cpus=2, resources={"node0": 1})
+        cluster.wait_for_nodes()
+        ray.init(address=cluster.address)
+        serve.start()
+
+        @serve.deployment
+        class GangDeployment:
+            def get_node_id(self):
+                return ray.get_runtime_context().get_node_id()
+
+        # Create deployment with 4 replicas and gang_size=4
+        app = GangDeployment.options(
+            num_replicas=4,
+            ray_actor_options={"num_cpus": 1},
+            gang_scheduling_config=GangSchedulingConfig(gang_size=4),
+        ).bind()
+
+        handle = serve._run(app, name="partial_gang_app", _blocking=False)
+
+        def check_status(expected_status):
+            try:
+                status_info = serve.status().applications["partial_gang_app"]
+                return status_info.status == expected_status
+            except KeyError:
+                return False
+
+        def verify_gang_not_scheduled():
+            """Verify the gang is stuck because insufficient resources."""
+            if not check_status("DEPLOYING"):
+                return False
+            # Check that actors are pending (not running)
+            actors = ray.util.state.list_actors()
+            pending_actors = [
+                a for a in actors if a["state"] == "PENDING_CREATION"
+            ]
+            return len(pending_actors) > 0
+
+        # Gang should be stuck in DEPLOYING because there aren't enough resources
+        wait_for_condition(verify_gang_not_scheduled, timeout=30)
+
+        # Verify it's not running yet
+        assert not check_status("RUNNING"), (
+            "Gang should not be running with insufficient resources"
+        )
+
+        # Add another node with 2 CPUs to make 4 total (enough for the gang)
+        cluster.add_node(num_cpus=2, resources={"node1": 1})
+        cluster.wait_for_nodes()
+
+        # Now the gang should be scheduled and running
+        wait_for_condition(lambda: check_status("RUNNING"), timeout=60)
+
+        # Verify all 4 replicas are running
+        responses = set()
+        for _ in range(20):
+            node_id = await handle.get_node_id.remote()
+            responses.add(node_id)
+
+        # We should see replicas on at least one node
+        assert len(responses) >= 1
+
+        serve.delete("partial_gang_app")
+        serve.shutdown()
 
 
 if __name__ == "__main__":

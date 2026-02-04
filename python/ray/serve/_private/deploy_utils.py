@@ -61,6 +61,7 @@ def deploy_args_to_deployment_info(
     app_name: Optional[str] = None,
     ingress: bool = False,
     route_prefix: Optional[str] = None,
+    serialized_gang_scheduling_config: Optional[bytes] = None,
     **kwargs,
 ) -> DeploymentInfo:
     """Takes deployment args passed to the controller after building an application and
@@ -72,6 +73,12 @@ def deploy_args_to_deployment_info(
     replica_config = ReplicaConfig.from_proto_bytes(
         replica_config_proto_bytes, deployment_config.needs_pickle()
     )
+
+    # Restore gang_scheduling_config from separate serialization
+    if serialized_gang_scheduling_config is not None:
+        deployment_config.gang_scheduling_config = cloudpickle.loads(
+            serialized_gang_scheduling_config
+        )
 
     # Java API passes in JobID as bytes
     if isinstance(deployer_job_id, bytes):

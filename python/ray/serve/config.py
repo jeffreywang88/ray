@@ -301,9 +301,11 @@ class RequestRouterConfig(BaseModel):
             )
 
         request_router_path = request_router_class or DEFAULT_REQUEST_ROUTER_PATH
-        request_router_module, request_router_class = import_module_and_attr(
-            request_router_path
-        )
+        _, request_router_class = import_module_and_attr(request_router_path)
+        # Get the actual module where the class is defined (not the package that
+        # re-exports it) to avoid cloudpickle serializing unnecessary dependencies.
+        import sys
+        request_router_module = sys.modules[request_router_class.__module__]
         cloudpickle.register_pickle_by_value(request_router_module)
         self.set_serialized_request_router_cls(cloudpickle.dumps(request_router_class))
         cloudpickle.unregister_pickle_by_value(request_router_module)
@@ -768,3 +770,100 @@ class gRPCOptions(BaseModel):
                 raise ModuleNotFoundError(message) from e
 
         return callables
+
+
+class GangPlacementStrategy(str, Enum):
+    """Placement strategy for replicas within a gang."""
+
+    PACK = "PACK"
+    """Pack replicas on as few nodes as possible (best effort)."""
+
+    SPREAD = "SPREAD"
+    """Spread replicas across distinct nodes as evenly as possible (best effort)."""
+
+    STRICT_PACK = "STRICT_PACK"
+    """Pack all replicas on a single node. The gang is not allowed to span multiple nodes."""
+
+    STRICT_SPREAD = "STRICT_SPREAD"
+    """Place replicas across distinct nodes. Only one replica per node is allowed."""
+
+
+class GangRuntimeFailurePolicy(str, Enum):
+    """Policy for handling runtime failures of replicas in a gang."""
+
+    RESTART_GANG = "RESTART_GANG"
+    """Kill and restart entire gang atomically when any replica fails.
+    Use for: Tightly coupled systems where partial gang is useless.
+    Ensures consistency but higher recovery time."""
+
+    RESTART_REPLICA = "RESTART_REPLICA"
+    """Kill and restart individual replica when it fails.
+    Use for: Systems that can tolerate partial gang availability.
+    Faster recovery but may result in inconsistent state."""
+
+
+@PublicAPI(stability="alpha")
+class GangSchedulingConfig(BaseModel):
+    """Configuration for gang scheduling of deployment replicas.
+
+    Gang scheduling ensures that groups of replicas are scheduled together
+    atomically, which is essential for distributed workloads that require
+    coordination between replicas.
+
+    Example:
+        .. code-block:: python
+
+            from ray import serve
+            from ray.serve.config import GangSchedulingConfig, GangPlacementStrategy
+
+            @serve.deployment(
+                num_replicas=8,
+                gang_scheduling_config=GangSchedulingConfig(
+                    gang_size=4,
+                    gang_placement_strategy=GangPlacementStrategy.STRICT_PACK,
+                    runtime_failure_policy=GangRuntimeFailurePolicy.RESTART_GANG
+                )
+            )
+            class MyDeployment:
+                pass
+    """
+
+    gang_size: int = Field(
+        description=(
+            "Number of replicas per gang. "
+            "num_replicas must be a multiple of gang_size."
+        ),
+        ge=1,
+    )
+
+    gang_timeout_s: float = Field(
+        default=300.0,
+        description="Maximum time to wait for gang scheduling (seconds).",
+        gt=0,
+    )
+
+    gang_placement_strategy: GangPlacementStrategy = Field(
+        default=GangPlacementStrategy.PACK,
+        description=(
+            "Placement strategy for replicas within a gang. "
+            "Options: PACK (pack with best effort, default), "
+            "SPREAD (maximize availability), "
+            "STRICT_PACK (pack on single node), "
+            "STRICT_SPREAD (one per node)."
+        ),
+    )
+
+    max_retries: int = Field(
+        default=3,
+        description="Maximum gang scheduling retry attempts.",
+        ge=0,
+    )
+
+    runtime_failure_policy: GangRuntimeFailurePolicy = Field(
+        default=GangRuntimeFailurePolicy.RESTART_GANG,
+        description=(
+            "What to do when a replica fails after gang is running. "
+            "RESTART_GANG: kill and restart entire gang atomically. "
+            "RESTART_REPLICA: kill and restart individual replica."
+        ),
+    )
