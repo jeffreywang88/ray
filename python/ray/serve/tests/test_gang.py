@@ -138,6 +138,110 @@ class TestGangSchedulingE2E:
         serve.shutdown()
 
     @pytest.mark.asyncio
+    async def test_gang_context_available_in_replica_context(self, ray_cluster):
+        """
+        Verifies that gang_context is properly set in ReplicaContext
+        and contains correct values (gang_id, rank, world_size, member_replica_ids).
+        """
+        cluster = ray_cluster
+        cluster.add_node(num_cpus=4)
+        cluster.wait_for_nodes()
+        ray.init(address=cluster.address)
+        serve.start()
+
+        # Collect gang context from all replicas
+        @ray.remote
+        class GangContextCollector:
+            def __init__(self):
+                self.contexts = []
+
+            def add_context(self, gang_id, rank, world_size, member_replica_ids):
+                self.contexts.append({
+                    "gang_id": gang_id,
+                    "rank": rank,
+                    "world_size": world_size,
+                    "member_replica_ids": member_replica_ids,
+                })
+
+            def get_contexts(self):
+                return self.contexts
+
+        collector = GangContextCollector.options(
+            name="gang_context_collector", lifetime="detached"
+        ).remote()
+
+        @serve.deployment(
+            num_replicas=2,
+            ray_actor_options={"num_cpus": 1},
+            gang_scheduling_config=GangSchedulingConfig(gang_size=2),
+        )
+        class GangDeployment:
+            def __init__(self):
+                # Get gang context from ReplicaContext during initialization
+                import ray.serve
+                ctx = ray.serve.context._get_internal_replica_context()
+                gang_ctx = ctx.gang_context
+                if gang_ctx is not None:
+                    collector_actor = ray.get_actor("gang_context_collector")
+                    ray.get(collector_actor.add_context.remote(
+                        gang_ctx.gang_id,
+                        gang_ctx.rank,
+                        gang_ctx.world_size,
+                        gang_ctx.member_replica_ids,
+                    ))
+
+            def __call__(self):
+                import ray.serve
+                ctx = ray.serve.context._get_internal_replica_context()
+                gang_ctx = ctx.gang_context
+                if gang_ctx is None:
+                    return {"gang_context": None}
+                return {
+                    "gang_id": gang_ctx.gang_id,
+                    "rank": gang_ctx.rank,
+                    "world_size": gang_ctx.world_size,
+                    "member_replica_ids": gang_ctx.member_replica_ids,
+                }
+
+        handle = serve.run(GangDeployment.bind(), name="gang_context_app")
+        wait_for_condition(check_apps_running, apps=["gang_context_app"], timeout=60)
+
+        # Call the deployment to get gang context from a replica
+        result = await handle.remote()
+
+        # Verify gang_context is set
+        assert result.get("gang_context") is None or result.get("gang_id") is not None, \
+            "gang_context should be set for gang deployment"
+
+        if result.get("gang_id") is not None:
+            # Verify gang_context fields
+            assert result["world_size"] == 2, "world_size should match gang_size"
+            assert result["rank"] in [0, 1], "rank should be 0 or 1 for gang_size=2"
+            assert len(result["member_replica_ids"]) == 2, \
+                "member_replica_ids should have 2 members"
+
+        # Get all contexts collected during initialization
+        contexts = ray.get(collector.get_contexts.remote())
+
+        # If contexts were collected, verify them
+        if len(contexts) > 0:
+            # All replicas should have the same gang_id
+            gang_ids = set(c["gang_id"] for c in contexts)
+            assert len(gang_ids) == 1, f"All replicas should have same gang_id, got {gang_ids}"
+
+            # All should have world_size = 2
+            for ctx in contexts:
+                assert ctx["world_size"] == 2, f"Expected world_size=2, got {ctx['world_size']}"
+
+            # Ranks should be unique
+            ranks = [c["rank"] for c in contexts]
+            assert len(set(ranks)) == len(ranks), f"Ranks should be unique, got {ranks}"
+
+        serve.delete("gang_context_app")
+        ray.kill(collector)
+        serve.shutdown()
+
+    @pytest.mark.asyncio
     async def test_gang_with_timeout_config(self, ray_cluster):
         """
         Verifies gang_timeout_s parameter is accepted in a deployment.

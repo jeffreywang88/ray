@@ -755,7 +755,11 @@ class DeploymentScheduler(ABC):
             placement_group = scheduling_strategy.placement_group
 
         scheduling_request.status = ReplicaSchedulingRequestStatus.SUCCEEDED
-        scheduling_request.on_scheduled(actor_handle, placement_group=placement_group)
+        # Get gang context for this replica (if part of a gang)
+        gang_context = self.get_gang_context_for_replica(replica_id)
+        scheduling_request.on_scheduled(
+            actor_handle, placement_group=placement_group, gang_context=gang_context
+        )
 
     @abstractmethod
     def get_node_to_compact(

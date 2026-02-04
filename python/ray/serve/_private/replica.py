@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from functools import wraps
 from importlib import import_module
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncGenerator,
     Callable,
@@ -29,6 +30,9 @@ from typing import (
     Tuple,
     Union,
 )
+
+if TYPE_CHECKING:
+    from ray.serve.context import GangContext
 
 import grpc
 import starlette.responses
@@ -939,6 +943,10 @@ class ReplicaBase(ABC):
         # `ASGIAppReplicaWrapper` (i.e., they are using the FastAPI integration).
         self._user_callable_asgi_app: Optional[ASGIApp] = None
 
+        # Gang context for replicas that are part of a gang.
+        # Will be set via initialize_and_get_metadata or reconfigure.
+        self._gang_context: Optional["GangContext"] = None
+
         # Set metadata for logs and metrics.
         # servable_object will be populated in `initialize_and_get_metadata`.
         self._set_internal_replica_context(servable_object=None, rank=None)
@@ -1054,10 +1062,18 @@ class ReplicaBase(ABC):
         return list(seen_deployment_ids)
 
     def _set_internal_replica_context(
-        self, *, servable_object: Callable = None, rank: ReplicaRank = None
+        self,
+        *,
+        servable_object: Callable = None,
+        rank: ReplicaRank = None,
+        gang_context: Optional["GangContext"] = None,
     ):
         # Calculate world_size from deployment config instead of storing it
         world_size = self._deployment_config.num_replicas
+
+        # Update stored gang_context if provided
+        if gang_context is not None:
+            self._gang_context = gang_context
 
         # Create callback for registering dynamically created handles
         def register_handle_callback(deployment_id: DeploymentID) -> None:
@@ -1070,6 +1086,7 @@ class ReplicaBase(ABC):
             rank=rank,
             world_size=world_size,
             handle_registration_callback=register_handle_callback,
+            gang_context=self._gang_context,
         )
 
     def _configure_logger_and_profilers(
@@ -1382,12 +1399,17 @@ class ReplicaBase(ABC):
         raise NotImplementedError
 
     async def initialize(
-        self, deployment_config: Optional[DeploymentConfig], rank: Optional[ReplicaRank]
+        self,
+        deployment_config: Optional[DeploymentConfig],
+        rank: Optional[ReplicaRank],
+        gang_context: Optional["GangContext"] = None,
     ):
         if rank is not None:
             self._rank = rank
             self._set_internal_replica_context(
-                servable_object=self._user_callable_wrapper.user_callable, rank=rank
+                servable_object=self._user_callable_wrapper.user_callable,
+                rank=rank,
+                gang_context=gang_context,
             )
         try:
             # Ensure that initialization is only performed once.
@@ -2427,7 +2449,10 @@ class ReplicaActor:
         return self._replica_impl.list_outbound_deployments()
 
     async def initialize_and_get_metadata(
-        self, deployment_config: DeploymentConfig = None, rank: ReplicaRank = None
+        self,
+        deployment_config: DeploymentConfig = None,
+        rank: ReplicaRank = None,
+        gang_context: Optional["GangContext"] = None,
     ) -> ReplicaMetadata:
         """Handles initializing the replica.
 
@@ -2440,7 +2465,7 @@ class ReplicaActor:
         """
         # Unused `_after` argument is for scheduling: passing an ObjectRef
         # allows delaying this call until after the `_after` call has returned.
-        await self._replica_impl.initialize(deployment_config, rank)
+        await self._replica_impl.initialize(deployment_config, rank, gang_context)
         return self._replica_impl.get_metadata()
 
     async def check_health(self):

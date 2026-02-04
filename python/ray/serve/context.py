@@ -139,6 +139,7 @@ def _set_internal_replica_context(
     rank: ReplicaRank,
     world_size: int,
     handle_registration_callback: Optional[Callable[[str, str], None]] = None,
+    gang_context: Optional[GangContext] = None,
 ):
     global _INTERNAL_REPLICA_CONTEXT
     _INTERNAL_REPLICA_CONTEXT = ReplicaContext(
@@ -148,6 +149,7 @@ def _set_internal_replica_context(
         rank=rank,
         world_size=world_size,
         _handle_registration_callback=handle_registration_callback,
+        gang_context=gang_context,
     )
 
 

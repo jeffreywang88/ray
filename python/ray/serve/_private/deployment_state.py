@@ -324,6 +324,8 @@ class ActorReplicaWrapper:
         # Rank assigned to the replica.
         self._assign_rank_callback: Optional[Callable[[ReplicaID], ReplicaRank]] = None
         self._rank: Optional[ReplicaRank] = None
+        # Gang context for this replica, set in on_scheduled().
+        self._gang_context: Optional["GangContext"] = None
         # Populated in `on_scheduled` or `recover`.
         self._actor_handle: ActorHandle = None
         self._placement_group: PlacementGroup = None
@@ -708,9 +710,11 @@ class ActorReplicaWrapper:
         self,
         actor_handle: ActorHandle,
         placement_group: Optional[PlacementGroup] = None,
+        gang_context: Optional["GangContext"] = None,
     ):
         self._actor_handle = actor_handle
         self._placement_group = placement_group
+        self._gang_context = gang_context
 
         if self._is_cross_language:
             self._actor_handle = JavaActorHandleProxy(self._actor_handle)
@@ -881,8 +885,9 @@ class ActorReplicaWrapper:
                 self._rank = self._assign_rank_callback(
                     self._replica_id.unique_id, self._node_id
                 )
+                # Use gang context set during on_scheduled()
                 self._ready_obj_ref = replica_ready_check_func.remote(
-                    deployment_config, self._rank
+                    deployment_config, self._rank, self._gang_context
                 )
 
             return ReplicaStartupStatus.PENDING_INITIALIZATION, None
@@ -1379,7 +1384,8 @@ class DeploymentReplica:
         Start a new actor for current DeploymentReplica instance.
         """
         replica_scheduling_request = self._actor.start(
-            deployment_info, assign_rank_callback=assign_rank_callback
+            deployment_info,
+            assign_rank_callback=assign_rank_callback,
         )
         self._start_time = time.time()
         self._logged_shutdown_message = False
