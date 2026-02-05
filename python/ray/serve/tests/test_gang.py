@@ -8,6 +8,7 @@ Config validation tests are in tests/unit/test_config.py.
 """
 
 import sys
+import uuid
 
 import pytest
 
@@ -346,8 +347,9 @@ class TestGangSchedulingE2E:
             def clear_fail(self):
                 self.should_fail_health_check = None
 
+        tracker_name = f"replica_tracker_gang_{uuid.uuid4().hex[:8]}"
         tracker = ReplicaTracker.options(
-            name="replica_tracker", lifetime="detached"
+            name=tracker_name, lifetime="detached"
         ).remote()
 
         @serve.deployment(
@@ -364,7 +366,7 @@ class TestGangSchedulingE2E:
             def __init__(self):
                 import ray
                 self.actor_id = ray.get_runtime_context().get_actor_id()
-                self.tracker = ray.get_actor("replica_tracker")
+                self.tracker = ray.get_actor(tracker_name)
                 ray.get(self.tracker.register_start.remote(self.actor_id))
 
             def check_health(self):
@@ -416,6 +418,18 @@ class TestGangSchedulingE2E:
         # - 2 new replicas are created (with new actor IDs)
         # - Other gang (2 replicas) is NOT affected
         # Total unique actor IDs seen: 4 original + 2 new = 6
+        #
+        # Wait for all new replicas to register. This is necessary because
+        # the deployment may be marked RUNNING before all replicas have
+        # completed their __init__ and registered with the tracker.
+        def check_replica_count():
+            count = ray.get(tracker.get_count.remote())
+            # We expect 6 (4 original + 2 new), but due to timing we might
+            # briefly see 5 if one new replica hasn't registered yet.
+            return count >= 6
+
+        wait_for_condition(check_replica_count, timeout=30, retry_interval_ms=500)
+
         final_count = ray.get(tracker.get_count.remote())
         assert final_count == 6, (
             f"Expected 6 total actor IDs (4 original + 2 new from gang restart), "
@@ -465,8 +479,9 @@ class TestGangSchedulingE2E:
             def clear_fail(self):
                 self.should_fail_health_check = None
 
+        tracker_name = f"replica_tracker_replica_{uuid.uuid4().hex[:8]}"
         tracker = ReplicaTracker.options(
-            name="replica_tracker_2", lifetime="detached"
+            name=tracker_name, lifetime="detached"
         ).remote()
 
         @serve.deployment(
@@ -483,7 +498,7 @@ class TestGangSchedulingE2E:
             def __init__(self):
                 import ray
                 self.actor_id = ray.get_runtime_context().get_actor_id()
-                self.tracker = ray.get_actor("replica_tracker_2")
+                self.tracker = ray.get_actor(tracker_name)
                 ray.get(self.tracker.register_start.remote(self.actor_id))
 
             def check_health(self):

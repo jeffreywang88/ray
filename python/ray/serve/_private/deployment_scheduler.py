@@ -432,6 +432,9 @@ class DeploymentScheduler(ABC):
                 # This marks a "slot" as needing replacement
                 idx = gang_state.replica_ids.index(replica_id)
                 gang_state.replica_ids[idx] = None  # Mark slot as empty
+                # Decrement scheduled_count since this replica is no longer scheduled
+                if gang_state.scheduled_count > 0:
+                    gang_state.scheduled_count -= 1
                 logger.info(
                     f"Replica {replica_id} stopped, gang {gang_id} now has "
                     f"an empty slot at rank {idx}"
@@ -841,54 +844,42 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
     def _get_schedulable_gangs(
         self, deployment_id: DeploymentID
     ) -> List[GangSchedulingState]:
-        """Returns gangs that are ready to be scheduled (complete and not timed out).
-
-        Also handles timeout and max_retries logic, cleaning up gangs that have
-        exceeded their retry limits.
-        """
+        """Returns gangs that are ready to be scheduled (complete and not timed out)."""
         info = self._deployments.get(deployment_id)
         if not info or not info.gang_scheduling_config:
             return []
 
         config = info.gang_scheduling_config
         schedulable = []
-        failed_gangs = []
+        timed_out_gangs = []
 
         for gang_id, gang_state in self._gang_states[deployment_id].items():
             if gang_state.is_complete:
                 continue
 
-            # Check if gang has exceeded max retries (from either timeout or failures)
-            if gang_state.retry_count > config.max_retries:
-                failed_gangs.append(gang_id)
-                logger.error(
-                    f"Gang {gang_id} exceeded max_retries ({config.max_retries}). "
-                    "Marking as permanently failed."
-                )
-                continue
-
-            # Check for timeout
             if gang_state.is_timed_out(config.gang_timeout_s):
-                gang_state.retry_count += 1
-                if gang_state.retry_count > config.max_retries:
-                    failed_gangs.append(gang_id)
-                    logger.error(
-                        f"Gang {gang_id} timed out after {config.gang_timeout_s}s "
-                        f"and exceeded max_retries ({config.max_retries})."
-                    )
-                    continue
-                else:
+                if gang_state.can_retry(config.max_retries):
                     # Reset gang for retry
+                    gang_state.retry_count += 1
                     gang_state.start_time = time.time()
                     gang_state.scheduled_count = 0
                     logger.warning(
                         f"Gang {gang_id} timed out after {config.gang_timeout_s}s. "
                         f"Retry {gang_state.retry_count}/{config.max_retries}"
                     )
+                else:
+                    # Max retries exceeded
+                    timed_out_gangs.append(gang_id)
+                    logger.error(
+                        f"Gang {gang_id} scheduling failed after {config.max_retries} "
+                        "retries."
+                    )
+                    continue
 
-            # Gang has empty slots - waiting for replacement replicas
+            # TODO (jeffreywang): Clarify why this is needed.
             has_empty_slots = any(r is None for r in gang_state.replica_ids)
             if has_empty_slots:
+                # Gang has empty slots, not ready to be scheduled yet
                 continue
 
             # Check if all replicas in this gang are pending
@@ -899,8 +890,8 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
             if all_pending:
                 schedulable.append(gang_state)
 
-        # Clean up failed gangs (exceeded max retries)
-        for gang_id in failed_gangs:
+        # Clean up timed-out gangs
+        for gang_id in timed_out_gangs:
             gang_state = self._gang_states[deployment_id].pop(gang_id, None)
             if gang_state:
                 for replica_id in gang_state.replica_ids:
@@ -956,8 +947,10 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
                 break
 
         if failed:
-            # Increment retry count and check if we should give up
+            # Increment retry count for this gang
             gang_state.retry_count += 1
+
+            # Check if max retries exceeded
             info = self._deployments.get(deployment_id)
             max_retries = (
                 info.gang_scheduling_config.max_retries
@@ -965,16 +958,36 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
                 else 3
             )
 
-            if gang_state.retry_count > max_retries:
+            if not gang_state.can_retry(max_retries):
+                # Max retries exceeded - mark gang as permanently failed
                 logger.error(
-                    f"Gang {gang_state.gang_id} failed after {gang_state.retry_count} "
-                    f"attempts (max_retries={max_retries}). Giving up."
+                    f"Gang {gang_state.gang_id} scheduling failed after "
+                    f"{gang_state.retry_count} retries. Marking as failed."
                 )
-            else:
-                logger.warning(
-                    f"Gang {gang_state.gang_id} scheduling failed. "
-                    f"Retry {gang_state.retry_count}/{max_retries}. Rolling back."
-                )
+                # Mark all already-scheduled replicas as failed (for rollback)
+                for request in scheduled_requests.values():
+                    request.status = ReplicaSchedulingRequestStatus.ACTOR_CREATION_FAILED
+
+                # Mark all replicas in the gang as failed
+                for replica_id in gang_state.replica_ids:
+                    if replica_id is None:
+                        continue
+                    self._replica_to_gang[deployment_id].pop(replica_id, None)
+                    pending_request = self._pending_replicas[deployment_id].get(
+                        replica_id
+                    )
+                    if pending_request is not None:
+                        pending_request.status = (
+                            ReplicaSchedulingRequestStatus.ACTOR_CREATION_FAILED
+                        )
+                # Remove the gang from tracking
+                self._gang_states[deployment_id].pop(gang_state.gang_id, None)
+                return False
+
+            logger.warning(
+                f"Gang {gang_state.gang_id} scheduling failed. "
+                f"Retry {gang_state.retry_count}/{max_retries}. Rolling back."
+            )
 
             # Mark all scheduled replicas as failed to trigger rollback.
             for request in scheduled_requests.values():
@@ -986,7 +999,11 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
                 if replica_id in scheduled_requests:
                     continue
                 pending_request = self._pending_replicas[deployment_id].get(replica_id)
-                if pending_request is not None:
+                if (
+                    pending_request is not None
+                    and pending_request.status
+                    == ReplicaSchedulingRequestStatus.IN_PROGRESS
+                ):
                     pending_request.status = (
                         ReplicaSchedulingRequestStatus.ACTOR_CREATION_FAILED
                     )
@@ -1031,8 +1048,7 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
         # Assign pending replicas to gangs for deployments with gang scheduling
         for deployment_id, pending in self._pending_replicas.items():
             if deployment_id in self._deployments:
-                info = self._deployments[deployment_id]
-                if info.gang_scheduling_config:
+                if self._deployments[deployment_id].gang_scheduling_config:
                     self._assign_replicas_to_gangs(
                         deployment_id, list(pending.keys())
                     )
@@ -1098,10 +1114,16 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
                 # Non-gang deployment: schedule all pending replicas
                 non_gang_requests.extend(pending.values())
             else:
-                # Gang deployment: schedule replicas not assigned to any gang
+                # Gang deployment: schedule replicas that are either:
+                # 1. Not assigned to any gang, OR
+                # 2. Assigned to a gang that's not schedulable (e.g., has running replicas)
                 # These are likely replacement replicas (RESTART_REPLICA policy)
+                schedulable_gang_ids = {
+                    gs.gang_id for gs in self._get_schedulable_gangs(deployment_id)
+                }
                 for replica_id, request in pending.items():
-                    if replica_id not in self._replica_to_gang.get(deployment_id, {}):
+                    gang_id = self._replica_to_gang.get(deployment_id, {}).get(replica_id)
+                    if gang_id is None or gang_id not in schedulable_gang_ids:
                         non_gang_requests.append(request)
 
         all_scheduling_requests = sorted(
@@ -1131,13 +1153,19 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
             # Handle gang scheduling for deployments with gang config
             if info and info.gang_scheduling_config:
                 schedulable_gangs = self._get_schedulable_gangs(deployment_id)
+                schedulable_gang_ids = {gs.gang_id for gs in schedulable_gangs}
                 for gang_state in schedulable_gangs:
                     self._schedule_gang(gang_state, "SPREAD")
 
-                # Also schedule any unassigned replicas individually
-                # (e.g., replacement replicas from RESTART_REPLICA policy)
+                # Schedule any replicas that are either:
+                # 1. Not assigned to any gang, OR
+                # 2. Assigned to a gang that's not schedulable (has running replicas)
+                # These are likely replacement replicas (RESTART_REPLICA policy)
                 for replica_id, scheduling_request in list(pending_replicas.items()):
-                    if replica_id not in self._replica_to_gang.get(deployment_id, {}):
+                    gang_id = self._replica_to_gang.get(deployment_id, {}).get(
+                        replica_id
+                    )
+                    if gang_id is None or gang_id not in schedulable_gang_ids:
                         self._schedule_replica(
                             scheduling_request=scheduling_request,
                             default_scheduling_strategy="SPREAD",

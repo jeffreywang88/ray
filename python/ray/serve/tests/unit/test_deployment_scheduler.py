@@ -205,6 +205,8 @@ def test_deployment_scheduling_info():
     assert info.is_non_strict_pack_pg()
 
 
+
+
 def test_get_available_resources_per_node():
     d_id = DeploymentID("a", "b")
 
