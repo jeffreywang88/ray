@@ -8,8 +8,8 @@ from ray._common.test_utils import wait_for_condition
 from ray._raylet import GcsClient
 from ray.serve._private import default_impl
 from ray.serve._private.common import DeploymentID, ReplicaID
-from ray.serve._private.constants import RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY
 from ray.serve._private.config import ReplicaConfig
+from ray.serve._private.constants import RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY
 from ray.serve._private.deployment_scheduler import (
     DefaultDeploymentScheduler,
     ReplicaSchedulingRequest,
@@ -895,9 +895,143 @@ class TestGangScheduling:
         serve.delete("partial_gang_app")
         serve.shutdown()
 
-
 class TestGangSchedulerMethods:
     """Unit tests for gang-related scheduler methods."""
+
+    def test_gang_retry_logic_on_scheduling_failure(self):
+        """Test that gang scheduling increments retry_count on failure."""
+        from ray.serve._private.test_utils import MockActorClass
+
+        cluster_node_info_cache = MockClusterNodeInfoCache()
+        cluster_node_info_cache.add_node("node1", {"CPU": 4})
+        scheduler = DefaultDeploymentScheduler(
+            cluster_node_info_cache, "head_node", lambda *args, **kwargs: None
+        )
+
+        d_id = DeploymentID(name="test_deployment", app_name="test_app")
+        scheduler.on_deployment_created(d_id, SpreadDeploymentSchedulingPolicy())
+
+        # Set gang config with max_retries=3
+        gang_config = GangSchedulingConfig(
+            gang_size=2,
+            max_retries=3,
+            gang_timeout_s=60,
+        )
+        replica_config = ReplicaConfig.create(lambda: None, ray_actor_options={})
+        scheduler.on_deployment_deployed(d_id, replica_config, gang_config)
+
+        # Create replicas and assign to gang
+        replica1 = ReplicaID(unique_id="replica-1", deployment_id=d_id)
+        replica2 = ReplicaID(unique_id="replica-2", deployment_id=d_id)
+
+        # Create a failing actor class
+        class FailingActorClass(MockActorClass):
+            def remote(self, *args):
+                raise RuntimeError("Simulated actor creation failure")
+
+        # Add scheduling requests
+        from unittest.mock import Mock
+        req1 = ReplicaSchedulingRequest(
+            replica_id=replica1,
+            actor_def=FailingActorClass(),
+            actor_resources={"CPU": 1},
+            actor_options={},
+            actor_init_args=(),
+            on_scheduled=Mock(),
+        )
+        req2 = ReplicaSchedulingRequest(
+            replica_id=replica2,
+            actor_def=MockActorClass(),
+            actor_resources={"CPU": 1},
+            actor_options={},
+            actor_init_args=(),
+            on_scheduled=Mock(),
+        )
+
+        # First scheduling attempt - should fail
+        scheduler.schedule(upscales={d_id: [req1, req2]}, downscales={})
+
+        # Check that gang has retry_count = 1
+        gang_state = list(scheduler._gang_states[d_id].values())[0]
+        assert gang_state.retry_count == 1, (
+            f"Expected retry_count=1 after first failure, got {gang_state.retry_count}"
+        )
+        assert gang_state.scheduled_count == 0, (
+            f"Expected scheduled_count=0 after failure, got {gang_state.scheduled_count}"
+        )
+
+        # Verify replicas are marked as failed
+        from ray.serve._private.deployment_scheduler import (
+            ReplicaSchedulingRequestStatus,
+        )
+        assert req1.status == ReplicaSchedulingRequestStatus.ACTOR_CREATION_FAILED
+        assert req2.status == ReplicaSchedulingRequestStatus.ACTOR_CREATION_FAILED
+
+    def test_gang_exceeds_max_retries(self):
+        """Test that gang is marked as failed when max_retries is exceeded."""
+        from ray.serve._private.test_utils import MockActorClass
+
+        cluster_node_info_cache = MockClusterNodeInfoCache()
+        cluster_node_info_cache.add_node("node1", {"CPU": 4})
+        scheduler = DefaultDeploymentScheduler(
+            cluster_node_info_cache, "head_node", lambda *args, **kwargs: None
+        )
+
+        d_id = DeploymentID(name="test_deployment", app_name="test_app")
+        scheduler.on_deployment_created(d_id, SpreadDeploymentSchedulingPolicy())
+
+        # Set gang config with max_retries=2
+        gang_config = GangSchedulingConfig(
+            gang_size=2,
+            max_retries=2,
+            gang_timeout_s=60,
+        )
+        replica_config = ReplicaConfig.create(lambda: None, ray_actor_options={})
+        scheduler.on_deployment_deployed(d_id, replica_config, gang_config)
+
+        class FailingActorClass(MockActorClass):
+            def remote(self, *args):
+                raise RuntimeError("Simulated actor creation failure")
+
+        from unittest.mock import Mock
+
+        # Simulate 3 scheduling failures (exceeds max_retries=2)
+        for i in range(3):
+            replica1 = ReplicaID(unique_id=f"replica-{i*2}", deployment_id=d_id)
+            replica2 = ReplicaID(unique_id=f"replica-{i*2+1}", deployment_id=d_id)
+
+            req1 = ReplicaSchedulingRequest(
+                replica_id=replica1,
+                actor_def=FailingActorClass(),
+                actor_resources={"CPU": 1},
+                actor_options={},
+                actor_init_args=(),
+                on_scheduled=Mock(),
+            )
+            req2 = ReplicaSchedulingRequest(
+                replica_id=replica2,
+                actor_def=MockActorClass(),
+                actor_resources={"CPU": 1},
+                actor_options={},
+                actor_init_args=(),
+                on_scheduled=Mock(),
+            )
+
+            scheduler.schedule(upscales={d_id: [req1, req2]}, downscales={})
+
+            # Simulate replicas being stopped
+            scheduler.on_replica_stopping(replica1)
+            scheduler.on_replica_stopping(replica2)
+
+        # After 3 failures with max_retries=2, gang should be cleaned up
+        # Check that gang has retry_count > max_retries
+        schedulable = scheduler._get_schedulable_gangs(d_id)
+        assert len(schedulable) == 0, "Gang should not be schedulable after exceeding max_retries"
+
+        # Gang should be removed from gang_states
+        assert len(scheduler._gang_states[d_id]) == 0, (
+            "Gang should be removed after exceeding max_retries"
+        )
 
     def test_get_gang_runtime_failure_policy_no_gang_config(self):
         """Test get_gang_runtime_failure_policy returns None when no gang config."""

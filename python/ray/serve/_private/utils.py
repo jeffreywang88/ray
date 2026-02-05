@@ -18,6 +18,7 @@ import requests
 
 import ray
 import ray.util.serialization_addons
+from ray import ObjectRef
 from ray._common.constants import HEAD_NODE_RESOURCE_NAME
 from ray._common.utils import get_random_alphanumeric_string, import_attr
 from ray._private.worker import LOCAL_MODE, SCRIPT_MODE
@@ -25,7 +26,6 @@ from ray._raylet import MessagePackSerializer
 from ray.actor import ActorHandle
 from ray.serve._private.common import RequestMetadata, ServeComponentType
 from ray.serve._private.constants import HTTP_PROXY_TIMEOUT, SERVE_LOGGER_NAME
-from ray import ObjectRef
 from ray.util.serialization import StandaloneSerializationContext
 
 try:

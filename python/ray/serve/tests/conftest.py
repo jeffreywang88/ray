@@ -154,7 +154,7 @@ def _shared_serve_instance():
         "namespace": "default_test_namespace",
         "_metrics_export_port": 9999,
     }
-    
+
     # Only pass num_cpus and _system_config if we're starting a new cluster (not connecting to existing)
     is_connecting_to_existing = False
     if ray_address is not None:
@@ -168,12 +168,12 @@ def _shared_serve_instance():
                 is_connecting_to_existing = True
         except Exception:
             pass  # If we can't determine, assume new cluster
-    
+
     if not is_connecting_to_existing:
         # Only set these when starting a new cluster
         init_kwargs["num_cpus"] = 36
         init_kwargs["_system_config"] = {"metrics_report_interval_ms": 1000, "task_retry_delay_ms": 50}
-    
+
     ray.init(**init_kwargs)
     serve.start(
         proxy_location=ProxyLocation.HeadOnly,

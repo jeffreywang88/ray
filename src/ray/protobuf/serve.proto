@@ -129,10 +129,10 @@ message RequestRouterConfig {
 //[Begin] GANG SCHEDULING CONFIG
 // Placement strategy for replicas within a gang.
 enum GangPlacementStrategy {
-  GANG_PACK = 0;
-  GANG_SPREAD = 1;
-  GANG_STRICT_PACK = 2;
-  GANG_STRICT_SPREAD = 3;
+  PACK = 0;
+  SPREAD = 1;
+  STRICT_PACK = 2;
+  STRICT_SPREAD = 3;
 }
 
 // Policy for handling runtime failures of replicas in a gang.

@@ -262,18 +262,12 @@ class DeploymentConfig(BaseModel):
         if v is None:
             return v
 
-        # Convert dict to GangSchedulingConfig if needed
-        if isinstance(v, dict):
-            v = GangSchedulingConfig(**v)
-
-        # Validate that num_replicas is a multiple of gang_size
         num_replicas = values.get("num_replicas")
-        if num_replicas is not None and num_replicas > 0:
-            if num_replicas % v.gang_size != 0:
-                raise ValueError(
-                    f"num_replicas ({num_replicas}) must be a multiple of "
-                    f"gang_size ({v.gang_size})."
-                )
+        if num_replicas % v.gang_size != 0:
+            raise ValueError(
+                f"num_replicas ({num_replicas}) must be a multiple of "
+                f"gang_size ({v.gang_size})."
+            )
 
         return v
 
@@ -326,32 +320,20 @@ class DeploymentConfig(BaseModel):
         data["user_configured_option_names"] = list(
             data["user_configured_option_names"]
         )
-        # Convert gang_scheduling_config to proto
         if data.get("gang_scheduling_config"):
             gang_config = data["gang_scheduling_config"]
-            # Map Python enum to proto enum values
-            placement_strategy_map = {
-                "PACK": GangPlacementStrategyProto.GANG_PACK,
-                "SPREAD": GangPlacementStrategyProto.GANG_SPREAD,
-                "STRICT_PACK": GangPlacementStrategyProto.GANG_STRICT_PACK,
-                "STRICT_SPREAD": GangPlacementStrategyProto.GANG_STRICT_SPREAD,
-            }
-            failure_policy_map = {
-                "RESTART_GANG": GangRuntimeFailurePolicyProto.RESTART_GANG,
-                "RESTART_REPLICA": GangRuntimeFailurePolicyProto.RESTART_REPLICA,
-            }
+            placement_strategy = GangPlacementStrategyProto.Value(
+                gang_config["gang_placement_strategy"]
+            )
+            failure_policy = GangRuntimeFailurePolicyProto.Value(
+                gang_config["runtime_failure_policy"]
+            )
             data["gang_scheduling_config"] = GangSchedulingConfigProto(
                 gang_size=gang_config["gang_size"],
                 gang_timeout_s=gang_config["gang_timeout_s"],
-                gang_placement_strategy=placement_strategy_map.get(
-                    gang_config["gang_placement_strategy"],
-                    GangPlacementStrategyProto.GANG_PACK,
-                ),
+                gang_placement_strategy=placement_strategy,
                 max_retries=gang_config["max_retries"],
-                runtime_failure_policy=failure_policy_map.get(
-                    gang_config["runtime_failure_policy"],
-                    GangRuntimeFailurePolicyProto.RESTART_GANG,
-                ),
+                runtime_failure_policy=failure_policy,
             )
         return DeploymentConfigProto(**data)
 
@@ -432,34 +414,15 @@ class DeploymentConfig(BaseModel):
                 data["logging_config"]["encoding"] = EncodingTypeProto.Name(
                     data["logging_config"]["encoding"]
                 )
-
-        # Convert gang_scheduling_config proto to Python object
         if "gang_scheduling_config" in data and data["gang_scheduling_config"]:
             gang_config = data["gang_scheduling_config"]
-            # Map proto enum values to Python enum
-            placement_strategy_map = {
-                GangPlacementStrategyProto.GANG_PACK: GangPlacementStrategy.PACK,
-                GangPlacementStrategyProto.GANG_SPREAD: GangPlacementStrategy.SPREAD,
-                GangPlacementStrategyProto.GANG_STRICT_PACK: GangPlacementStrategy.STRICT_PACK,
-                GangPlacementStrategyProto.GANG_STRICT_SPREAD: GangPlacementStrategy.STRICT_SPREAD,
-            }
-            failure_policy_map = {
-                GangRuntimeFailurePolicyProto.RESTART_GANG: GangRuntimeFailurePolicy.RESTART_GANG,
-                GangRuntimeFailurePolicyProto.RESTART_REPLICA: GangRuntimeFailurePolicy.RESTART_REPLICA,
-            }
-            data["gang_scheduling_config"] = GangSchedulingConfig(
-                gang_size=gang_config.get("gang_size", 1),
-                gang_timeout_s=gang_config.get("gang_timeout_s", 300.0),
-                gang_placement_strategy=placement_strategy_map.get(
-                    gang_config.get("gang_placement_strategy"),
-                    GangPlacementStrategy.PACK,
-                ),
-                max_retries=gang_config.get("max_retries", 3),
-                runtime_failure_policy=failure_policy_map.get(
-                    gang_config.get("runtime_failure_policy"),
-                    GangRuntimeFailurePolicy.RESTART_GANG,
-                ),
+            gang_config["gang_placement_strategy"] = GangPlacementStrategy(
+                GangPlacementStrategyProto.Name(gang_config["gang_placement_strategy"])
             )
+            gang_config["runtime_failure_policy"] = GangRuntimeFailurePolicy(
+                GangRuntimeFailurePolicyProto.Name(gang_config["runtime_failure_policy"])
+            )
+            data["gang_scheduling_config"] = GangSchedulingConfig(**gang_config)
         else:
             data.pop("gang_scheduling_config", None)
 

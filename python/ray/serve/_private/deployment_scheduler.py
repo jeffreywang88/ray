@@ -841,44 +841,54 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
     def _get_schedulable_gangs(
         self, deployment_id: DeploymentID
     ) -> List[GangSchedulingState]:
-        """Returns gangs that are ready to be scheduled (complete and not timed out)."""
+        """Returns gangs that are ready to be scheduled (complete and not timed out).
+
+        Also handles timeout and max_retries logic, cleaning up gangs that have
+        exceeded their retry limits.
+        """
         info = self._deployments.get(deployment_id)
         if not info or not info.gang_scheduling_config:
             return []
 
         config = info.gang_scheduling_config
         schedulable = []
-        timed_out_gangs = []
+        failed_gangs = []
 
-        for gang_id, gang_state in list(self._gang_states[deployment_id].items()):
-            # Skip already completed gangs
+        for gang_id, gang_state in self._gang_states[deployment_id].items():
             if gang_state.is_complete:
                 continue
 
-            # Check timeout
+            # Check if gang has exceeded max retries (from either timeout or failures)
+            if gang_state.retry_count > config.max_retries:
+                failed_gangs.append(gang_id)
+                logger.error(
+                    f"Gang {gang_id} exceeded max_retries ({config.max_retries}). "
+                    "Marking as permanently failed."
+                )
+                continue
+
+            # Check for timeout
             if gang_state.is_timed_out(config.gang_timeout_s):
-                if gang_state.can_retry(config.max_retries):
+                gang_state.retry_count += 1
+                if gang_state.retry_count > config.max_retries:
+                    failed_gangs.append(gang_id)
+                    logger.error(
+                        f"Gang {gang_id} timed out after {config.gang_timeout_s}s "
+                        f"and exceeded max_retries ({config.max_retries})."
+                    )
+                    continue
+                else:
                     # Reset gang for retry
-                    gang_state.retry_count += 1
                     gang_state.start_time = time.time()
                     gang_state.scheduled_count = 0
                     logger.warning(
                         f"Gang {gang_id} timed out after {config.gang_timeout_s}s. "
                         f"Retry {gang_state.retry_count}/{config.max_retries}"
                     )
-                else:
-                    # Max retries exceeded
-                    timed_out_gangs.append(gang_id)
-                    logger.error(
-                        f"Gang {gang_id} scheduling failed after {config.max_retries} "
-                        f"retries. Marking replicas as failed."
-                    )
-                    continue
 
-            # Check if gang has no empty slots (all replica_ids are filled)
+            # Gang has empty slots - waiting for replacement replicas
             has_empty_slots = any(r is None for r in gang_state.replica_ids)
             if has_empty_slots:
-                # Gang has empty slots, not ready to be scheduled yet
                 continue
 
             # Check if all replicas in this gang are pending
@@ -889,8 +899,8 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
             if all_pending:
                 schedulable.append(gang_state)
 
-        # Mark replicas in timed out gangs as failed
-        for gang_id in timed_out_gangs:
+        # Clean up failed gangs (exceeded max retries)
+        for gang_id in failed_gangs:
             gang_state = self._gang_states[deployment_id].pop(gang_id, None)
             if gang_state:
                 for replica_id in gang_state.replica_ids:
@@ -913,7 +923,10 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
         Returns True if all replicas were scheduled, False otherwise.
         """
         deployment_id = gang_state.deployment_id
-        scheduled_replicas = []
+        scheduled_replicas: List[ReplicaID] = []
+        scheduled_requests: Dict[ReplicaID, ReplicaSchedulingRequest] = {}
+        pending_replicas: List[ReplicaID] = []
+        failed = False
 
         for replica_id in gang_state.replica_ids:
             if replica_id is None:
@@ -922,7 +935,9 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
             if replica_id not in self._pending_replicas[deployment_id]:
                 # Replica was already scheduled or removed
                 continue
+            pending_replicas.append(replica_id)
 
+        for replica_id in pending_replicas:
             scheduling_request = self._pending_replicas[deployment_id][replica_id]
             self._schedule_replica(
                 scheduling_request=scheduling_request,
@@ -931,13 +946,57 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
 
             if scheduling_request.status == ReplicaSchedulingRequestStatus.SUCCEEDED:
                 scheduled_replicas.append(replica_id)
-                gang_state.scheduled_count += 1
+                scheduled_requests[replica_id] = scheduling_request
             else:
-                # If any replica fails to schedule, we should ideally roll back
-                # For now, we just log and continue (let timeout handle retries)
+                failed = True
                 logger.warning(
-                    f"Failed to schedule replica {replica_id} in gang {gang_state.gang_id}"
+                    f"Failed to schedule replica {replica_id} in gang {gang_state.gang_id}. "
+                    "Rolling back gang scheduling."
                 )
+                break
+
+        if failed:
+            # Increment retry count and check if we should give up
+            gang_state.retry_count += 1
+            info = self._deployments.get(deployment_id)
+            max_retries = (
+                info.gang_scheduling_config.max_retries
+                if info and info.gang_scheduling_config
+                else 3
+            )
+
+            if gang_state.retry_count > max_retries:
+                logger.error(
+                    f"Gang {gang_state.gang_id} failed after {gang_state.retry_count} "
+                    f"attempts (max_retries={max_retries}). Giving up."
+                )
+            else:
+                logger.warning(
+                    f"Gang {gang_state.gang_id} scheduling failed. "
+                    f"Retry {gang_state.retry_count}/{max_retries}. Rolling back."
+                )
+
+            # Mark all scheduled replicas as failed to trigger rollback.
+            for request in scheduled_requests.values():
+                request.status = ReplicaSchedulingRequestStatus.ACTOR_CREATION_FAILED
+
+            # Mark any remaining pending replicas in the gang as failed so the
+            # deployment state manager will stop them and retry later.
+            for replica_id in pending_replicas:
+                if replica_id in scheduled_requests:
+                    continue
+                pending_request = self._pending_replicas[deployment_id].get(replica_id)
+                if pending_request is not None:
+                    pending_request.status = (
+                        ReplicaSchedulingRequestStatus.ACTOR_CREATION_FAILED
+                    )
+
+            # Reset scheduling progress for this gang.
+            gang_state.scheduled_count = 0
+            gang_state.start_time = time.time()
+            return False
+
+        gang_state.scheduled_count += len(scheduled_replicas)
 
         if gang_state.is_complete:
             logger.info(

@@ -10,7 +10,7 @@ from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 import ray
-from ray import cloudpickle
+from ray import ObjectRef, cloudpickle
 from ray._common.utils import import_attr, import_module_and_attr
 from ray.exceptions import RuntimeEnvSetupError
 from ray.serve._private.autoscaling_state import AutoscalingStateManager
@@ -66,7 +66,6 @@ from ray.serve.schema import (
     LoggingConfig,
     ServeApplicationSchema,
 )
-from ray import ObjectRef
 from ray.util import metrics as ray_metrics
 
 logger = logging.getLogger(SERVE_LOGGER_NAME)

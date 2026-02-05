@@ -944,7 +944,6 @@ class ReplicaBase(ABC):
         self._user_callable_asgi_app: Optional[ASGIApp] = None
 
         # Gang context for replicas that are part of a gang.
-        # Will be set via initialize_and_get_metadata or reconfigure.
         self._gang_context: Optional["GangContext"] = None
 
         # Set metadata for logs and metrics.

@@ -387,8 +387,6 @@ class Deployment:
             new_deployment_config.logging_config = logging_config
 
         if gang_scheduling_config is not DEFAULT.VALUE:
-            if isinstance(gang_scheduling_config, dict):
-                gang_scheduling_config = GangSchedulingConfig(**gang_scheduling_config)
             new_deployment_config.gang_scheduling_config = gang_scheduling_config
 
         new_replica_config = ReplicaConfig.create(

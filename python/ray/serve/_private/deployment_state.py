@@ -37,7 +37,6 @@ from ray.serve._private.common import (
     RunningReplicaInfo,
 )
 from ray.serve._private.config import DeploymentConfig
-from ray.serve.config import GangRuntimeFailurePolicy
 from ray.serve._private.constants import (
     DEFAULT_LATENCY_BUCKET_MS,
     MAX_PER_REPLICA_RETRY_COUNT,
@@ -72,6 +71,7 @@ from ray.serve._private.utils import (
     msgpack_serialize,
 )
 from ray.serve._private.version import DeploymentVersion
+from ray.serve.config import GangRuntimeFailurePolicy
 from ray.serve.generated.serve_pb2 import DeploymentLanguage
 from ray.serve.schema import (
     DeploymentDetails,
@@ -324,7 +324,7 @@ class ActorReplicaWrapper:
         # Rank assigned to the replica.
         self._assign_rank_callback: Optional[Callable[[ReplicaID], ReplicaRank]] = None
         self._rank: Optional[ReplicaRank] = None
-        # Gang context for this replica, set in on_scheduled().
+        # Gang context for this replica
         self._gang_context: Optional["GangContext"] = None
         # Populated in `on_scheduled` or `recover`.
         self._actor_handle: ActorHandle = None
@@ -1245,8 +1245,6 @@ class DeploymentReplica:
         self._multiplexed_model_ids: List[str] = []
         self._routing_stats: Dict[str, Any] = {}
         self._logged_shutdown_message = False
-        # Gang context for replicas that are part of a gang.
-        # Set when the replica is assigned to a gang by the scheduler.
         self._gang_context: Optional["GangContext"] = None
 
     @property
@@ -1254,9 +1252,9 @@ class DeploymentReplica:
         """Get the gang context for this replica, if part of a gang."""
         return self._gang_context
 
-    def set_gang_context(self, gang_context: "GangContext") -> None:
-        """Set the gang context for this replica."""
-        self._gang_context = gang_context
+    @gang_context.setter
+    def gang_context(self, value: "GangContext") -> None:
+        self._gang_context = value
 
     def get_running_replica_info(
         self, cluster_node_info_cache: ClusterNodeInfoCache
@@ -1384,8 +1382,7 @@ class DeploymentReplica:
         Start a new actor for current DeploymentReplica instance.
         """
         replica_scheduling_request = self._actor.start(
-            deployment_info,
-            assign_rank_callback=assign_rank_callback,
+            deployment_info, assign_rank_callback=assign_rank_callback,
         )
         self._start_time = time.time()
         self._logged_shutdown_message = False
@@ -3248,7 +3245,7 @@ class DeploymentState:
                     )
                 )
                 if gang_context is not None:
-                    replica.set_gang_context(gang_context)
+                    replica.gang_context = gang_context
 
             if not is_healthy:
                 # Check if this replica is part of a gang using its gang_context

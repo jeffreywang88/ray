@@ -44,10 +44,10 @@ class GangContext:
         member_replica_ids: List of replica IDs in this gang, ordered by rank.
     """
 
-    gang_id: str  # Unique identifier for this gang
-    rank: int  # This replica's rank within the gang (0-indexed)
-    world_size: int  # Total number of replicas in this gang
-    member_replica_ids: List[str]  # List of replica IDs in this gang, ordered by rank
+    gang_id: str
+    rank: int
+    world_size: int
+    member_replica_ids: List[str]
 
 _INTERNAL_REPLICA_CONTEXT: "ReplicaContext" = None
 _global_client: ServeControllerClient = None
@@ -65,6 +65,7 @@ class ReplicaContext:
         - servable_object: instance of the user class/function this replica is running.
         - rank: the rank of the replica.
         - world_size: the number of replicas in the deployment.
+        - gang_context: gang context information for a replica that is part of a gang.
     """
 
     replica_id: ReplicaID
