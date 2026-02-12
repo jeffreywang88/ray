@@ -950,6 +950,7 @@ class ActorReplicaWrapper:
                         self._route_patterns,
                         self._outbound_deployments,
                         self._has_user_routing_stats_method,
+                        self._gang_context,
                     ) = ray.get(self._ready_obj_ref)
             except RayTaskError as e:
                 logger.exception(
@@ -2914,6 +2915,10 @@ class DeploymentState:
         Stop replicas with versions that require the actor to be restarted, and
         reconfigure replicas that require refreshing deployment config values.
 
+        For gang-scheduled deployments, replicas that need restarting are
+        grouped by gang_id and stopped in complete gangs so that we never
+        leave a gang partially torn down.
+
         Args:
             max_to_stop: max number of replicas to stop, by default,
                          it stops all replicas with an outdated version.
@@ -2929,6 +2934,55 @@ class DeploymentState:
         replicas_changed = False
         code_version_changes = 0
         reconfigure_changes = 0
+
+        # Process gang-grouped replicas
+        gang_config = self.get_gang_config()
+        if gang_config is not None:
+            need_restart: List[DeploymentReplica] = []
+            remaining: List[DeploymentReplica] = []
+            for replica in replicas_to_update:
+                if replica.version.requires_actor_restart(self._target_state.version):
+                    need_restart.append(replica)
+                else:
+                    remaining.append(replica)
+
+            # Group restart-candidates by gang_id.
+            # Every replica in a gang deployment should have gang_context set
+            # (via start() or recovered via check_ready()), so we expect all
+            # restart candidates to be groupable.
+            gangs: Dict[str, List[DeploymentReplica]] = defaultdict(list)
+            for replica in need_restart:
+                if replica.gang_context is None:
+                    logger.warning(
+                        f"Replica {replica.replica_id} in gang deployment "
+                        f"{self._id} has no gang_context. This is unexpected "
+                        "and may indicate a bug. Treating as an individual "
+                        "restart candidate."
+                    )
+                else:
+                    gangs[replica.gang_context.gang_id].append(replica)
+
+            # Stop complete gangs atomically within the budget
+            for _, gang_replicas in gangs.items():
+                if code_version_changes + len(gang_replicas) <= max_to_stop:
+                    for replica in gang_replicas:
+                        code_version_changes += 1
+                        graceful_stop = (
+                            replica.actor_details.state == ReplicaState.RUNNING
+                        )
+                        self._stop_replica(replica, graceful_stop=graceful_stop)
+                        replicas_changed = True
+                else:
+                    # Not enough budget for this gang; put replicas back
+                    for replica in gang_replicas:
+                        self._replicas.add(replica.actor_details.state, replica)
+
+            logger.info(
+                f"Stopping {code_version_changes} gang replicas of {self._id} with outdated versions."
+            )
+            replicas_to_update = remaining
+
+        # Per-replica restart/reconfigure handling
         for replica in replicas_to_update:
             if (code_version_changes + reconfigure_changes) >= max_to_stop:
                 self._replicas.add(replica.actor_details.state, replica)
@@ -3034,6 +3088,15 @@ class DeploymentState:
         # There should never be more than rollout_size old replicas stopping
         # or rollout_size new replicas starting.
         rollout_size = max(int(0.2 * self._target_state.target_num_replicas), 1)
+
+        # For gang deployments, ensure rollout_size is at least a multiple of gang_size
+        # so that we always stop and start complete gangs, respecting gang boundaries.
+        gang_config = self.get_gang_config()
+        if gang_config is not None:
+            gs = gang_config.gang_size
+            rollout_size = max(rollout_size, gs)
+            rollout_size = math.ceil(rollout_size / gs) * gs
+
         max_to_stop = max(rollout_size - pending_replicas, 0)
 
         return self._stop_or_update_outdated_version_replicas(max_to_stop)
@@ -3115,11 +3178,33 @@ class DeploymentState:
 
         elif delta_replicas < 0:
             to_remove = -delta_replicas
-            removed_replicas = f"{to_remove} replica{'s' if to_remove > 1 else ''}"
-            logger.info(f"Removing {removed_replicas} from {self._id}.")
-            downscale = DeploymentDownscaleRequest(
-                deployment_id=self._id, num_to_stop=to_remove
-            )
+            gang_config = self.get_gang_config()
+            gang_id_by_replica = None
+
+            if gang_config is not None:
+                # Round down to a full gang so we only stop complete gangs
+                gang_size = gang_config.gang_size
+                to_remove = (to_remove // gang_size) * gang_size
+                if to_remove == 0:
+                    return (upscale, downscale)
+
+                # Build gang membership map so the scheduler can select complete gangs
+                gang_id_by_replica = {}
+                for replica in self._replicas.get():
+                    if replica.gang_context is not None:
+                        gang_id_by_replica[
+                            replica.replica_id
+                        ] = replica.gang_context.gang_id
+
+            if to_remove > 0:
+                removed_replicas = f"{to_remove} replica{'s' if to_remove > 1 else ''}"
+                logger.info(f"Removing {removed_replicas} from {self._id}.")
+                downscale = DeploymentDownscaleRequest(
+                    deployment_id=self._id,
+                    num_to_stop=to_remove,
+                    gang_id_by_replica=gang_id_by_replica,
+                    gang_size=gang_config.gang_size if gang_config else None,
+                )
 
         return upscale, downscale
 

@@ -213,6 +213,10 @@ class DeploymentDownscaleRequest:
 
     deployment_id: DeploymentID
     num_to_stop: int
+    # For gang-scheduled deployments: maps each replica to its gang_id so the
+    # scheduler can select complete gangs instead of individual replicas.
+    gang_id_by_replica: Optional[Dict[ReplicaID, str]] = None
+    gang_size: Optional[int] = None
 
 
 @dataclass
@@ -737,7 +741,10 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
             deployment_to_replicas_to_stop[
                 downscale.deployment_id
             ] = self._get_replicas_to_stop(
-                downscale.deployment_id, downscale.num_to_stop
+                downscale.deployment_id,
+                downscale.num_to_stop,
+                gang_id_by_replica=downscale.gang_id_by_replica,
+                gang_size=downscale.gang_size,
             )
 
         return deployment_to_replicas_to_stop
@@ -855,7 +862,11 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
         return placement_candidates
 
     def _get_replicas_to_stop(
-        self, deployment_id: DeploymentID, max_num_to_stop: int
+        self,
+        deployment_id: DeploymentID,
+        max_num_to_stop: int,
+        gang_id_by_replica: Optional[Dict[ReplicaID, str]] = None,
+        gang_size: Optional[int] = None,
     ) -> Set[ReplicaID]:
         """Prioritize replicas running on a node with fewest replicas of
             all deployments.
@@ -864,7 +875,17 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
         relinquish nodes faster. Note that this algorithm doesn't consider
         other non-serve actors on the same node. See more at
         https://github.com/ray-project/ray/issues/20599.
+
+        For gang deployments, the same priority order is used, but entire gangs
+        are selected atomically.
         """
+        # For gang deployments, delegate to a gang-aware helper that uses
+        # the same priority ordering but selects complete gangs.
+        if gang_id_by_replica is not None:
+            return self._get_gang_replicas_to_stop(
+                deployment_id, max_num_to_stop, gang_id_by_replica, gang_size
+            )
+
         replicas_to_stop = set()
 
         # Replicas not in running state don't have node id.
@@ -919,6 +940,81 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
                 if len(replicas_to_stop) == max_num_to_stop:
                     return replicas_to_stop
 
+        return replicas_to_stop
+
+    def _get_gang_replicas_to_stop(
+        self,
+        deployment_id: DeploymentID,
+        max_num_to_stop: int,
+        gang_id_by_replica: Dict[ReplicaID, str],
+        gang_size: int,
+    ) -> Set[ReplicaID]:
+        """Gang-aware variant of _get_replicas_to_stop.
+
+        Uses the same priority order (pending/launching/recovering first,
+        then running on least-populated nodes, newest first) but selects
+        entire gangs atomically.
+        """
+        # Build a priority-ordered list of replica IDs using the same
+        # ordering as _get_replicas_to_stop.
+        ranked: List[ReplicaID] = []
+
+        ranked.extend(
+            set().union(
+                self._pending_replicas[deployment_id].keys(),
+                self._launching_replicas[deployment_id].keys(),
+                self._recovering_replicas[deployment_id],
+            )
+        )
+
+        node_to_running_replicas_of_all_deployments = (
+            self._get_node_to_running_replicas()
+        )
+
+        ordered_running_replicas = list(self._running_replicas[deployment_id].items())
+        ordered_running_replicas.reverse()
+        ordered_running_replicas_of_target_deployment: Dict[
+            str, List[ReplicaID]
+        ] = defaultdict(list)
+        for replica_id, replica_node_id in ordered_running_replicas:
+            ordered_running_replicas_of_target_deployment[replica_node_id].append(
+                replica_id
+            )
+
+        def key(node_and_num_running_replicas_of_all_deployments):
+            return (
+                len(node_and_num_running_replicas_of_all_deployments[1])
+                if node_and_num_running_replicas_of_all_deployments[0]
+                != self._head_node_id
+                else sys.maxsize
+            )
+
+        for node_id, _ in sorted(
+            node_to_running_replicas_of_all_deployments.items(), key=key
+        ):
+            if node_id not in ordered_running_replicas_of_target_deployment:
+                continue
+            for replica_id in ordered_running_replicas_of_target_deployment[node_id]:
+                ranked.append(replica_id)
+
+        # Walk the ranked list; when a replica is encountered, select its
+        # entire gang. Skip gangs that don't fit the remaining budget.
+        gang_members: Dict[str, Set[ReplicaID]] = defaultdict(set)
+        for replica_id, gang_id in gang_id_by_replica.items():
+            gang_members[gang_id].add(replica_id)
+
+        replicas_to_stop: Set[ReplicaID] = set()
+        selected_gangs: Set[str] = set()
+        for replica_id in ranked:
+            gang_id = gang_id_by_replica.get(replica_id)
+            if gang_id is None or gang_id in selected_gangs:
+                continue
+            if len(replicas_to_stop) + gang_size > max_num_to_stop:
+                continue
+            selected_gangs.add(gang_id)
+            replicas_to_stop.update(gang_members[gang_id])
+            if len(replicas_to_stop) >= max_num_to_stop:
+                break
         return replicas_to_stop
 
     def _filter_nodes_by_label_selector(
@@ -1015,21 +1111,23 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
         """
         gang_size = request.gang_size
 
-        if request.num_replicas_to_add % gang_size != 0:
-            logger.error(
-                f"num_replicas_to_add {request.num_replicas_to_add} "
-                f"is not divisible by gang_size {gang_size}."
-            )
-            return GangReservationResult(
-                success=False,
-                error_message=(
-                    f"num_replicas_to_add {request.num_replicas_to_add} "
-                    f"is not divisible by gang_size {gang_size}."
-                ),
-            )
-        num_gangs = request.num_replicas_to_add // gang_size
+        # Round down to the nearest multiple of gang_size to create as many
+        # complete gangs as possible and let the controller retry for the remainder
+        # in the next reconciliation loop.
+        num_replicas_to_add = (request.num_replicas_to_add // gang_size) * gang_size
+        if num_replicas_to_add == 0:
+            if request.num_replicas_to_add > 0:
+                logger.info(
+                    f"num_replicas_to_add ({request.num_replicas_to_add}) is "
+                    f"less than gang_size ({gang_size}) for "
+                    f"{request.deployment_id}. Waiting for the delta to reach "
+                    "a full gang."
+                )
+            return GangReservationResult(success=True, gang_pgs=[])
 
-        gang_pgs: Dict[int, Any] = {}
+        num_gangs = num_replicas_to_add // gang_size
+
+        gang_pgs: List[Any] = []
         for gang_index in range(num_gangs):
             bundles = [request.replica_resource_dict.copy() for _ in range(gang_size)]
 
@@ -1049,7 +1147,7 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
                         bundle_label_selector=None,
                     )
                 )
-                gang_pgs[gang_index] = pg
+                gang_pgs.append(pg)
             except Exception:
                 # Follow the same pattern as single-replica PG creation
                 # failure: log and skip this gang so the controller can

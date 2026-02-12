@@ -382,5 +382,337 @@ class TestGangScheduling:
         serve.shutdown()
 
 
+class TestGangScaling:
+    """Integration tests for gang-aware scaling and rolling updates."""
+
+    @staticmethod
+    def _send_requests_background(handle, stop_event, errors, successes):
+        """Continuously send requests until *stop_event* is set.
+
+        Any request that raises an exception is recorded in *errors*.
+        """
+        import time
+
+        while not stop_event.is_set():
+            try:
+                handle.remote().result(timeout_s=10)
+                successes.append(1)
+            except Exception as e:
+                errors.append(str(e))
+            time.sleep(0.05)
+
+    # ------------------------------------------------------------------
+    # Upscale: 4 → 8, gang_size=2 → adds 2 complete gangs, no downtime
+    # ------------------------------------------------------------------
+    def test_upscale_gang_boundary(self, ray_cluster):
+        """Upscaling adds only complete gangs.  Existing replicas keep serving."""
+        import threading
+
+        cluster = ray_cluster
+        cluster.add_node(num_cpus=2)
+        cluster.add_node(num_cpus=2)
+        cluster.wait_for_nodes()
+        ray.init(address=cluster.address)
+        serve.start()
+
+        # Pin version so that changing only num_replicas is a pure scale-up
+        # (no rolling restart).
+        @serve.deployment(
+            name="D",
+            version="v1",
+            num_replicas=4,
+            ray_actor_options={"num_cpus": 0.25},
+            gang_scheduling_config=GangSchedulingConfig(gang_size=2),
+        )
+        class D:
+            def __call__(self):
+                ctx = ray.serve.context._get_internal_replica_context()
+                gc = ctx.gang_context
+                return {"pid": os.getpid(), "gang_id": gc.gang_id if gc else None}
+
+        handle = serve.run(D.bind(), name="app")
+        wait_for_condition(check_apps_running, apps=["app"])
+
+        # Collect the initial gang_ids (should be 2 gangs of size 2).
+        initial_gang_ids = set()
+        for _ in range(40):
+            resp = handle.remote().result()
+            if resp["gang_id"] is not None:
+                initial_gang_ids.add(resp["gang_id"])
+        assert (
+            len(initial_gang_ids) == 2
+        ), f"Expected 2 initial gangs, got {len(initial_gang_ids)}"
+
+        # Start background request sender *before* the scale-up.
+        errors, successes = [], []
+        stop_event = threading.Event()
+        t = threading.Thread(
+            target=self._send_requests_background,
+            args=(handle, stop_event, errors, successes),
+            daemon=True,
+        )
+        t.start()
+
+        # Upscale: 4 → 8 (same code + version, only num_replicas changes).
+        handle = serve.run(D.options(num_replicas=8).bind(), name="app")
+        wait_for_condition(check_apps_running, apps=["app"])
+
+        # Verify 8 replicas running.
+        dep = list(serve.status().applications["app"].deployments.values())[0]
+        assert dep.replica_states.get("RUNNING", 0) == 8
+
+        stop_event.set()
+        t.join(timeout=5)
+
+        assert len(errors) == 0, f"Request errors during upscale: {errors}"
+        assert len(successes) > 0, "Background sender never succeeded"
+
+        # Verify the final 8 replicas belong to exactly 4 gangs, and the
+        # original 2 gangs are preserved (subset of the final set).
+        final_gang_ids = set()
+        seen_pids = set()
+        for _ in range(80):
+            resp = handle.remote().result()
+            if resp["gang_id"] is not None:
+                final_gang_ids.add(resp["gang_id"])
+            seen_pids.add(resp["pid"])
+            if len(seen_pids) >= 8:
+                break
+        assert (
+            len(final_gang_ids) == 4
+        ), f"Expected 4 final gangs, got {len(final_gang_ids)}: {final_gang_ids}"
+        assert initial_gang_ids.issubset(final_gang_ids), (
+            f"Initial gang_ids {initial_gang_ids} are not a subset of "
+            f"final gang_ids {final_gang_ids}"
+        )
+
+        serve.delete("app")
+        serve.shutdown()
+
+    # ------------------------------------------------------------------
+    # Downscale: 8 → 4, gang_size=2 → removes 2 complete gangs, no downtime
+    # ------------------------------------------------------------------
+    def test_downscale_gang_boundary(self, ray_cluster):
+        """Downscaling removes only complete gangs.  Surviving replicas keep serving."""
+        import threading
+
+        cluster = ray_cluster
+        cluster.add_node(num_cpus=2)
+        cluster.add_node(num_cpus=2)
+        cluster.wait_for_nodes()
+        ray.init(address=cluster.address)
+        serve.start()
+
+        # Pin version="v1" so that changing only num_replicas does NOT
+        # trigger a rolling restart (otherwise each serve.run generates a
+        # random code_version and all replicas are replaced).
+        @serve.deployment(
+            name="D",
+            version="v1",
+            num_replicas=8,
+            ray_actor_options={"num_cpus": 0.25},
+            gang_scheduling_config=GangSchedulingConfig(gang_size=2),
+        )
+        class D:
+            def __call__(self):
+                ctx = ray.serve.context._get_internal_replica_context()
+                gc = ctx.gang_context
+                return {"pid": os.getpid(), "gang_id": gc.gang_id if gc else None}
+
+        handle = serve.run(D.bind(), name="app")
+        wait_for_condition(check_apps_running, apps=["app"])
+
+        dep = list(serve.status().applications["app"].deployments.values())[0]
+        assert dep.replica_states.get("RUNNING", 0) == 8
+
+        # Collect the initial gang_ids (should be 4 gangs of size 2).
+        initial_gang_ids = set()
+        for _ in range(80):
+            resp = handle.remote().result()
+            if resp["gang_id"] is not None:
+                initial_gang_ids.add(resp["gang_id"])
+        assert (
+            len(initial_gang_ids) == 4
+        ), f"Expected 4 initial gangs, got {len(initial_gang_ids)}"
+
+        # Start background request sender *before* the scale-down.
+        errors, successes = [], []
+        stop_event = threading.Event()
+        t = threading.Thread(
+            target=self._send_requests_background,
+            args=(handle, stop_event, errors, successes),
+            daemon=True,
+        )
+        t.start()
+
+        # Downscale: 8 → 4 (same code + version, only num_replicas changes).
+        handle = serve.run(D.options(num_replicas=4).bind(), name="app")
+        wait_for_condition(check_apps_running, apps=["app"])
+
+        dep = list(serve.status().applications["app"].deployments.values())[0]
+        assert dep.replica_states.get("RUNNING", 0) == 4
+
+        stop_event.set()
+        t.join(timeout=5)
+
+        assert len(errors) == 0, f"Request errors during downscale: {errors}"
+        assert len(successes) > 0, "Background sender never succeeded"
+
+        # Verify the surviving 4 replicas belong to exactly 2 complete gangs
+        # and those gang_ids are a subset of the original 4.
+        surviving_gang_ids = set()
+        seen_pids = set()
+        for _ in range(80):
+            resp = handle.remote().result()
+            if resp["gang_id"] is not None:
+                surviving_gang_ids.add(resp["gang_id"])
+            seen_pids.add(resp["pid"])
+            if len(seen_pids) >= 4:
+                break
+        assert len(surviving_gang_ids) == 2, (
+            f"Expected 2 surviving gangs, got {len(surviving_gang_ids)}: "
+            f"{surviving_gang_ids}"
+        )
+        assert surviving_gang_ids.issubset(initial_gang_ids), (
+            f"Surviving gang_ids {surviving_gang_ids} are not a subset of "
+            f"initial gang_ids {initial_gang_ids}"
+        )
+
+        serve.delete("app")
+        serve.shutdown()
+
+    # ------------------------------------------------------------------
+    # Rolling update: same num_replicas, new code, gang_size replicas at a time
+    # ------------------------------------------------------------------
+    def test_rolling_update_gang_size_at_a_time(self, ray_cluster):
+        """Rolling update replaces one gang at a time.  No downtime."""
+        import threading
+
+        cluster = ray_cluster
+        cluster.add_node(num_cpus=2)
+        cluster.add_node(num_cpus=2)
+        cluster.wait_for_nodes()
+        ray.init(address=cluster.address)
+        serve.start()
+
+        @serve.deployment(
+            name="D",
+            num_replicas=4,
+            ray_actor_options={"num_cpus": 0.25},
+            gang_scheduling_config=GangSchedulingConfig(gang_size=2),
+        )
+        class V1:
+            def __call__(self):
+                return "v1"
+
+        handle = serve.run(V1.bind(), name="app")
+        wait_for_condition(check_apps_running, apps=["app"])
+        assert handle.remote().result() == "v1"
+
+        # Start background request sender *before* the update.
+        errors, successes = [], []
+        stop_event = threading.Event()
+        t = threading.Thread(
+            target=self._send_requests_background,
+            args=(handle, stop_event, errors, successes),
+            daemon=True,
+        )
+        t.start()
+
+        # New code version → triggers requires_actor_restart → rolling update.
+        @serve.deployment(
+            name="D",
+            num_replicas=4,
+            ray_actor_options={"num_cpus": 0.25},
+            gang_scheduling_config=GangSchedulingConfig(gang_size=2),
+        )
+        class V2:
+            def __call__(self):
+                return "v2"
+
+        handle = serve.run(V2.bind(), name="app")
+        wait_for_condition(check_apps_running, apps=["app"])
+
+        # All replicas should now return "v2".
+        for _ in range(20):
+            assert handle.remote().result() == "v2"
+
+        stop_event.set()
+        t.join(timeout=5)
+
+        assert len(errors) == 0, f"Request errors during rolling update: {errors}"
+        assert len(successes) > 0, "Background sender never succeeded"
+
+        serve.delete("app")
+        serve.shutdown()
+
+    # ------------------------------------------------------------------
+    # Rolling update *with* scale change: 4→8 replicas + new code
+    # ------------------------------------------------------------------
+    def test_rolling_update_with_scale_change(self, ray_cluster):
+        """Rolling update + upscale works correctly.  No downtime."""
+        import threading
+
+        cluster = ray_cluster
+        cluster.add_node(num_cpus=2)
+        cluster.add_node(num_cpus=2)
+        cluster.wait_for_nodes()
+        ray.init(address=cluster.address)
+        serve.start()
+
+        @serve.deployment(
+            name="D",
+            num_replicas=4,
+            ray_actor_options={"num_cpus": 0.25},
+            gang_scheduling_config=GangSchedulingConfig(gang_size=2),
+        )
+        class V1:
+            def __call__(self):
+                return "v1"
+
+        handle = serve.run(V1.bind(), name="app")
+        wait_for_condition(check_apps_running, apps=["app"])
+        assert handle.remote().result() == "v1"
+
+        # Start background request sender *before* the update.
+        errors, successes = [], []
+        stop_event = threading.Event()
+        t = threading.Thread(
+            target=self._send_requests_background,
+            args=(handle, stop_event, errors, successes),
+            daemon=True,
+        )
+        t.start()
+
+        # New code version + more replicas.
+        @serve.deployment(
+            name="D",
+            num_replicas=8,
+            ray_actor_options={"num_cpus": 0.25},
+            gang_scheduling_config=GangSchedulingConfig(gang_size=2),
+        )
+        class V2:
+            def __call__(self):
+                return "v2"
+
+        handle = serve.run(V2.bind(), name="app")
+        wait_for_condition(check_apps_running, apps=["app"])
+
+        dep = list(serve.status().applications["app"].deployments.values())[0]
+        assert dep.replica_states.get("RUNNING", 0) == 8
+
+        for _ in range(20):
+            assert handle.remote().result() == "v2"
+
+        stop_event.set()
+        t.join(timeout=5)
+
+        assert len(errors) == 0, f"Errors during rolling update + scale: {errors}"
+        assert len(successes) > 0, "Background sender never succeeded"
+
+        serve.delete("app")
+        serve.shutdown()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main(["-v", "-s", __file__]))
