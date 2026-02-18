@@ -952,6 +952,16 @@ class ActorReplicaWrapper:
                         self._has_user_routing_stats_method,
                         self._gang_context,
                     ) = ray.get(self._ready_obj_ref)
+
+                    # Recover gang placement group from actor gang context.
+                    # If recovery fails, treat the replica as failed so the
+                    # gang is restarted cleanly, or otherwise the PG leaks.
+                    if self._placement_group is None and self._gang_context is not None:
+                        if not self._recover_gang_placement_group():
+                            return ReplicaStartupStatus.FAILED, (
+                                f"Failed to recover gang placement group "
+                                f"for {self._replica_id}."
+                            )
             except RayTaskError as e:
                 logger.exception(
                     f"Exception in {self._replica_id}, the replica will be stopped."
@@ -967,6 +977,28 @@ class ActorReplicaWrapper:
                 return ReplicaStartupStatus.FAILED, repr(e)
 
         return ReplicaStartupStatus.SUCCEEDED, None
+
+    def _recover_gang_placement_group(self) -> bool:
+        """Recover the gang PG reference for this replica after controller restart.
+
+        Returns:
+            True if the PG was recovered successfully, False otherwise.
+        """
+        pg_name = self._gang_context.pg_name
+        if not pg_name:
+            logger.warning(
+                f"No pg_name in gang context for {self._replica_id}, "
+                "cannot recover gang PG."
+            )
+            return False
+
+        try:
+            self._placement_group = ray.util.get_placement_group(pg_name)
+            logger.info(f"Recovered gang PG '{pg_name}' for {self._replica_id}.")
+            return True
+        except ValueError:
+            logger.warning(f"Gang PG '{pg_name}' not found for {self._replica_id}.")
+            return False
 
     @property
     def actor_resources(self) -> Optional[Dict[str, float]]:
@@ -2908,6 +2940,10 @@ class DeploymentState:
         Stop replicas with versions that require the actor to be restarted, and
         reconfigure replicas that require refreshing deployment config values.
 
+        For gang-scheduled deployments, replicas that need restarting are
+        grouped by gang_id and stopped in complete gangs so that we never
+        leave a gang partially torn down.
+
         Args:
             max_to_stop: max number of replicas to stop, by default,
                          it stops all replicas with an outdated version.
@@ -2923,6 +2959,54 @@ class DeploymentState:
         replicas_changed = False
         code_version_changes = 0
         reconfigure_changes = 0
+
+        # Process gang-grouped replicas
+        gang_config = self.get_gang_config()
+        if gang_config is not None:
+            need_restart: List[DeploymentReplica] = []
+            remaining: List[DeploymentReplica] = []
+            for replica in replicas_to_update:
+                if replica.version.requires_actor_restart(self._target_state.version):
+                    need_restart.append(replica)
+                else:
+                    remaining.append(replica)
+
+            # Group restart-candidates by gang_id.
+            gangs: Dict[str, List[DeploymentReplica]] = defaultdict(list)
+            for replica in need_restart:
+                if replica.gang_context is None:
+                    logger.warning(
+                        f"Replica {replica.replica_id} in gang deployment "
+                        f"{self._id} has no gang_context. This is unexpected "
+                        "and may indicate a bug. Treating as an individual "
+                        "restart candidate."
+                    )
+                else:
+                    gangs[replica.gang_context.gang_id].append(replica)
+
+            # Stop complete gangs atomically within the budget
+            for _, gang_replicas in gangs.items():
+                if code_version_changes + len(gang_replicas) <= max_to_stop:
+                    for replica in gang_replicas:
+                        code_version_changes += 1
+                        graceful_stop = (
+                            replica.actor_details.state == ReplicaState.RUNNING
+                        )
+                        self._stop_replica(replica, graceful_stop=graceful_stop)
+                        replicas_changed = True
+                else:
+                    # Not enough budget for this gang; put replicas back
+                    for replica in gang_replicas:
+                        self._replicas.add(replica.actor_details.state, replica)
+
+            if code_version_changes > 0:
+                logger.info(
+                    f"Stopping {code_version_changes} gang replicas of "
+                    f"{self._id} with outdated versions."
+                )
+            replicas_to_update = remaining
+
+        # Per-replica restart/reconfigure handling
         for replica in replicas_to_update:
             if (code_version_changes + reconfigure_changes) >= max_to_stop:
                 self._replicas.add(replica.actor_details.state, replica)
@@ -3028,6 +3112,15 @@ class DeploymentState:
         # There should never be more than rollout_size old replicas stopping
         # or rollout_size new replicas starting.
         rollout_size = max(int(0.2 * self._target_state.target_num_replicas), 1)
+
+        # For gang deployments, ensure rollout_size is at least a multiple of
+        # gang_size so that we always stop and start complete gangs.
+        gang_config = self.get_gang_config()
+        if gang_config is not None:
+            gs = gang_config.gang_size
+            rollout_size = max(rollout_size, gs)
+            rollout_size = math.ceil(rollout_size / gs) * gs
+
         max_to_stop = max(rollout_size - pending_replicas, 0)
 
         return self._stop_or_update_outdated_version_replicas(max_to_stop)
@@ -3109,11 +3202,33 @@ class DeploymentState:
 
         elif delta_replicas < 0:
             to_remove = -delta_replicas
-            removed_replicas = f"{to_remove} replica{'s' if to_remove > 1 else ''}"
-            logger.info(f"Removing {removed_replicas} from {self._id}.")
-            downscale = DeploymentDownscaleRequest(
-                deployment_id=self._id, num_to_stop=to_remove
-            )
+            gang_config = self.get_gang_config()
+            gang_id_by_replica = None
+
+            if gang_config is not None:
+                # Round down to a full gang so we only stop complete gangs
+                gang_size = gang_config.gang_size
+                to_remove = (to_remove // gang_size) * gang_size
+                if to_remove == 0:
+                    return (upscale, downscale)
+
+                # Build gang membership map so the scheduler can select complete gangs
+                gang_id_by_replica = {}
+                for replica in self._replicas.get():
+                    if replica.gang_context is not None:
+                        gang_id_by_replica[
+                            replica.replica_id
+                        ] = replica.gang_context.gang_id
+
+            if to_remove > 0:
+                removed_replicas = f"{to_remove} replica{'s' if to_remove > 1 else ''}"
+                logger.info(f"Removing {removed_replicas} from {self._id}.")
+                downscale = DeploymentDownscaleRequest(
+                    deployment_id=self._id,
+                    num_to_stop=to_remove,
+                    gang_id_by_replica=gang_id_by_replica,
+                    gang_size=gang_config.gang_size if gang_config else None,
+                )
 
         return upscale, downscale
 
@@ -3171,9 +3286,12 @@ class DeploymentState:
         # Lazy import to avoid circular imports
         from ray.serve.context import GangContext
 
-        for gang_pg in gang_pgs:
-            # Pre-generate replica IDs for all members of this gang
-            gang_id = get_random_string()
+        gang_ids = gang_reservation_result.gang_ids or [
+            get_random_string() for _ in gang_pgs
+        ]
+        gang_pg_names = gang_reservation_result.gang_pg_names or ["" for _ in gang_pgs]
+
+        for gang_pg, gang_id, pg_name in zip(gang_pgs, gang_ids, gang_pg_names):
             member_replica_ids = [
                 ReplicaID(get_random_string(), deployment_id=self._id)
                 for _ in range(gang_size)
@@ -3185,6 +3303,7 @@ class DeploymentState:
                     rank=bundle_index,
                     world_size=gang_size,
                     member_replica_ids=[r.unique_id for r in member_replica_ids],
+                    pg_name=pg_name,
                 )
 
                 new_deployment_replica = DeploymentReplica(
@@ -3389,6 +3508,10 @@ class DeploymentState:
                 # state?
                 if is_slow and stop_on_slow:
                     self._stop_replica(replica, graceful_stop=False)
+                    # Track failed gang IDs so sibling replicas are also
+                    # stopped, preventing partial gangs from lingering.
+                    if replica.gang_context is not None:
+                        failed_gang_ids.add(replica.gang_context.gang_id)
                 else:
                     self._replicas.add(original_state, replica)
 
@@ -3747,11 +3870,23 @@ class DeploymentState:
     ) -> Tuple[List[DeploymentReplica], List[DeploymentReplica]]:
         """Returns a partition of replicas to stop and to keep.
 
+        For gang deployments, replicas are grouped by gang_id and complete
+        gangs are stopped atomically.
+
         Args:
             replicas: The current list of replicas pending migration.
             deadlines: The current draining node deadlines.
             min_replicas_to_stop: The minimum number of replicas to stop.
         """
+        gang_config = self.get_gang_config()
+
+        if gang_config is not None:
+            return self._choose_pending_migration_gangs_to_stop(
+                replicas,
+                deadlines,
+                min_replicas_to_stop,
+            )
+
         to_stop = []
         remaining = []
 
@@ -3778,39 +3913,137 @@ class DeploymentState:
 
         return to_stop, remaining
 
-    def migrate_replicas_on_draining_nodes(self, draining_nodes: Dict[str, int]):
-        # Move replicas back to running if they are no longer on a draining node.
-        # If this causes the number of replicas to exceed the target state,
-        # they will be scaled down because `scale_deployment_replicas` is called on
-        # each deployment after this
-        for replica in self._replicas.pop(states=[ReplicaState.PENDING_MIGRATION]):
-            if replica.actor_node_id not in draining_nodes:
-                self._replicas.add(ReplicaState.RUNNING, replica)
+    def _choose_pending_migration_gangs_to_stop(
+        self,
+        replicas: List[DeploymentReplica],
+        deadlines: Dict[str, int],
+        min_replicas_to_stop: int,
+    ) -> Tuple[List[DeploymentReplica], List[DeploymentReplica]]:
+        """Gang-aware variant: stop complete gangs atomically.
+
+        A gang is considered deadline-expired if ANY member's deadline is up.
+        For excess stopping, gangs are sorted by their earliest member
+        deadline.
+        """
+        gangs: Dict[str, List[DeploymentReplica]] = defaultdict(list)
+        for replica in replicas:
+            gangs[replica.gang_context.gang_id].append(replica)
+
+        to_stop: List[DeploymentReplica] = []
+        remaining_gangs: List[Tuple[int, str, List[DeploymentReplica]]] = []
+
+        curr_timestamp_ms = time.time() * 1000
+        for gang_id, gang_replicas in gangs.items():
+            # A gang's effective deadline is its earliest member deadline
+            earliest_deadline = min(
+                deadlines[replica.actor_node_id] for replica in gang_replicas
+            )
+            # Be conservative -- use the longest graceful shutdown timeout of any member
+            max_timeout_ms = max(
+                replica._actor.graceful_shutdown_timeout_s * 1000
+                for replica in gang_replicas
+            )
+
+            if curr_timestamp_ms >= earliest_deadline - max_timeout_ms:
+                to_stop.extend(gang_replicas)
             else:
-                self._replicas.add(ReplicaState.PENDING_MIGRATION, replica)
+                remaining_gangs.append((earliest_deadline, gang_id, gang_replicas))
+
+        # Stop excess gangs, earliest deadline first
+        remaining_gangs.sort(key=lambda x: x[0])
+        num_excess = min_replicas_to_stop - len(to_stop)
+
+        remaining: List[DeploymentReplica] = []
+        for _, _, gang_replicas in remaining_gangs:
+            if num_excess >= len(gang_replicas):
+                to_stop.extend(gang_replicas)
+                num_excess -= len(gang_replicas)
+            else:
+                remaining.extend(gang_replicas)
+
+        return to_stop, remaining
+
+    def migrate_replicas_on_draining_nodes(self, draining_nodes: Dict[str, int]):
+        gang_config = self.get_gang_config()
+
+        if gang_config is not None:
+            # Only move a gang back to RUNNING if ALL members' nodes are no longer draining
+            gangs: Dict[str, List[DeploymentReplica]] = defaultdict(list)
+            for replica in self._replicas.pop(states=[ReplicaState.PENDING_MIGRATION]):
+                gangs[replica.gang_context.gang_id].append(replica)
+
+            for gang_replicas in gangs.values():
+                any_draining = any(
+                    replica.actor_node_id in draining_nodes for replica in gang_replicas
+                )
+                if any_draining:
+                    for replica in gang_replicas:
+                        self._replicas.add(ReplicaState.PENDING_MIGRATION, replica)
+                else:
+                    for replica in gang_replicas:
+                        self._replicas.add(ReplicaState.RUNNING, replica)
+        else:
+            for replica in self._replicas.pop(states=[ReplicaState.PENDING_MIGRATION]):
+                if replica.actor_node_id not in draining_nodes:
+                    self._replicas.add(ReplicaState.RUNNING, replica)
+                else:
+                    self._replicas.add(ReplicaState.PENDING_MIGRATION, replica)
 
         # Migrate replicas on draining nodes
-        for replica in self._replicas.pop(
-            states=[ReplicaState.UPDATING, ReplicaState.RUNNING, ReplicaState.STARTING]
-        ):
-            if replica.actor_node_id in draining_nodes:
-                # For RUNNING replicas, migrate them safely by starting
-                # a replacement replica first.
-                if replica.actor_details.state == ReplicaState.RUNNING:
-                    logger.info(
-                        f"Migrating {replica.replica_id} from draining node "
-                        f"'{replica.actor_node_id}'. A new replica will be created on "
-                        "another node."
-                    )
-                    self._replicas.add(ReplicaState.PENDING_MIGRATION, replica)
-                # For replicas that are STARTING or UPDATING, might as
-                # well terminate them immediately to allow replacement
-                # replicas to start. Otherwise we need to wait for them
-                # to transition to RUNNING before starting migration.
+        if gang_config is not None:
+            gangs_to_migrate: Set[str] = set()
+            all_replicas = self._replicas.pop(
+                states=[
+                    ReplicaState.UPDATING,
+                    ReplicaState.RUNNING,
+                    ReplicaState.STARTING,
+                ]
+            )
+
+            # First pass: identify gangs that need migration.
+            for replica in all_replicas:
+                if replica.actor_node_id in draining_nodes:
+                    gangs_to_migrate.add(replica.gang_context.gang_id)
+
+            # Second pass: migrate entire gangs or keep replicas.
+            for replica in all_replicas:
+                if replica.gang_context.gang_id in gangs_to_migrate:
+                    if replica.actor_details.state == ReplicaState.RUNNING:
+                        logger.info(
+                            f"Migrating {replica.replica_id} from node "
+                            f"'{replica.actor_node_id}' (gang migration)"
+                        )
+                        self._replicas.add(ReplicaState.PENDING_MIGRATION, replica)
+                    else:
+                        self._stop_replica(replica, graceful_stop=True)
                 else:
-                    self._stop_replica(replica, graceful_stop=True)
-            else:
-                self._replicas.add(replica.actor_details.state, replica)
+                    self._replicas.add(replica.actor_details.state, replica)
+        else:
+            for replica in self._replicas.pop(
+                states=[
+                    ReplicaState.UPDATING,
+                    ReplicaState.RUNNING,
+                    ReplicaState.STARTING,
+                ]
+            ):
+                if replica.actor_node_id in draining_nodes:
+                    # For RUNNING replicas, migrate them safely by starting
+                    # a replacement replica first.
+                    if replica.actor_details.state == ReplicaState.RUNNING:
+                        logger.info(
+                            f"Migrating {replica.replica_id} from draining node "
+                            f"'{replica.actor_node_id}'. A new replica will be created on "
+                            "another node."
+                        )
+                        self._replicas.add(ReplicaState.PENDING_MIGRATION, replica)
+                    # For replicas that are STARTING or UPDATING, might as
+                    # well terminate them immediately to allow replacement
+                    # replicas to start. Otherwise we need to wait for them
+                    # to transition to RUNNING before starting migration.
+                    else:
+                        self._stop_replica(replica, graceful_stop=True)
+                else:
+                    self._replicas.add(replica.actor_details.state, replica)
 
         num_running = self._replicas.count(states=[ReplicaState.RUNNING])
         num_draining = self._replicas.count(states=[ReplicaState.PENDING_MIGRATION])
