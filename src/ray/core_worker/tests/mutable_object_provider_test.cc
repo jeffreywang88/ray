@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <string>
@@ -21,6 +22,8 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include <grpcpp/grpcpp.h>
 
 #include "absl/functional/bind_front.h"
 #include "absl/random/random.h"
@@ -133,6 +136,84 @@ std::shared_ptr<RayletClientInterface> GetMockRayletClient(
     std::shared_ptr<MockRayletClient> &interface, const NodeID &node_id) {
   return interface;
 }
+
+// A mock that simulates server unavailability for the first N push attempts, then
+// delegates to a MutableObjectProvider's HandlePushMutableObject for success.
+// This lets us test the full PollWriterClosure -> PushToReaderWithRetry -> retry path.
+class RetryingMockRayletClient : public rpc::FakeRayletClient {
+ public:
+  explicit RetryingMockRayletClient(MutableObjectProvider *receiver_provider,
+                                    int fail_first_n)
+      : receiver_provider_(receiver_provider), fail_first_n_(fail_first_n) {}
+
+  virtual ~RetryingMockRayletClient() {}
+
+  void PushMutableObject(const ObjectID &object_id,
+                         uint64_t data_size,
+                         uint64_t metadata_size,
+                         void *data,
+                         void *metadata,
+                         int64_t version,
+                         const rpc::ClientCallback<rpc::PushMutableObjectReply> &callback,
+                         int64_t timeout_ms = -1) override {
+    int attempt;
+    {
+      absl::MutexLock guard(&lock_);
+      attempt_count_++;
+      attempt = attempt_count_;
+      push_history_.push_back({object_id, version, attempt});
+    }
+
+    if (attempt <= fail_first_n_) {
+      // Simulate server unavailable
+      rpc::PushMutableObjectReply reply;
+      callback(Status::RpcError("Simulated server unavailable", grpc::UNAVAILABLE),
+               std::move(reply));
+      return;
+    }
+
+    // Simulate a successful push by feeding chunks to the receiver's handler.
+    // Build the request from the raw data pointers.
+    rpc::PushMutableObjectRequest request;
+    request.set_writer_object_id(object_id.Binary());
+    request.set_total_data_size(data_size);
+    request.set_total_metadata_size(metadata_size);
+    request.set_offset(0);
+    request.set_chunk_size(data_size);
+    request.set_data(static_cast<char *>(data), data_size);
+    request.set_metadata(static_cast<char *>(metadata), metadata_size);
+    request.set_version(version);
+
+    rpc::PushMutableObjectReply reply;
+    receiver_provider_->HandlePushMutableObject(request, &reply);
+
+    callback(Status::OK(), std::move(reply));
+  }
+
+  struct PushAttempt {
+    ObjectID object_id;
+    int64_t version;
+    int attempt;
+  };
+
+  int attempt_count() {
+    absl::MutexLock guard(&lock_);
+    return attempt_count_;
+  }
+
+  std::vector<PushAttempt> push_history() {
+    absl::MutexLock guard(&lock_);
+    return push_history_;
+  }
+
+ private:
+  MutableObjectProvider *receiver_provider_;
+  int fail_first_n_;
+
+  absl::Mutex lock_;
+  int attempt_count_ ABSL_GUARDED_BY(lock_) = 0;
+  std::vector<PushAttempt> push_history_ ABSL_GUARDED_BY(lock_);
+};
 
 }  // namespace
 
@@ -400,13 +481,14 @@ TEST(MutableObjectProvider, MutableObjectBufferSetErrorBeforeReadRelease) {
             StatusCode::ChannelError);
 }
 
-// Test retry handling with out-of-order chunks
-// Simulates the scenario where a chunk is retried and arrives out of order
-TEST(MutableObjectProvider, HandleRetryOutOfOrderChunks) {
+// Test that chunks arriving out of order within the same version are handled correctly.
+// (No per-chunk retry — chunks within a single attempt can still arrive out of order
+// due to gRPC concurrency.)
+TEST(MutableObjectProvider, HandleOutOfOrderChunks) {
   constexpr size_t kChunk0Size = 256;
   constexpr size_t kChunk1Size = 512;
   constexpr size_t kChunk2Size = 384;
-  constexpr size_t kTotalDataSize = kChunk0Size + kChunk1Size + kChunk2Size;  // 3 chunks
+  constexpr size_t kTotalDataSize = kChunk0Size + kChunk1Size + kChunk2Size;
   constexpr size_t kMetadataSize = 16;
 
   ObjectID writer_object_id = ObjectID::FromRandom();
@@ -417,15 +499,12 @@ TEST(MutableObjectProvider, HandleRetryOutOfOrderChunks) {
   provider.HandleRegisterMutableObject(
       writer_object_id, /*num_readers=*/1, reader_object_id);
 
-  // Prepare chunk data
   std::vector<std::vector<uint8_t>> chunk_data(3);
   std::vector<uint8_t> metadata(kMetadataSize, 0xAB);
   chunk_data[0].resize(kChunk0Size, static_cast<uint8_t>(0));
   chunk_data[1].resize(kChunk1Size, static_cast<uint8_t>(1));
   chunk_data[2].resize(kChunk2Size, static_cast<uint8_t>(2));
 
-  // Send chunks out of order: chunk 1, then chunk 0 (retry scenario),
-  // then chunk 2
   std::vector<ray::rpc::PushMutableObjectReply> replies(3);
 
   // Chunk 1 arrives first (offset = kChunk0Size)
@@ -438,12 +517,12 @@ TEST(MutableObjectProvider, HandleRetryOutOfOrderChunks) {
     request.set_chunk_size(kChunk1Size);
     request.set_data(chunk_data[1].data(), kChunk1Size);
     request.set_metadata(metadata.data(), kMetadataSize);
-    request.set_version(1);  // All chunks in this write have version 1
+    request.set_version(1);
     provider.HandlePushMutableObject(request, &replies[1]);
     EXPECT_FALSE(replies[1].done()) << "Chunk 1 should not complete the object";
   }
 
-  // Chunk 0 arrives second (offset = 0) - simulates retry or out-of-order
+  // Chunk 0 arrives second (offset = 0)
   {
     ray::rpc::PushMutableObjectRequest request;
     request.set_writer_object_id(writer_object_id.Binary());
@@ -453,26 +532,9 @@ TEST(MutableObjectProvider, HandleRetryOutOfOrderChunks) {
     request.set_chunk_size(kChunk0Size);
     request.set_data(chunk_data[0].data(), kChunk0Size);
     request.set_metadata(metadata.data(), kMetadataSize);
-    request.set_version(1);  // Same version as chunk 1
+    request.set_version(1);
     provider.HandlePushMutableObject(request, &replies[0]);
     EXPECT_FALSE(replies[0].done()) << "Chunk 0 should not complete the object";
-  }
-
-  // Retry chunk 0 (idempotent - should be handled gracefully)
-  {
-    ray::rpc::PushMutableObjectRequest request;
-    request.set_writer_object_id(writer_object_id.Binary());
-    request.set_total_data_size(kTotalDataSize);
-    request.set_total_metadata_size(kMetadataSize);
-    request.set_offset(0);
-    request.set_chunk_size(kChunk0Size);
-    request.set_data(chunk_data[0].data(), kChunk0Size);
-    request.set_metadata(metadata.data(), kMetadataSize);
-    request.set_version(1);  // Same version - legitimate retry
-    ray::rpc::PushMutableObjectReply retry_reply;
-    provider.HandlePushMutableObject(request, &retry_reply);
-    // Retry should return current status without error
-    EXPECT_FALSE(retry_reply.done()) << "Retry of chunk 0 should return current status";
   }
 
   // Chunk 2 arrives last (offset = kChunk0Size + kChunk1Size)
@@ -485,7 +547,7 @@ TEST(MutableObjectProvider, HandleRetryOutOfOrderChunks) {
     request.set_chunk_size(kChunk2Size);
     request.set_data(chunk_data[2].data(), kChunk2Size);
     request.set_metadata(metadata.data(), kMetadataSize);
-    request.set_version(1);  // Same version
+    request.set_version(1);
     provider.HandlePushMutableObject(request, &replies[2]);
     EXPECT_TRUE(replies[2].done()) << "Chunk 2 should complete the object";
   }
@@ -497,7 +559,6 @@ TEST(MutableObjectProvider, HandleRetryOutOfOrderChunks) {
   EXPECT_EQ(result->GetData()->Size(), kTotalDataSize);
   EXPECT_EQ(result->GetMetadata()->Size(), kMetadataSize);
 
-  // Verify data integrity - check each chunk
   const uint8_t *data_ptr = result->GetData()->Data();
   size_t chunk_offsets[3] = {0, kChunk0Size, kChunk0Size + kChunk1Size};
   size_t chunk_sizes[3] = {kChunk0Size, kChunk1Size, kChunk2Size};
@@ -506,6 +567,124 @@ TEST(MutableObjectProvider, HandleRetryOutOfOrderChunks) {
       EXPECT_EQ(data_ptr[chunk_offsets[chunk] + i], static_cast<uint8_t>(chunk))
           << "Data mismatch at chunk " << chunk << " offset " << i;
     }
+  }
+
+  EXPECT_EQ(provider.ReadRelease(reader_object_id).code(), StatusCode::OK);
+}
+
+// Test whole-object retry: send partial chunks, then resend all chunks for the same
+// version. The receiver should detect the retry (offset=0 with partial progress) and
+// reset, completing successfully.
+TEST(MutableObjectProvider, HandleWholeObjectRetry) {
+  constexpr size_t kChunk0Size = 256;
+  constexpr size_t kChunk1Size = 256;
+  constexpr size_t kChunk2Size = 256;
+  constexpr size_t kTotalDataSize = kChunk0Size + kChunk1Size + kChunk2Size;
+  constexpr size_t kMetadataSize = 16;
+
+  ObjectID writer_object_id = ObjectID::FromRandom();
+  ObjectID reader_object_id = ObjectID::FromRandom();
+  auto plasma = std::make_shared<TestPlasma>();
+  MutableObjectProvider provider(plasma, /*factory=*/nullptr, nullptr);
+
+  provider.HandleRegisterMutableObject(
+      writer_object_id, /*num_readers=*/1, reader_object_id);
+
+  std::vector<uint8_t> chunk0_data(kChunk0Size, 0xAA);
+  std::vector<uint8_t> chunk1_data(kChunk1Size, 0xBB);
+  std::vector<uint8_t> chunk2_data(kChunk2Size, 0xCC);
+  std::vector<uint8_t> metadata(kMetadataSize, 0xDD);
+
+  // First attempt: send chunk 0 and chunk 1 (simulating chunk 2 failed)
+  {
+    ray::rpc::PushMutableObjectRequest request;
+    ray::rpc::PushMutableObjectReply reply;
+    request.set_writer_object_id(writer_object_id.Binary());
+    request.set_total_data_size(kTotalDataSize);
+    request.set_total_metadata_size(kMetadataSize);
+    request.set_offset(0);
+    request.set_chunk_size(kChunk0Size);
+    request.set_data(chunk0_data.data(), kChunk0Size);
+    request.set_metadata(metadata.data(), kMetadataSize);
+    request.set_version(1);
+    provider.HandlePushMutableObject(request, &reply);
+    EXPECT_FALSE(reply.done());
+  }
+  {
+    ray::rpc::PushMutableObjectRequest request;
+    ray::rpc::PushMutableObjectReply reply;
+    request.set_writer_object_id(writer_object_id.Binary());
+    request.set_total_data_size(kTotalDataSize);
+    request.set_total_metadata_size(kMetadataSize);
+    request.set_offset(kChunk0Size);
+    request.set_chunk_size(kChunk1Size);
+    request.set_data(chunk1_data.data(), kChunk1Size);
+    request.set_metadata(metadata.data(), kMetadataSize);
+    request.set_version(1);
+    provider.HandlePushMutableObject(request, &reply);
+    EXPECT_FALSE(reply.done());
+  }
+
+  // Second attempt (whole-object retry): resend all chunks starting from offset 0.
+  // The receiver should detect offset=0 with existing progress and reset written_so_far_.
+  {
+    ray::rpc::PushMutableObjectRequest request;
+    ray::rpc::PushMutableObjectReply reply;
+    request.set_writer_object_id(writer_object_id.Binary());
+    request.set_total_data_size(kTotalDataSize);
+    request.set_total_metadata_size(kMetadataSize);
+    request.set_offset(0);
+    request.set_chunk_size(kChunk0Size);
+    request.set_data(chunk0_data.data(), kChunk0Size);
+    request.set_metadata(metadata.data(), kMetadataSize);
+    request.set_version(1);
+    provider.HandlePushMutableObject(request, &reply);
+    EXPECT_FALSE(reply.done()) << "Retry chunk 0 should not complete yet";
+  }
+  {
+    ray::rpc::PushMutableObjectRequest request;
+    ray::rpc::PushMutableObjectReply reply;
+    request.set_writer_object_id(writer_object_id.Binary());
+    request.set_total_data_size(kTotalDataSize);
+    request.set_total_metadata_size(kMetadataSize);
+    request.set_offset(kChunk0Size);
+    request.set_chunk_size(kChunk1Size);
+    request.set_data(chunk1_data.data(), kChunk1Size);
+    request.set_metadata(metadata.data(), kMetadataSize);
+    request.set_version(1);
+    provider.HandlePushMutableObject(request, &reply);
+    EXPECT_FALSE(reply.done()) << "Retry chunk 1 should not complete yet";
+  }
+  {
+    ray::rpc::PushMutableObjectRequest request;
+    ray::rpc::PushMutableObjectReply reply;
+    request.set_writer_object_id(writer_object_id.Binary());
+    request.set_total_data_size(kTotalDataSize);
+    request.set_total_metadata_size(kMetadataSize);
+    request.set_offset(kChunk0Size + kChunk1Size);
+    request.set_chunk_size(kChunk2Size);
+    request.set_data(chunk2_data.data(), kChunk2Size);
+    request.set_metadata(metadata.data(), kMetadataSize);
+    request.set_version(1);
+    provider.HandlePushMutableObject(request, &reply);
+    EXPECT_TRUE(reply.done()) << "Retry chunk 2 should complete the object";
+  }
+
+  // Verify data integrity
+  std::shared_ptr<RayObject> result;
+  EXPECT_EQ(provider.ReadAcquire(reader_object_id, result).code(), StatusCode::OK);
+  EXPECT_EQ(result->GetData()->Size(), kTotalDataSize);
+
+  const uint8_t *data_ptr = result->GetData()->Data();
+  for (size_t i = 0; i < kChunk0Size; i++) {
+    EXPECT_EQ(data_ptr[i], 0xAA) << "Chunk 0 data mismatch at offset " << i;
+  }
+  for (size_t i = 0; i < kChunk1Size; i++) {
+    EXPECT_EQ(data_ptr[kChunk0Size + i], 0xBB) << "Chunk 1 data mismatch at offset " << i;
+  }
+  for (size_t i = 0; i < kChunk2Size; i++) {
+    EXPECT_EQ(data_ptr[kChunk0Size + kChunk1Size + i], 0xCC)
+        << "Chunk 2 data mismatch at offset " << i;
   }
 
   EXPECT_EQ(provider.ReadRelease(reader_object_id).code(), StatusCode::OK);
@@ -595,6 +774,89 @@ TEST(MutableObjectProvider, HandleVersionBasedRetryDetection) {
     }
     EXPECT_EQ(provider.ReadRelease(reader_object_id).code(), StatusCode::OK);
   }
+}
+
+// Integration test: verify that PollWriterClosure retries on push failure and
+// eventually delivers the data to the remote reader. This tests the full path:
+// writer writes -> PollWriterClosure -> PushToReaderWithRetry (fails N times) -> succeeds.
+TEST(MutableObjectProvider, RetryOnPushFailure) {
+  ObjectID writer_object_id = ObjectID::FromRandom();
+  ObjectID reader_object_id = ObjectID::FromRandom();
+  NodeID reader_node_id = NodeID::FromRandom();
+  auto plasma = std::make_shared<TestPlasma>();
+
+  // We need two providers: one for the writer side (sends), one for the reader side
+  // (receives via HandlePushMutableObject). In production these are on different nodes.
+  // Here we use a RetryingMockRayletClient to bridge them.
+
+  // Create reader-side provider first (it has no remote readers of its own).
+  MutableObjectProvider reader_provider(plasma, /*factory=*/nullptr, nullptr);
+  reader_provider.HandleRegisterMutableObject(
+      writer_object_id, /*num_readers=*/1, reader_object_id);
+
+  // Create the retrying mock that fails the first 2 pushes, then succeeds.
+  auto retrying_client =
+      std::make_shared<RetryingMockRayletClient>(&reader_provider, /*fail_first_n=*/2);
+
+  // Writer-side provider with factory that returns the retrying mock.
+  MutableObjectProvider writer_provider(
+      plasma,
+      /*factory=*/
+      [retrying_client](const NodeID &) -> std::shared_ptr<RayletClientInterface> {
+        return retrying_client;
+      },
+      nullptr);
+  writer_provider.RegisterWriterChannel(writer_object_id, {reader_node_id});
+
+  // Write data on the writer side. This triggers PollWriterClosure.
+  constexpr size_t kDataSize = 64;
+  constexpr size_t kMetadataSize = 8;
+  std::vector<uint8_t> test_data(kDataSize, 0x42);
+  std::vector<uint8_t> test_metadata(kMetadataSize, 0xFF);
+
+  {
+    std::shared_ptr<Buffer> data;
+    ASSERT_EQ(writer_provider
+                  .WriteAcquire(writer_object_id,
+                                kDataSize,
+                                test_metadata.data(),
+                                kMetadataSize,
+                                /*num_readers=*/1,
+                                data)
+                  .code(),
+              StatusCode::OK);
+    memcpy(data->Data(), test_data.data(), kDataSize);
+    ASSERT_EQ(writer_provider.WriteRelease(writer_object_id).code(), StatusCode::OK);
+  }
+
+  // Wait for the push to succeed after retries.
+  // PushToReaderWithRetry uses backoff: 100ms, 200ms, ... so ~300ms total for 2 failures.
+  auto start_time = std::chrono::steady_clock::now();
+  bool reader_got_data = false;
+  while ((std::chrono::steady_clock::now() - start_time) < std::chrono::seconds(5)) {
+    // Try to read — ReadAcquire blocks until data is available or timeout.
+    std::shared_ptr<RayObject> result;
+    Status s = reader_provider.ReadAcquire(reader_object_id, result, /*timeout_ms=*/100);
+    if (s.ok()) {
+      // Verify the data
+      ASSERT_EQ(result->GetData()->Size(), kDataSize);
+      ASSERT_EQ(result->GetMetadata()->Size(), kMetadataSize);
+      const uint8_t *data_ptr = result->GetData()->Data();
+      for (size_t i = 0; i < kDataSize; i++) {
+        EXPECT_EQ(data_ptr[i], 0x42) << "Data mismatch at offset " << i;
+      }
+      EXPECT_EQ(reader_provider.ReadRelease(reader_object_id).code(), StatusCode::OK);
+      reader_got_data = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  ASSERT_TRUE(reader_got_data) << "Reader should have received data after retries";
+
+  // Verify that retries actually happened (first 2 attempts failed, 3rd succeeded).
+  EXPECT_GE(retrying_client->attempt_count(), 3)
+      << "Should have needed at least 3 attempts (2 failures + 1 success)";
 }
 
 #endif  // defined(__APPLE__) || defined(__linux__)

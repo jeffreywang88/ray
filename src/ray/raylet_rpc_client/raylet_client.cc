@@ -202,8 +202,8 @@ void RayletClient::PushMutableObject(
     // Set the version from the sender's PlasmaObjectHeader to distinguish write epochs
     request.set_version(version);
 
-    // Use retryable RPC call to handle failure recovery, retries, and timeout.
-    // Each chunk is retried automatically on transient network errors.
+    // Use non-retryable RPC call for each chunk. Retry is handled at the
+    // whole-object level by PollWriterClosure, not per-chunk.
     auto lambda_callback = [callback, callback_invoked](
                                const Status &status,
                                rpc::PushMutableObjectReply &&reply) {
@@ -226,13 +226,12 @@ void RayletClient::PushMutableObject(
         callback(status, std::move(reply));
       }
     };
-    INVOKE_RETRYABLE_RPC_CALL(retryable_grpc_client_,
-                              NodeManagerService,
-                              PushMutableObject,
-                              request,
-                              lambda_callback,
-                              grpc_client_,
-                              /*method_timeout_ms*/ timeout_ms);
+    INVOKE_RPC_CALL(NodeManagerService,
+                    PushMutableObject,
+                    request,
+                    lambda_callback,
+                    grpc_client_,
+                    /*method_timeout_ms*/ timeout_ms);
   }
 }
 
