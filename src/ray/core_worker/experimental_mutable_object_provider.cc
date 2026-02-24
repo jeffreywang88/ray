@@ -147,76 +147,27 @@ void MutableObjectProvider::HandlePushMutableObject(
       << "Metadata size mismatch. Expected " << total_metadata_size << " bytes, got "
       << request.metadata().size() << " bytes";
 
-  // Version-based idempotent retry handling strategy:
-  // - Stale versions (<= highest_completed): discard immediately
-  // - Active version (== highest_completed + 1): write to backing store
-  // - Future versions (> highest_completed + 1): buffer for later processing
-  int64_t request_version = request.version();
-
-  // Step 1: Reject stale retries from completed writes (O(1) check)
-  int64_t highest_completed = 0;
-  {
-    absl::MutexLock guard(&written_so_far_lock_);
-    highest_completed = highest_completed_version_[writer_object_id];  // default 0
-
-    if (request_version <= highest_completed) {
-      // Stale retry from already-completed write
-      reply->set_done(true);
-      return;
-    }
-  }
-
-  // Step 2: Determine if this is active version or future version
-  int64_t active_version = highest_completed + 1;
-  bool is_active_version = (request_version == active_version);
-
-  // Step 3: Check for duplicate chunks using (offset, version) key
-  auto chunk_key = std::make_pair(offset, request_version);
+  // The sender fires all chunk RPCs concurrently, so chunks may arrive out of order.
+  // We use the written_so_far_ counter to identify the first chunk (it sees 0).
+  uint64_t tmp_written_so_far = 0;
   bool needs_write_acquire = false;
-
   {
     absl::MutexLock guard(&written_so_far_lock_);
-    auto &received_chunks = received_chunks_[writer_object_id];
 
-    if (received_chunks.find(chunk_key) != received_chunks.end()) {
-      // Duplicate chunk - return status
-      if (is_active_version) {
-        auto written_it = written_so_far_.find(writer_object_id);
-        uint64_t written = (written_it != written_so_far_.end()) ? written_it->second : 0;
-        reply->set_done(written == total_data_size);
-      } else {
-        reply->set_done(false);
-      }
-      return;
+    tmp_written_so_far = written_so_far_[writer_object_id];
+    written_so_far_[writer_object_id] += chunk_size;
+    if (written_so_far_[writer_object_id] == total_data_size) {
+      written_so_far_.erase(writer_object_id);
     }
-
-    // Step 4: For future versions, buffer only (don't write to backing store)
-    if (!is_active_version) {
-      received_chunks.insert(chunk_key);
-      reply->set_done(false);
-      return;
-    }
-
-    // Step 5: Active version - check if need WriteAcquire
-    if (!write_acquired_[writer_object_id]) {
+    if (tmp_written_so_far == 0u) {
+      write_acquired_[writer_object_id] = false;
       needs_write_acquire = true;
-      // Note: We do NOT set write_acquired_ = true here yet. This prevents other threads
-      // from calling GetObjectBackingStore() before WriteAcquire() completes.
     }
   }
-
-  // Continue with WriteAcquire and write logic for active version
-  bool object_complete = false;
 
   std::shared_ptr<Buffer> object_backing_store;
   if (needs_write_acquire) {
-    // Initialize written_so_far_ for new write
-    {
-      absl::MutexLock guard(&written_so_far_lock_);
-      written_so_far_[writer_object_id] = 0;
-    }
-    // First chunk to arrive (may not be offset 0 due to out-of-order delivery) -
-    // acquire write lock and allocate backing store.
+    // First chunk to arrive (may not be offset 0 due to out-of-order delivery).
     // We set `metadata` to nullptr since the metadata is at the end of the object, which
     // we will not have until the last chunk is received.
     RAY_CHECK_OK(object_manager_->WriteAcquire(info.local_object_id,
@@ -233,8 +184,8 @@ void MutableObjectProvider::HandlePushMutableObject(
     }
   } else {
     // Wait until WriteAcquire has completed before calling GetObjectBackingStore.
-    // This prevents the race condition where we check write_acquired_ before
-    // WriteAcquire() has actually completed.
+    // This prevents the race condition where a concurrent chunk calls
+    // GetObjectBackingStore() before WriteAcquire() has finished.
     {
       absl::MutexLock guard(&written_so_far_lock_);
       auto condition = [this, &writer_object_id]()
@@ -243,8 +194,6 @@ void MutableObjectProvider::HandlePushMutableObject(
                            };
       written_so_far_lock_.Await(absl::Condition(&condition));
     }
-    // Subsequent chunk (or chunk arriving after WriteAcquire was called by another chunk)
-    // - get existing backing store.
     RAY_CHECK_OK(object_manager_->GetObjectBackingStore(info.local_object_id,
                                                         total_data_size,
                                                         total_metadata_size,
@@ -252,63 +201,21 @@ void MutableObjectProvider::HandlePushMutableObject(
   }
   RAY_CHECK(object_backing_store);
 
-  // Copy chunk data to backing store.
   memcpy(object_backing_store->Data() + offset, request.data().data(), chunk_size);
-
-  // Mark this chunk as received only after successfully writing it.
-  // This ensures retries are handled correctly even if WriteAcquire fails.
-  {
-    absl::MutexLock guard(&written_so_far_lock_);
-    // Mark chunk as received using (offset, version) pair (reusing chunk_key from above)
-    received_chunks_[writer_object_id].insert(chunk_key);
-    // Update written_so_far_ by adding this chunk's size.
-    // Note: written_so_far_ was already initialized to 0 in the first lock block
-    // for new writes, so we can safely increment it here.
-    written_so_far_[writer_object_id] += chunk_size;
-    RAY_CHECK_LE(written_so_far_[writer_object_id], total_data_size);
-    if (written_so_far_[writer_object_id] == total_data_size) {
-      object_complete = true;
-      // Note: We keep received_chunks_ and written_so_far_ entries until WriteRelease
-      // completes to handle retries. They will be cleaned up after WriteRelease() is
-      // called.
-    }
-  }
-
-  if (object_complete) {
-    // All data chunks received - copy metadata and release write lock.
+  size_t total_written = tmp_written_so_far + chunk_size;
+  RAY_CHECK_LE(total_written, total_data_size);
+  if (total_written == total_data_size) {
+    // Copy the metadata to the end of the object.
     memcpy(object_backing_store->Data() + total_data_size,
            request.metadata().data(),
            total_metadata_size);
     // The entire object has been written, so call `WriteRelease()`.
     RAY_CHECK_OK(object_manager_->WriteRelease(info.local_object_id));
-
-    // Update tracking state after WriteRelease
+    // Clean up write_acquired_ tracking for next write.
     {
       absl::MutexLock guard(&written_so_far_lock_);
-
-      // Update highest completed version
-      highest_completed_version_[writer_object_id] = request_version;
-
-      // Remove ONLY chunks belonging to this completed version
-      auto &chunks = received_chunks_[writer_object_id];
-      for (auto it = chunks.begin(); it != chunks.end();) {
-        if (it->second == request_version) {
-          it = chunks.erase(it);
-        } else {
-          ++it;
-        }
-      }
-
-      // Clear per-object tracking for next write
-      written_so_far_.erase(writer_object_id);
       write_acquired_.erase(writer_object_id);
-
-      // Clean up received_chunks_ entry if empty
-      if (chunks.empty()) {
-        received_chunks_.erase(writer_object_id);
-      }
     }
-
     reply->set_done(true);
   } else {
     reply->set_done(false);

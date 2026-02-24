@@ -16,18 +16,11 @@
 #include <limits>
 #include <memory>
 #include <string>
-#include <thread>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
 #include <vector>
 
 #include "absl/functional/bind_front.h"
 #include "absl/random/random.h"
 #include "absl/strings/str_format.h"
-#include "absl/synchronization/barrier.h"
-#include "absl/time/clock.h"
-#include "absl/time/time.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "mock/ray/object_manager/plasma/client.h"
@@ -400,13 +393,13 @@ TEST(MutableObjectProvider, MutableObjectBufferSetErrorBeforeReadRelease) {
             StatusCode::ChannelError);
 }
 
-// Test retry handling with out-of-order chunks
-// Simulates the scenario where a chunk is retried and arrives out of order
-TEST(MutableObjectProvider, HandleRetryOutOfOrderChunks) {
+// Test out-of-order chunk arrival within a single write.
+// The sender fires all chunk RPCs concurrently, so gRPC may deliver them in any order.
+TEST(MutableObjectProvider, HandleOutOfOrderChunks) {
   constexpr size_t kChunk0Size = 256;
   constexpr size_t kChunk1Size = 512;
   constexpr size_t kChunk2Size = 384;
-  constexpr size_t kTotalDataSize = kChunk0Size + kChunk1Size + kChunk2Size;  // 3 chunks
+  constexpr size_t kTotalDataSize = kChunk0Size + kChunk1Size + kChunk2Size;
   constexpr size_t kMetadataSize = 16;
 
   ObjectID writer_object_id = ObjectID::FromRandom();
@@ -424,8 +417,7 @@ TEST(MutableObjectProvider, HandleRetryOutOfOrderChunks) {
   chunk_data[1].resize(kChunk1Size, static_cast<uint8_t>(1));
   chunk_data[2].resize(kChunk2Size, static_cast<uint8_t>(2));
 
-  // Send chunks out of order: chunk 1, then chunk 0 (retry scenario),
-  // then chunk 2
+  // Send chunks out of order: chunk 1 first, then chunk 0, then chunk 2
   std::vector<ray::rpc::PushMutableObjectReply> replies(3);
 
   // Chunk 1 arrives first (offset = kChunk0Size)
@@ -438,12 +430,12 @@ TEST(MutableObjectProvider, HandleRetryOutOfOrderChunks) {
     request.set_chunk_size(kChunk1Size);
     request.set_data(chunk_data[1].data(), kChunk1Size);
     request.set_metadata(metadata.data(), kMetadataSize);
-    request.set_version(1);  // All chunks in this write have version 1
+    request.set_version(1);
     provider.HandlePushMutableObject(request, &replies[1]);
     EXPECT_FALSE(replies[1].done()) << "Chunk 1 should not complete the object";
   }
 
-  // Chunk 0 arrives second (offset = 0) - simulates retry or out-of-order
+  // Chunk 0 arrives second (offset = 0)
   {
     ray::rpc::PushMutableObjectRequest request;
     request.set_writer_object_id(writer_object_id.Binary());
@@ -453,29 +445,12 @@ TEST(MutableObjectProvider, HandleRetryOutOfOrderChunks) {
     request.set_chunk_size(kChunk0Size);
     request.set_data(chunk_data[0].data(), kChunk0Size);
     request.set_metadata(metadata.data(), kMetadataSize);
-    request.set_version(1);  // Same version as chunk 1
+    request.set_version(1);
     provider.HandlePushMutableObject(request, &replies[0]);
     EXPECT_FALSE(replies[0].done()) << "Chunk 0 should not complete the object";
   }
 
-  // Retry chunk 0 (idempotent - should be handled gracefully)
-  {
-    ray::rpc::PushMutableObjectRequest request;
-    request.set_writer_object_id(writer_object_id.Binary());
-    request.set_total_data_size(kTotalDataSize);
-    request.set_total_metadata_size(kMetadataSize);
-    request.set_offset(0);
-    request.set_chunk_size(kChunk0Size);
-    request.set_data(chunk_data[0].data(), kChunk0Size);
-    request.set_metadata(metadata.data(), kMetadataSize);
-    request.set_version(1);  // Same version - legitimate retry
-    ray::rpc::PushMutableObjectReply retry_reply;
-    provider.HandlePushMutableObject(request, &retry_reply);
-    // Retry should return current status without error
-    EXPECT_FALSE(retry_reply.done()) << "Retry of chunk 0 should return current status";
-  }
-
-  // Chunk 2 arrives last (offset = kChunk0Size + kChunk1Size)
+  // Chunk 2 arrives last (offset = kChunk0Size + kChunk1Size) - completes the object
   {
     ray::rpc::PushMutableObjectRequest request;
     request.set_writer_object_id(writer_object_id.Binary());
@@ -485,19 +460,18 @@ TEST(MutableObjectProvider, HandleRetryOutOfOrderChunks) {
     request.set_chunk_size(kChunk2Size);
     request.set_data(chunk_data[2].data(), kChunk2Size);
     request.set_metadata(metadata.data(), kMetadataSize);
-    request.set_version(1);  // Same version
+    request.set_version(1);
     provider.HandlePushMutableObject(request, &replies[2]);
     EXPECT_TRUE(replies[2].done()) << "Chunk 2 should complete the object";
   }
 
-  // Verify all chunks were received correctly
+  // Verify all chunks were received and reassembled correctly
   std::shared_ptr<RayObject> result;
   EXPECT_EQ(provider.ReadAcquire(reader_object_id, result).code(), StatusCode::OK);
 
   EXPECT_EQ(result->GetData()->Size(), kTotalDataSize);
   EXPECT_EQ(result->GetMetadata()->Size(), kMetadataSize);
 
-  // Verify data integrity - check each chunk
   const uint8_t *data_ptr = result->GetData()->Data();
   size_t chunk_offsets[3] = {0, kChunk0Size, kChunk0Size + kChunk1Size};
   size_t chunk_sizes[3] = {kChunk0Size, kChunk1Size, kChunk2Size};
@@ -511,9 +485,9 @@ TEST(MutableObjectProvider, HandleRetryOutOfOrderChunks) {
   EXPECT_EQ(provider.ReadRelease(reader_object_id).code(), StatusCode::OK);
 }
 
-// Test that version tracking correctly distinguishes chunks from different write epochs
-// This verifies chunks with different versions are not incorrectly treated as duplicates
-TEST(MutableObjectProvider, HandleVersionBasedRetryDetection) {
+// Test sequential version writes: version 1 completes, reader consumes it, then version 2
+// arrives and is correctly written to the same backing store.
+TEST(MutableObjectProvider, HandleSequentialVersionWrites) {
   constexpr size_t kDataSize = 512;
   constexpr size_t kMetadataSize = 16;
 
@@ -525,7 +499,7 @@ TEST(MutableObjectProvider, HandleVersionBasedRetryDetection) {
   provider.HandleRegisterMutableObject(
       writer_object_id, /*num_readers=*/1, reader_object_id);
 
-  // Write with version 1, single chunk at offset 0
+  // Write version 1 (single chunk)
   std::vector<uint8_t> write1_data(kDataSize, 0xAA);
   std::vector<uint8_t> metadata1(kMetadataSize, 0x11);
   {
@@ -543,31 +517,18 @@ TEST(MutableObjectProvider, HandleVersionBasedRetryDetection) {
     EXPECT_TRUE(reply.done());
   }
 
-  // Retry of same chunk (same version) - should be treated as duplicate
-  {
-    ray::rpc::PushMutableObjectRequest request;
-    ray::rpc::PushMutableObjectReply reply;
-    request.set_writer_object_id(writer_object_id.Binary());
-    request.set_total_data_size(kDataSize);
-    request.set_total_metadata_size(kMetadataSize);
-    request.set_offset(0);
-    request.set_chunk_size(kDataSize);
-    request.set_data(write1_data.data(), kDataSize);
-    request.set_metadata(metadata1.data(), kMetadataSize);
-    request.set_version(1);  // Same version
-    provider.HandlePushMutableObject(request, &reply);
-    EXPECT_TRUE(reply.done())
-        << "Legitimate retry with same version recognized as duplicate";
-  }
-
-  // Read and release
+  // Read and release version 1
   {
     std::shared_ptr<RayObject> result;
     EXPECT_EQ(provider.ReadAcquire(reader_object_id, result).code(), StatusCode::OK);
+    const uint8_t *data_ptr = result->GetData()->Data();
+    for (size_t i = 0; i < kDataSize; i++) {
+      EXPECT_EQ(data_ptr[i], 0xAA) << "Version 1 data mismatch at offset " << i;
+    }
     EXPECT_EQ(provider.ReadRelease(reader_object_id).code(), StatusCode::OK);
   }
 
-  // New write with version 2, same offset 0 - should NOT be treated as duplicate
+  // Write version 2 (single chunk, same offset 0)
   std::vector<uint8_t> write2_data(kDataSize, 0xBB);
   std::vector<uint8_t> metadata2(kMetadataSize, 0x22);
   {
@@ -580,202 +541,20 @@ TEST(MutableObjectProvider, HandleVersionBasedRetryDetection) {
     request.set_chunk_size(kDataSize);
     request.set_data(write2_data.data(), kDataSize);
     request.set_metadata(metadata2.data(), kMetadataSize);
-    request.set_version(2);  // DIFFERENT version
+    request.set_version(2);
     provider.HandlePushMutableObject(request, &reply);
-    EXPECT_TRUE(reply.done()) << "New write with different version correctly processed";
+    EXPECT_TRUE(reply.done());
   }
 
-  // Verify we got Write 2's data (version 2 overwrote version 1)
+  // Verify version 2 data is correct
   {
     std::shared_ptr<RayObject> result;
     EXPECT_EQ(provider.ReadAcquire(reader_object_id, result).code(), StatusCode::OK);
     const uint8_t *data_ptr = result->GetData()->Data();
     for (size_t i = 0; i < kDataSize; i++) {
-      EXPECT_EQ(data_ptr[i], 0xBB) << "Version 2 data correctly written at offset " << i;
+      EXPECT_EQ(data_ptr[i], 0xBB) << "Version 2 data mismatch at offset " << i;
     }
     EXPECT_EQ(provider.ReadRelease(reader_object_id).code(), StatusCode::OK);
-  }
-}
-
-// Test that a future version chunk (version > active) is buffered and does not
-// interfere with the active version completing normally.
-TEST(MutableObjectProvider, HandleFutureVersionChunkBuffered) {
-  constexpr size_t kChunkSize = 256;
-  constexpr size_t kTotalDataSize = kChunkSize * 2;  // 2 chunks
-  constexpr size_t kMetadataSize = 8;
-
-  ObjectID writer_object_id = ObjectID::FromRandom();
-  ObjectID reader_object_id = ObjectID::FromRandom();
-  auto plasma = std::make_shared<TestPlasma>();
-  MutableObjectProvider provider(plasma, /*factory=*/nullptr, nullptr);
-
-  provider.HandleRegisterMutableObject(
-      writer_object_id, /*num_readers=*/1, reader_object_id);
-
-  std::vector<uint8_t> v1_data(kChunkSize, 0x11);
-  std::vector<uint8_t> v2_data(kChunkSize, 0x22);
-  std::vector<uint8_t> metadata(kMetadataSize, 0xCC);
-
-  // A future version chunk (version 2) arrives while no version has completed yet.
-  // Active version is 1, so version 2 is a future version.
-  {
-    ray::rpc::PushMutableObjectRequest request;
-    ray::rpc::PushMutableObjectReply reply;
-    request.set_writer_object_id(writer_object_id.Binary());
-    request.set_total_data_size(kTotalDataSize);
-    request.set_total_metadata_size(kMetadataSize);
-    request.set_offset(0);
-    request.set_chunk_size(kChunkSize);
-    request.set_data(v2_data.data(), kChunkSize);
-    request.set_metadata(metadata.data(), kMetadataSize);
-    request.set_version(2);  // Future version
-    provider.HandlePushMutableObject(request, &reply);
-    EXPECT_FALSE(reply.done()) << "Future version chunk should be buffered, not completed";
-  }
-
-  // Now send both chunks for version 1 (the active version). These should write
-  // to backing store normally despite the buffered future chunk.
-  {
-    ray::rpc::PushMutableObjectRequest request;
-    ray::rpc::PushMutableObjectReply reply;
-    request.set_writer_object_id(writer_object_id.Binary());
-    request.set_total_data_size(kTotalDataSize);
-    request.set_total_metadata_size(kMetadataSize);
-    request.set_offset(0);
-    request.set_chunk_size(kChunkSize);
-    request.set_data(v1_data.data(), kChunkSize);
-    request.set_metadata(metadata.data(), kMetadataSize);
-    request.set_version(1);
-    provider.HandlePushMutableObject(request, &reply);
-    EXPECT_FALSE(reply.done()) << "First chunk of version 1 should not complete";
-  }
-  {
-    ray::rpc::PushMutableObjectRequest request;
-    ray::rpc::PushMutableObjectReply reply;
-    request.set_writer_object_id(writer_object_id.Binary());
-    request.set_total_data_size(kTotalDataSize);
-    request.set_total_metadata_size(kMetadataSize);
-    request.set_offset(kChunkSize);
-    request.set_chunk_size(kChunkSize);
-    request.set_data(v1_data.data(), kChunkSize);
-    request.set_metadata(metadata.data(), kMetadataSize);
-    request.set_version(1);
-    provider.HandlePushMutableObject(request, &reply);
-    EXPECT_TRUE(reply.done()) << "Second chunk of version 1 should complete the object";
-  }
-
-  // Verify version 1 data was written correctly (not corrupted by future chunk)
-  {
-    std::shared_ptr<RayObject> result;
-    EXPECT_EQ(provider.ReadAcquire(reader_object_id, result).code(), StatusCode::OK);
-    const uint8_t *data_ptr = result->GetData()->Data();
-    for (size_t i = 0; i < kTotalDataSize; i++) {
-      EXPECT_EQ(data_ptr[i], 0x11)
-          << "Version 1 data should not be corrupted by future version chunk at offset "
-          << i;
-    }
-    EXPECT_EQ(provider.ReadRelease(reader_object_id).code(), StatusCode::OK);
-  }
-}
-
-// Test that stale retries are correctly rejected after multiple version epochs complete.
-// Ensures the highest_completed_version tracking works across a gap.
-TEST(MutableObjectProvider, HandleStaleRetryAfterMultipleEpochs) {
-  constexpr size_t kDataSize = 128;
-  constexpr size_t kMetadataSize = 8;
-
-  ObjectID writer_object_id = ObjectID::FromRandom();
-  ObjectID reader_object_id = ObjectID::FromRandom();
-  auto plasma = std::make_shared<TestPlasma>();
-  MutableObjectProvider provider(plasma, /*factory=*/nullptr, nullptr);
-
-  provider.HandleRegisterMutableObject(
-      writer_object_id, /*num_readers=*/1, reader_object_id);
-
-  // Helper to send a single-chunk write and read/release.
-  auto do_write_and_read = [&](int64_t version, uint8_t fill) {
-    std::vector<uint8_t> data(kDataSize, fill);
-    std::vector<uint8_t> metadata(kMetadataSize, fill);
-    ray::rpc::PushMutableObjectRequest request;
-    ray::rpc::PushMutableObjectReply reply;
-    request.set_writer_object_id(writer_object_id.Binary());
-    request.set_total_data_size(kDataSize);
-    request.set_total_metadata_size(kMetadataSize);
-    request.set_offset(0);
-    request.set_chunk_size(kDataSize);
-    request.set_data(data.data(), kDataSize);
-    request.set_metadata(metadata.data(), kMetadataSize);
-    request.set_version(version);
-    provider.HandlePushMutableObject(request, &reply);
-    EXPECT_TRUE(reply.done()) << "Version " << version << " should complete";
-
-    std::shared_ptr<RayObject> result;
-    EXPECT_EQ(provider.ReadAcquire(reader_object_id, result).code(), StatusCode::OK);
-    EXPECT_EQ(provider.ReadRelease(reader_object_id).code(), StatusCode::OK);
-  };
-
-  // Complete versions 1, 2, and 3.
-  do_write_and_read(1, 0xAA);
-  do_write_and_read(2, 0xBB);
-  do_write_and_read(3, 0xCC);
-
-  // Stale retry for version 1 (highest_completed is now 3, so gap of 2).
-  {
-    std::vector<uint8_t> stale_data(kDataSize, 0xAA);
-    std::vector<uint8_t> stale_meta(kMetadataSize, 0xAA);
-    ray::rpc::PushMutableObjectRequest request;
-    ray::rpc::PushMutableObjectReply reply;
-    request.set_writer_object_id(writer_object_id.Binary());
-    request.set_total_data_size(kDataSize);
-    request.set_total_metadata_size(kMetadataSize);
-    request.set_offset(0);
-    request.set_chunk_size(kDataSize);
-    request.set_data(stale_data.data(), kDataSize);
-    request.set_metadata(stale_meta.data(), kMetadataSize);
-    request.set_version(1);
-    provider.HandlePushMutableObject(request, &reply);
-    EXPECT_TRUE(reply.done()) << "Stale version 1 retry should return done=true";
-  }
-
-  // Stale retry for version 2 as well.
-  {
-    std::vector<uint8_t> stale_data(kDataSize, 0xBB);
-    std::vector<uint8_t> stale_meta(kMetadataSize, 0xBB);
-    ray::rpc::PushMutableObjectRequest request;
-    ray::rpc::PushMutableObjectReply reply;
-    request.set_writer_object_id(writer_object_id.Binary());
-    request.set_total_data_size(kDataSize);
-    request.set_total_metadata_size(kMetadataSize);
-    request.set_offset(0);
-    request.set_chunk_size(kDataSize);
-    request.set_data(stale_data.data(), kDataSize);
-    request.set_metadata(stale_meta.data(), kMetadataSize);
-    request.set_version(2);
-    provider.HandlePushMutableObject(request, &reply);
-    EXPECT_TRUE(reply.done()) << "Stale version 2 retry should return done=true";
-  }
-
-  // Version 4 should still work normally after stale retries.
-  do_write_and_read(4, 0xDD);
-
-  // Verify version 4 data is correct.
-  {
-    // Need another write+read cycle to verify, but we already verified in do_write_and_read.
-    // Instead, just verify stale retry for version 3 works.
-    std::vector<uint8_t> stale_data(kDataSize, 0xCC);
-    std::vector<uint8_t> stale_meta(kMetadataSize, 0xCC);
-    ray::rpc::PushMutableObjectRequest request;
-    ray::rpc::PushMutableObjectReply reply;
-    request.set_writer_object_id(writer_object_id.Binary());
-    request.set_total_data_size(kDataSize);
-    request.set_total_metadata_size(kMetadataSize);
-    request.set_offset(0);
-    request.set_chunk_size(kDataSize);
-    request.set_data(stale_data.data(), kDataSize);
-    request.set_metadata(stale_meta.data(), kMetadataSize);
-    request.set_version(3);
-    provider.HandlePushMutableObject(request, &reply);
-    EXPECT_TRUE(reply.done()) << "Stale version 3 retry should return done=true";
   }
 }
 
