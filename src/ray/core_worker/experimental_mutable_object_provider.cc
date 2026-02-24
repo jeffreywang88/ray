@@ -222,9 +222,11 @@ void MutableObjectProvider::PollWriterClosure(
         &remote_readers) {
   // NOTE: There's only 1 PollWriterClosure at any time in a single thread.
   std::shared_ptr<RayObject> object;
+  int64_t version = 0;
   // The corresponding ReadRelease() will be automatically called when
   // `object` goes out of scope.
-  Status status = object_manager_->ReadAcquire(writer_object_id, object);
+  Status status =
+      object_manager_->ReadAcquire(writer_object_id, object, version, /*timeout_ms=*/-1);
   // Check if the thread returned from ReadAcquire() because the process is exiting, not
   // because there is something to read.
   if (status.code() == StatusCode::ChannelError) {
@@ -236,6 +238,9 @@ void MutableObjectProvider::PollWriterClosure(
   RAY_CHECK(object->GetData());
   RAY_CHECK(object->GetMetadata());
 
+  // Version was obtained safely from ReadAcquire (with header_sem protection)
+  RAY_CHECK_GT(version, 0) << "Invalid version for " << writer_object_id;
+
   std::shared_ptr<size_t> num_replied = std::make_shared<size_t>(0);
   for (const auto &reader : *remote_readers) {
     reader->PushMutableObject(
@@ -244,7 +249,7 @@ void MutableObjectProvider::PollWriterClosure(
         object->GetMetadata()->Size(),
         object->GetData()->Data(),
         object->GetMetadata()->Data(),
-        /*version=*/0,
+        version,
         [this, &io_context, writer_object_id, remote_readers, num_replied](
             const Status &push_object_status, const rpc::PushMutableObjectReply &reply) {
           *num_replied += 1;
