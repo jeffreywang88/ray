@@ -78,13 +78,14 @@ class MockRayletClient : public rpc::FakeRayletClient {
  public:
   virtual ~MockRayletClient() {}
 
-  void PushMutableObject(
-      const ObjectID &object_id,
-      uint64_t data_size,
-      uint64_t metadata_size,
-      void *data,
-      void *metadata,
-      const rpc::ClientCallback<rpc::PushMutableObjectReply> &callback) override {
+  void PushMutableObject(const ObjectID &object_id,
+                         uint64_t data_size,
+                         uint64_t metadata_size,
+                         void *data,
+                         void *metadata,
+                         int64_t version,
+                         const rpc::ClientCallback<rpc::PushMutableObjectReply> &callback)
+      override {
     absl::MutexLock guard(&lock_);
     pushed_objects_.push_back(object_id);
   }
@@ -189,6 +190,7 @@ TEST(MutableObjectProvider, HandlePushMutableObject) {
   request.set_writer_object_id(object_id.Binary());
   request.set_total_data_size(0);
   request.set_total_metadata_size(0);
+  request.set_version(1);
 
   ray::rpc::PushMutableObjectReply reply;
   provider.HandlePushMutableObject(request, &reply);

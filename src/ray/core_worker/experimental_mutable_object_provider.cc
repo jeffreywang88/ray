@@ -244,6 +244,7 @@ void MutableObjectProvider::PollWriterClosure(
         object->GetMetadata()->Size(),
         object->GetData()->Data(),
         object->GetMetadata()->Data(),
+        /*version=*/0,
         [this, &io_context, writer_object_id, remote_readers, num_replied](
             const Status &push_object_status, const rpc::PushMutableObjectReply &reply) {
           *num_replied += 1;
