@@ -306,7 +306,7 @@ class TestLifecycleTracking:
     async def test_booked_reservation_changes_scoring_load(self, deployed_handle):
         """A reservation booked through the lifecycle hooks shows up as active
         load on the worker (the value scoring consumes) and freeing it restores
-        baseline -- deterministic, without racing a live stream."""
+        baseline."""
         actor = discover_deployment_actor(
             APP_NAME, deployed_handle.deployment_name, KV_ROUTER_ACTOR_NAME
         )

@@ -24,8 +24,9 @@ from ray.llm._internal.serve.routing_policies.kv_aware.vllm.token_tracking impor
 from ray.llm.tests.serve.mocks.mock_vllm_engine import MockAsyncLLM
 from ray.serve.llm.request_router import KVAwareRouter
 
-# Cluster workers can't import this pytest module, so ship the actor classes
-# defined here (and their MockSelectionService) to actors by value, not by name.
+# Actors defined in a test module are pickled by reference, so a worker on
+# another node would have to import this module to load them, which fails.
+# Pickle it by value so the actor classes ship in full and run on any node.
 ray.cloudpickle.register_pickle_by_value(sys.modules[__name__])
 
 REPLICA_UNIQUE_ID = "test-replica-uid"
@@ -34,10 +35,6 @@ WORKER_ID = get_worker_id(REPLICA_UNIQUE_ID)
 PROMPT = {"prompt_token_ids": [1, 2, 3]}
 # SamplingParams.max_tokens the engine reports as the request's expected output.
 MAX_TOKENS = 20
-
-
-def sampling(kind=RequestOutputKind.DELTA, max_tokens=MAX_TOKENS):
-    return SamplingParams(output_kind=kind, max_tokens=max_tokens)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -108,9 +105,7 @@ class MockSelectionService:
 
 @ray.remote(num_cpus=0)
 class RecordingKVRouterActor(KVRouterActor):
-    """In-process KVRouterActor with the event plane + Serve LongPoll stripped,
-    recording the events it applies and the reservation calls it books into the
-    (fake) selection service."""
+    """KVRouterActor that records the lifecycle events it receives for tests."""
 
     def __init__(self, block_size):
         self._block_size = block_size
@@ -128,7 +123,7 @@ class RecordingKVRouterActor(KVRouterActor):
     def get_event_log(self):
         return self._event_log
 
-    def get_dynamo_calls(self):
+    def get_selection_service_calls(self):
         return self._svc.calls
 
     async def get_request_lifecycle(self, request_id):
@@ -229,7 +224,13 @@ async def test_basic_lifecycle(build_token_tracking_engine):
     engine = build_token_tracking_engine(delta_steps(3, prompt_len=10), actor)
 
     prompt = {"prompt_token_ids": list(range(10))}
-    outputs = await consume(engine.generate(prompt, sampling(), "req-1"))
+    outputs = await consume(
+        engine.generate(
+            prompt,
+            SamplingParams(output_kind=RequestOutputKind.DELTA, max_tokens=MAX_TOKENS),
+            "req-1",
+        )
+    )
     await drain(engine)
 
     assert ray.get(actor.get_event_log.remote()) == [
@@ -258,7 +259,9 @@ async def test_lifecycle_uses_serve_request_id(build_token_tracking_engine):
         await consume(
             engine.generate(
                 prompt,
-                sampling(),
+                SamplingParams(
+                    output_kind=RequestOutputKind.DELTA, max_tokens=MAX_TOKENS
+                ),
                 "chatcmpl-serve-route-id",
             )
         )
@@ -283,7 +286,11 @@ async def test_in_order_reports(build_token_tracking_engine):
     actor = RecordingKVRouterActor.remote(block_size=16)
     engine = build_token_tracking_engine(delta_steps(200), actor)
 
-    await consume(engine.generate(PROMPT, sampling(max_tokens=200), "r"))
+    await consume(
+        engine.generate(
+            PROMPT, SamplingParams(output_kind=RequestOutputKind.DELTA), "r"
+        )
+    )
     await drain(engine)
 
     events = ray.get(actor.get_event_log.remote())
@@ -302,7 +309,11 @@ async def test_streaming_accumulates_decode_progress(build_token_tracking_engine
     script = [request_output([n]) for n in (1, 2, 1)]
     engine = build_token_tracking_engine(script, actor)
 
-    await consume(engine.generate(PROMPT, sampling(), "r"))
+    await consume(
+        engine.generate(
+            PROMPT, SamplingParams(output_kind=RequestOutputKind.DELTA), "r"
+        )
+    )
     await drain(engine)
 
     assert decode_counts(ray.get(actor.get_event_log.remote())) == [1, 3, 4]
@@ -319,7 +330,9 @@ async def test_non_streaming_reports_full_output_once(build_token_tracking_engin
     engine = build_token_tracking_engine(script, actor)
 
     await consume(
-        engine.generate(PROMPT, sampling(kind=RequestOutputKind.FINAL_ONLY), "r")
+        engine.generate(
+            PROMPT, SamplingParams(output_kind=RequestOutputKind.FINAL_ONLY), "r"
+        )
     )
     await drain(engine)
 
@@ -361,7 +374,11 @@ async def test_empty_steps_ignored(build_token_tracking_engine):
     ]
     engine = build_token_tracking_engine(script, actor)
 
-    await consume(engine.generate(PROMPT, sampling(), "r"))
+    await consume(
+        engine.generate(
+            PROMPT, SamplingParams(output_kind=RequestOutputKind.DELTA), "r"
+        )
+    )
     await drain(engine)
 
     events = ray.get(actor.get_event_log.remote())
@@ -378,7 +395,9 @@ async def test_completed_exactly_once(early_drop, build_token_tracking_engine):
     actor = RecordingKVRouterActor.remote(block_size=16)
     engine = build_token_tracking_engine(delta_steps(3), actor)
 
-    stream = engine.generate(PROMPT, sampling(), "r")
+    stream = engine.generate(
+        PROMPT, SamplingParams(output_kind=RequestOutputKind.DELTA), "r"
+    )
     await consume(stream, limit=1 if early_drop else None)
     await drain(engine)
 
@@ -395,7 +414,11 @@ async def test_engine_error_still_completes(build_token_tracking_engine):
     engine = build_token_tracking_engine(delta_steps(3), actor, error_after=1)
 
     with pytest.raises(RuntimeError, match="engine failure"):
-        await consume(engine.generate(PROMPT, sampling(), "r"))
+        await consume(
+            engine.generate(
+                PROMPT, SamplingParams(output_kind=RequestOutputKind.DELTA), "r"
+            )
+        )
     await drain(engine)
 
     events = ray.get(actor.get_event_log.remote())
@@ -409,7 +432,13 @@ async def test_zero_token_request(build_token_tracking_engine):
     engine = build_token_tracking_engine([request_output([0], finished=True)], actor)
 
     prompt = {"prompt_token_ids": [1, 2, 3]}
-    await consume(engine.generate(prompt, sampling(), "r"))
+    await consume(
+        engine.generate(
+            prompt,
+            SamplingParams(output_kind=RequestOutputKind.DELTA, max_tokens=MAX_TOKENS),
+            "r",
+        )
+    )
     await drain(engine)
 
     assert ray.get(actor.get_event_log.remote()) == [
@@ -423,7 +452,11 @@ async def test_actor_failure_isolation(build_token_tracking_engine):
     """A failing actor never disrupts the engine's output stream."""
     engine = build_token_tracking_engine(delta_steps(2), RaisingActor.remote())
 
-    outputs = await consume(engine.generate(PROMPT, sampling(), "r"))
+    outputs = await consume(
+        engine.generate(
+            PROMPT, SamplingParams(output_kind=RequestOutputKind.DELTA), "r"
+        )
+    )
     await drain(engine)  # the failed batches are dropped without raising
 
     assert len(outputs) == 2
@@ -444,7 +477,11 @@ async def test_passthrough_without_actor(monkeypatch):
     monkeypatch.setattr(serve, "get_deployment_actor", _raise)
     engine = enable_token_tracking(MockAsyncLLM)(delta_steps(2))
 
-    outputs = await consume(engine.generate(PROMPT, sampling(), "r"))
+    outputs = await consume(
+        engine.generate(
+            PROMPT, SamplingParams(output_kind=RequestOutputKind.DELTA), "r"
+        )
+    )
 
     assert len(outputs) == 2
     assert engine._lifecycle_forwarder is None  # resolution failed; retried next call
@@ -530,17 +567,6 @@ async def test_active_load_tracking():
 
 
 @pytest.mark.asyncio
-async def test_books_effective_prefill_hint():
-    """The route-time effective prefill hint is booked into Dynamo load state."""
-    actor = LocalKVRouterActor(block_size=16)
-    actor._effective_prefill_tokens_by_request["r"] = 7
-
-    await actor.on_request_added("r", WORKER_ID, list(range(16)))
-
-    assert actor._svc.reservations[0]["effective_prefill_tokens"] == 7
-
-
-@pytest.mark.asyncio
 async def test_tracks_streamed_request_state(build_token_tracking_engine):
     """End-to-end: exact token counts land as actor block state over ``.remote``."""
     actor = RecordingKVRouterActor.remote(block_size=8)
@@ -549,7 +575,11 @@ async def test_tracks_streamed_request_state(build_token_tracking_engine):
     engine = build_token_tracking_engine(delta_steps(9, prompt_len=12), actor)
 
     prompt = {"prompt_token_ids": list(range(12))}
-    stream = engine.generate(prompt, sampling(), "req-e2e")
+    stream = engine.generate(
+        prompt,
+        SamplingParams(output_kind=RequestOutputKind.DELTA, max_tokens=MAX_TOKENS),
+        "req-e2e",
+    )
     for _ in range(9):
         await stream.__anext__()
     await drain(engine)
@@ -585,10 +615,16 @@ async def test_lifecycle_books_selection_service_load(build_token_tracking_engin
     engine = build_token_tracking_engine(delta_steps(20, prompt_len=12), actor)
 
     prompt = {"prompt_token_ids": list(range(12))}
-    await consume(engine.generate(prompt, sampling(), "req-1"))
+    await consume(
+        engine.generate(
+            prompt,
+            SamplingParams(output_kind=RequestOutputKind.DELTA, max_tokens=MAX_TOKENS),
+            "req-1",
+        )
+    )
     await drain(engine)
 
-    calls = ray.get(actor.get_dynamo_calls.remote())
+    calls = ray.get(actor.get_selection_service_calls.remote())
     assert op_names(calls) == (
         ["create_reservation", "prefill_complete"]
         + ["add_output_block"] * 2

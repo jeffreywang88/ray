@@ -90,7 +90,7 @@ class KVRouterActor:
     4. The ``SelectionService`` maintains a global KV index radix tree, fed by
        every replica's KV events; each node records which workers hold that KV block.
     5. Scoring (``select_worker``) ranks candidate workers by KV-cache overlap
-       (queried from the KV index) plus prefill/decode load.
+       and prefill/decode load.
     6. Books each request's lifecycle into the service's active-load tracker, so
        in-flight load feeds back into scoring for subsequent requests.
     """
@@ -112,9 +112,12 @@ class KVRouterActor:
         #   2. expected_output_tokens for decode-block decay weighting.
         #   3. In-flight request set: Free reservation exactly once.
         self._requests: Dict[str, RequestLifecycle] = {}
-        # ``select_worker`` already asks Dynamo for the chosen worker's
-        # effective prefill tokens. Keep that hint until the same request id's
-        # ``on_request_added`` lifecycle event books it as active load.
+        # Carries the effective prefill tokens select() computed at routing time to
+        # on_request_added, which books them via the explicit create_reservation.
+        # TODO(jeffreywang): this map is only needed because create_reservation
+        # requires the effective prefill tokens to be passed in explicitly. Once the
+        # selection service caches each select() result and create_reservation can
+        # look it up by request id, Ray no longer needs to forward it.
         self._effective_prefill_tokens_by_request: Dict[str, int] = {}
         self._pending_tasks: Set[asyncio.Task] = set()
         self._long_poll_client: Optional[LongPollClient] = None
@@ -355,9 +358,8 @@ class KVRouterActor:
         expected_output_tokens: Optional[int] = None,
     ) -> None:
         """Admit a routed request into ``worker_id``'s active load, booking it
-        into the selection service with the worker's uncached prompt length, so
-        active prefill load excludes any KV prefix already cached on that worker.
-        """
+        into the selection service which computes the worker's KV overlap from
+        ``token_ids``, so the recorded prefill excludes the cached prefix."""
         prompt_tokens = len(token_ids)
         self._requests[request_id] = RequestLifecycle(
             worker_id=worker_id,
