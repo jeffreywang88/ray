@@ -438,7 +438,7 @@ class TestKvEventIngestion:
         """With equal KV overlap on both workers, select_worker routes to the
         worker carrying less active load. Booking heavy load onto one worker
         sends the next equally-overlapping request to the other."""
-        actor = LocalKVRouterActor.remote(block_size=BLOCK_SIZE)
+        actor = LocalKVRouterActor.remote()
         a = FakeReplica.remote(23907)
         b = FakeReplica.remote(23908)
         worker_a = get_worker_id("replica-A")
@@ -512,7 +512,7 @@ class TestKvEventIngestion:
     async def test_select_worker_prefers_lower_decode_load(self, ray_instance):
         """With equal KV overlap and no active prefill, a long decode on one
         worker makes the selector choose the lower decode-load worker."""
-        actor = LocalKVRouterActor.remote(block_size=BLOCK_SIZE)
+        actor = LocalKVRouterActor.remote()
         a = FakeReplica.remote(23909)
         b = FakeReplica.remote(23910)
         worker_a = get_worker_id("replica-A")
@@ -580,7 +580,7 @@ class TestKvEventIngestion:
     async def test_decode_load_uses_expected_output_decay(self, ray_instance):
         """Expected output length decays decode load as generation nears the
         estimate, so the selector prefers the lower remaining-load worker."""
-        actor = LocalKVRouterActor.remote(block_size=BLOCK_SIZE)
+        actor = LocalKVRouterActor.remote()
         a = FakeReplica.remote(23911)
         b = FakeReplica.remote(23912)
         worker_a = get_worker_id("replica-A")

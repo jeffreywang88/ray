@@ -2,6 +2,7 @@ import asyncio
 import json
 import math
 import sys
+from dataclasses import asdict
 from unittest import mock
 
 import pytest
@@ -85,6 +86,15 @@ class RecordingKVRouterActor(KVRouterActor):
                 if load["worker_id"] == worker_id:
                     return load["active_requests"]
         return 0
+
+    async def get_request_lifecycle(self, request_id):
+        """(Test only) Snapshot of a request's local lifecycle state, or ``None``."""
+        state = self._requests.get(request_id)
+        return None if state is None else asdict(state)
+
+    async def get_active_request_ids(self):
+        """(Test only) Ids of the requests in the actor's in-flight view."""
+        return list(self._requests)
 
     async def get_overlap_blocks(self, token_ids):
         """(Test only) Per-worker device-tier KV overlap blocks for a sequence."""
