@@ -1,4 +1,7 @@
+import asyncio
+import random
 import sys
+from collections import OrderedDict
 from dataclasses import asdict
 from types import SimpleNamespace
 
@@ -10,6 +13,9 @@ import ray
 import ray.cloudpickle
 from ray import serve
 from ray.llm._internal.serve.core.configs.llm_config import LLMConfig
+from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
+    REQUEST_TRACKING_TTL_S,
+)
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_actor import (
     KV_ROUTER_ACTOR_NAME,
     KVRouterActor,
@@ -24,9 +30,9 @@ from ray.llm._internal.serve.routing_policies.kv_aware.vllm.token_tracking impor
 from ray.llm.tests.serve.mocks.mock_vllm_engine import MockAsyncLLM
 from ray.serve.llm.request_router import KVAwareRouter
 
-# Actors defined in a test module are pickled by reference, so a worker on
-# another node would have to import this module to load them, which fails.
-# Pickle it by value so the actor classes ship in full and run on any node.
+# The @ray.remote actors below are pickled by reference, so a worker must import
+# this module -- but pytest imports it under a bare name the worker cannot import
+# (ModuleNotFoundError). Pickling by value ships the class bodies instead.
 ray.cloudpickle.register_pickle_by_value(sys.modules[__name__])
 
 REPLICA_UNIQUE_ID = "test-replica-uid"
@@ -102,6 +108,9 @@ class MockSelectionService:
     async def free_reservation(self, reservation_id):
         self.calls.append(("free_reservation", reservation_id))
 
+    async def delete_worker(self, worker_id):
+        self.calls.append(("delete_worker", worker_id))
+
 
 @ray.remote(num_cpus=0)
 class RecordingKVRouterActor(KVRouterActor):
@@ -110,7 +119,8 @@ class RecordingKVRouterActor(KVRouterActor):
     def __init__(self, block_size):
         self._block_size = block_size
         self._replica_id_by_worker = {}
-        self._requests = {}
+        self._requests = OrderedDict()
+        self._request_ids_by_worker = {}
         self._effective_prefill_tokens_by_request = {}
         self._pending_tasks = set()
         self._svc = MockSelectionService()
@@ -129,7 +139,11 @@ class RecordingKVRouterActor(KVRouterActor):
     async def get_request_lifecycle(self, request_id):
         """Return a snapshot of an in-flight request's state, or ``None``."""
         state = self._requests.get(request_id)
-        return None if state is None else asdict(state)
+        if state is None:
+            return None
+        snapshot = asdict(state)
+        snapshot.pop("created_at", None)  # internal TTL bookkeeping, not asserted on
+        return snapshot
 
     async def get_active_request_ids(self):
         """Return ids of the in-flight requests."""
@@ -155,7 +169,8 @@ class LocalKVRouterActor(KVRouterActor):
     def __init__(self, block_size):
         self._block_size = block_size
         self._replica_id_by_worker = {}
-        self._requests = {}
+        self._requests = OrderedDict()
+        self._request_ids_by_worker = {}
         self._effective_prefill_tokens_by_request = {}
         self._pending_tasks = set()
         self._svc = MockSelectionService()
@@ -163,7 +178,11 @@ class LocalKVRouterActor(KVRouterActor):
     async def get_request_lifecycle(self, request_id):
         """Return a snapshot of an in-flight request's state, or ``None``."""
         state = self._requests.get(request_id)
-        return None if state is None else asdict(state)
+        if state is None:
+            return None
+        snapshot = asdict(state)
+        snapshot.pop("created_at", None)  # internal TTL bookkeeping, not asserted on
+        return snapshot
 
     async def get_active_request_ids(self):
         """Return ids of the in-flight requests."""
@@ -564,6 +583,98 @@ async def test_active_load_tracking():
     await actor.on_decode_progress("missing", 3)
     await actor.on_request_completed("missing")
     assert await actor.get_request_lifecycle("missing") is None
+
+
+@pytest.mark.asyncio
+async def test_request_tracking_grows_and_shrinks_under_churn():
+    """Memory chaos: a long run of interleaved submissions and completions across
+    workers grows the in-flight state and drains it back to nothing."""
+    rng = random.Random(20240708)
+    actor = LocalKVRouterActor(block_size=16)
+    workers = [1, 2, 3]
+    total = 400
+    inflight: set = set()
+    launched = 0
+    peak = 0
+
+    # Randomly interleave admitting new requests and completing live ones.
+    for _ in range(total * 3):
+        if launched < total and (not inflight or rng.random() < 0.6):
+            request_id = f"r{launched}"
+            launched += 1
+            # A routed request carries its effective prefill tokens from select();
+            # admission must drain that map too, not just _requests.
+            actor._effective_prefill_tokens_by_request[request_id] = rng.randint(0, 40)
+            await actor.on_request_added(
+                request_id,
+                rng.choice(workers),
+                list(range(rng.randint(1, 40))),
+                expected_output_tokens=rng.choice([None, 32]),
+            )
+            inflight.add(request_id)
+        elif inflight:
+            request_id = rng.choice(list(inflight))
+            if rng.random() < 0.5:
+                await actor.on_prefill_complete(request_id)
+                await actor.on_decode_progress(request_id, rng.randint(1, 80))
+            await actor.on_request_completed(request_id)
+            inflight.discard(request_id)
+        peak = max(peak, len(actor._requests))
+
+    for request_id in list(inflight):
+        await actor.on_request_completed(request_id)
+
+    assert launched == total
+    assert peak > 1  # state actually accumulated under concurrent load
+    # Everything drained: no request state, no index entries, no active load.
+    assert actor._requests == {}
+    assert actor._request_ids_by_worker == {}
+    assert actor._effective_prefill_tokens_by_request == {}
+    assert await actor.get_active_request_ids() == []
+    for worker_id in workers:
+        assert await actor.get_worker_active_load(worker_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_remove_worker_evicts_its_inflight_requests():
+    """A departed replica's in-flight request state is purged: its completion
+    events can never arrive, so the entries would otherwise leak forever."""
+    actor = LocalKVRouterActor(block_size=16)
+    await actor.on_request_added("a", 1, list(range(8)))
+    await actor.on_request_added("b", 1, list(range(8)))
+    await actor.on_request_added("c", 2, list(range(8)))
+
+    actor.remove_worker(1)
+
+    assert set(await actor.get_active_request_ids()) == {"c"}
+    assert await actor.get_worker_active_load(1) == 0
+    assert await actor.get_worker_active_load(2) == 1
+    # The reverse index drops the departed worker and keeps the survivor.
+    assert 1 not in actor._request_ids_by_worker
+    assert actor._request_ids_by_worker.get(2) == {"c"}
+    # remove_worker schedules delete_worker; drain the task and confirm.
+    await asyncio.gather(*list(actor._pending_tasks))
+    assert ("delete_worker", 1) in actor._svc.calls
+
+
+@pytest.mark.asyncio
+async def test_stale_request_evicted_after_ttl():
+    """Backstop for a lost completion on a live replica: a request tracked past
+    the TTL is evicted and its reservation freed, so it cannot accumulate."""
+    actor = LocalKVRouterActor(block_size=16)
+    await actor.on_request_added("stale", 1, list(range(8)))
+    await actor.on_request_added("fresh_untriggered", 1, list(range(8)))
+    # Backdate the stale request's admission beyond the TTL (lost completion).
+    actor._requests["stale"].created_at -= REQUEST_TRACKING_TTL_S + 1
+
+    # A new admission triggers the lazy sweep of the oldest entries.
+    await actor.on_request_added("trigger", 2, list(range(8)))
+
+    assert "stale" not in await actor.get_active_request_ids()
+    assert ("free_reservation", "stale") in actor._svc.calls
+    # A still-fresh request is left untouched (sweep stops at the first fresh one).
+    assert set(await actor.get_active_request_ids()) == {"fresh_untriggered", "trigger"}
+    assert ("free_reservation", "fresh_untriggered") not in actor._svc.calls
 
 
 @pytest.mark.asyncio

@@ -2,13 +2,16 @@ import asyncio
 import hashlib
 import logging
 import math
-from dataclasses import dataclass
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, TypedDict
 
 import ray
 from ray import serve
 from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
     DEFAULT_KV_INDEXER_THREADS,
+    REQUEST_TRACKING_TTL_S,
 )
 from ray.serve._private.common import DeploymentTargetInfo
 from ray.serve._private.constants import (
@@ -61,6 +64,8 @@ class RequestLifecycle:
     # Running count of KV blocks (prompt + output) the request occupies; the
     # cursor for booking each newly crossed decode block.
     total_blocks: int = 0
+    # Monotonic admission time, for the TTL eviction sweep.
+    created_at: float = field(default_factory=time.monotonic)
 
 
 class WorkerSelection(TypedDict):
@@ -111,7 +116,11 @@ class KVRouterActor:
         #   1. Block cursor: Turn cumulative decode tokens into add_output_block deltas.
         #   2. expected_output_tokens for decode-block decay weighting.
         #   3. In-flight request set: Free reservation exactly once.
-        self._requests: Dict[str, RequestLifecycle] = {}
+        # Ordered oldest-first so the TTL sweep pops stale entries off the front.
+        self._requests: "OrderedDict[str, RequestLifecycle]" = OrderedDict()
+        # Reverse index of in-flight request ids per worker, kept in lockstep with
+        # _requests, so remove_worker is O(k) in the worker's requests, not O(N).
+        self._request_ids_by_worker: Dict[int, Set[str]] = {}
         # Carries the effective prefill tokens select() computed at routing time to
         # on_request_added, which books them via the explicit create_reservation.
         # TODO(jeffreywang): this map is only needed because create_reservation
@@ -246,6 +255,11 @@ class KVRouterActor:
         """Evict a departed replica's worker and its KV blocks from the
         selection service.
         """
+        # Drop the departed replica's in-flight requests; their completions can
+        # never arrive, so they would otherwise leak. delete_worker below frees
+        # their load in the service, so no per-request free_reservation is needed.
+        for request_id in self._request_ids_by_worker.pop(worker_id, set()):
+            self._requests.pop(request_id, None)
         if self._svc is None:
             return
         self._schedule(self._svc.delete_worker(worker_id))
@@ -344,11 +358,20 @@ class KVRouterActor:
         admission would resurrect an evicted request) so a replica sends its
         events in submission order, batched into one call.
         """
+        if self._svc is None or self._block_size is None:
+            return
         for hook_name, args in events:
-            if hook_name in LIFECYCLE_HOOKS:
-                await getattr(self, hook_name)(*args)
-            else:
+            if hook_name not in LIFECYCLE_HOOKS:
                 logger.warning("Ignoring unknown lifecycle hook %s", hook_name)
+                continue
+            try:
+                await getattr(self, hook_name)(*args)
+            except Exception:
+                # One hook raising must not abort the batch and drop other events.
+                logger.exception(
+                    "KV lifecycle hook %s failed; skipping it and continuing.",
+                    hook_name,
+                )
 
     async def on_request_added(
         self,
@@ -360,6 +383,7 @@ class KVRouterActor:
         """Admit a routed request into ``worker_id``'s active load, booking it
         into the selection service which computes the worker's KV overlap from
         ``token_ids``, so the recorded prefill excludes the cached prefix."""
+        await self._evict_stale_requests()
         prompt_tokens = len(token_ids)
         self._requests[request_id] = RequestLifecycle(
             worker_id=worker_id,
@@ -367,6 +391,7 @@ class KVRouterActor:
             expected_output_tokens=expected_output_tokens,
             total_blocks=math.ceil(prompt_tokens / self._block_size),
         )
+        self._request_ids_by_worker.setdefault(worker_id, set()).add(request_id)
         effective_prefill_tokens = self._effective_prefill_tokens_by_request.pop(
             request_id, None
         )
@@ -414,7 +439,38 @@ class KVRouterActor:
         """Free ``request_id`` from the selection service's active load and the
         local view."""
         self._effective_prefill_tokens_by_request.pop(request_id, None)
-        if self._requests.pop(request_id, None) is not None:
+        state = self._requests.pop(request_id, None)
+        if state is not None:
+            self._untrack_worker_request(request_id, state.worker_id)
+            await self._svc.free_reservation(request_id)
+
+    def _untrack_worker_request(self, request_id: str, worker_id: int) -> None:
+        """Drop a request from the per-worker reverse index, keeping it in
+        lockstep with ``_requests``."""
+        request_ids = self._request_ids_by_worker.get(worker_id)
+        if request_ids is not None:
+            request_ids.discard(request_id)
+            if not request_ids:
+                del self._request_ids_by_worker[worker_id]
+
+    async def _evict_stale_requests(self) -> None:
+        """Backstop for a lost completion on a live replica: evict requests tracked
+        past ``REQUEST_TRACKING_TTL_S``, freeing their reservations.
+        """
+        cutoff = time.monotonic() - REQUEST_TRACKING_TTL_S
+        while self._requests:
+            request_id, state = next(iter(self._requests.items()))
+            if state.created_at > cutoff:
+                break
+            self._requests.popitem(last=False)
+            self._untrack_worker_request(request_id, state.worker_id)
+            self._effective_prefill_tokens_by_request.pop(request_id, None)
+            logger.warning(
+                "Evicting stale KV request %s (tracked > %ds without completion); "
+                "freeing its reservation.",
+                request_id,
+                REQUEST_TRACKING_TTL_S,
+            )
             await self._svc.free_reservation(request_id)
 
     def _get_decay_fraction(self, state: RequestLifecycle) -> Optional[float]:

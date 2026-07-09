@@ -59,11 +59,11 @@ class RecordingKVRouterActor(KVRouterActor):
 
     async def on_lifecycle_events(self, events):
         self._event_log.extend(events)
-        for event in events:
+        for hook_name, args in events:
             try:
-                await super().on_lifecycle_events([event])
-            except Exception as e:  # noqa: BLE001
-                self._errors.append((event[0], repr(e)))
+                await getattr(self, hook_name)(*args)
+            except Exception as e:
+                self._errors.append((hook_name, repr(e)))
 
     def get_event_log(self):
         return self._event_log
@@ -90,7 +90,11 @@ class RecordingKVRouterActor(KVRouterActor):
     async def get_request_lifecycle(self, request_id):
         """(Test only) Snapshot of a request's local lifecycle state, or ``None``."""
         state = self._requests.get(request_id)
-        return None if state is None else asdict(state)
+        if state is None:
+            return None
+        snapshot = asdict(state)
+        snapshot.pop("created_at", None)
+        return snapshot
 
     async def get_active_request_ids(self):
         """(Test only) Ids of the requests in the actor's in-flight view."""
