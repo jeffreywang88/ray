@@ -22,7 +22,7 @@ local SESSION_HEADER = "${SESSION_HEADER}"
 local ROUTERS = ${ROUTERS}
 local REPLICA_TARGETS = ${REPLICA_TARGETS}
 
-local function call_router(router, body, truncated_length, session_id)
+local function call_router(router, body, truncated_length, session_id, request_id)
     local sock = core.tcp()
     sock:settimeout(ROUTER_REQUEST_TIMEOUT_S)
 
@@ -41,6 +41,11 @@ local function call_router(router, body, truncated_length, session_id)
         session_header = SESSION_HEADER .. ": " .. session_id .. "\r\n"
     end
 
+    local request_id_header = ""
+    if request_id and request_id ~= "" then
+        request_id_header = "x-request-id: " .. request_id .. "\r\n"
+    end
+
     -- Connection: close so sock:receive("*a") terminates on EOF.
     local req = "POST /internal/route HTTP/1.0\r\n"
         .. "Host: " .. router.host_header .. "\r\n"
@@ -49,6 +54,7 @@ local function call_router(router, body, truncated_length, session_id)
         .. "Content-Length: " .. #body .. "\r\n"
         .. truncation_header
         .. session_header
+        .. request_id_header
         .. "\r\n"
         .. body
 
@@ -141,7 +147,19 @@ local function _route_via_ingress_request_router(txn, router, replica_map)
         end
     end
 
-    local response = call_router(router, body, truncated, session_id)
+    -- One request id across both legs: the routing call and the forwarded
+    -- replica request. Serve derives each leg's request id from this header,
+    -- and KV-aware routing books per-request state at routing time that the
+    -- replica's lifecycle events must find under the same id.
+    local id_hdrs = txn.http:req_get_headers()
+    local id_entry = id_hdrs and id_hdrs["x-request-id"]
+    local request_id = (id_entry and id_entry[0]) or txn.f:uuid()
+    -- Set unconditionally: req_set_header replaces every occurrence, so a
+    -- client sending duplicate x-request-id headers cannot leave the replica
+    -- leg (last-wins) on a different id than the routing leg (first-wins).
+    txn.http:req_set_header("x-request-id", request_id)
+
+    local response = call_router(router, body, truncated, session_id, request_id)
     if not response then
         txn:set_var("txn.ingress_request_router_failed", "router_unreachable")
         return
