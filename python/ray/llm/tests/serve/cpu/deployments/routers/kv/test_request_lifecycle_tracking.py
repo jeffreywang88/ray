@@ -586,7 +586,7 @@ async def test_active_load_tracking():
 
 
 @pytest.mark.asyncio
-async def test_request_tracking_grows_and_shrinks_under_churn():
+async def test_tracking_drains_under_churn():
     """Memory chaos: a long run of interleaved submissions and completions across
     workers grows the in-flight state and drains it back to nothing."""
     rng = random.Random(20240708)
@@ -636,7 +636,7 @@ async def test_request_tracking_grows_and_shrinks_under_churn():
 
 
 @pytest.mark.asyncio
-async def test_remove_worker_evicts_its_inflight_requests():
+async def test_remove_worker_evicts_requests():
     """A departed replica's in-flight request state is purged: its completion
     events can never arrive, so the entries would otherwise leak forever."""
     actor = LocalKVRouterActor(block_size=16)
@@ -675,6 +675,27 @@ async def test_stale_request_evicted_after_ttl():
     # A still-fresh request is left untouched (sweep stops at the first fresh one).
     assert set(await actor.get_active_request_ids()) == {"fresh_untriggered", "trigger"}
     assert ("free_reservation", "fresh_untriggered") not in actor._svc.calls
+
+
+@pytest.mark.asyncio
+async def test_admission_race_frees_reservation():
+    """If remove_worker evicts a request while create_reservation is in flight,
+    the orphaned reservation is freed rather than leaking in the service."""
+    actor = LocalKVRouterActor(block_size=16)
+
+    # Simulate the LongPoll remove_worker firing during the create_reservation await.
+    book_reservation = actor._svc.create_reservation
+
+    async def racing_create_reservation(request):
+        await book_reservation(request)
+        actor.remove_worker(request["worker_id"])
+
+    actor._svc.create_reservation = racing_create_reservation
+
+    await actor.on_request_added("r", 1, list(range(8)))
+
+    assert await actor.get_active_request_ids() == []  # evicted mid-flight
+    assert ("free_reservation", "r") in actor._svc.calls  # reservation not orphaned
 
 
 @pytest.mark.asyncio

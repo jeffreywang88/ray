@@ -407,6 +407,8 @@ class KVRouterActor:
                 "effective_prefill_tokens": effective_prefill_tokens,
             }
         )
+        if request_id not in self._requests:
+            await self._svc.free_reservation(request_id)
 
     async def on_prefill_complete(self, request_id: str) -> None:
         """Record a request's prefill -> decode transition, dropping its prefill
