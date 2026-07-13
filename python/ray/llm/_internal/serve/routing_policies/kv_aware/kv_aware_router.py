@@ -6,6 +6,7 @@ import ray
 from ray.actor import ActorHandle
 from ray.llm._internal.serve.core.configs.llm_config import LLMConfig
 from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
+    REQUEST_ROUTING_BODY_KWARG,
     REQUEST_TOKEN_IDS_KWARG,
 )
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_actor import (
@@ -95,16 +96,17 @@ class KVAwareRouter(RequestRouter):
         """Choose the candidate replica(s) to route ``pending_request`` to.
 
         Maps the candidate replicas to their Dynamo worker ids, asks the
-        ``KVRouterActor`` to rank them via ``select_worker``, and routes to
-        the chosen worker's replica. With direct streaming enabled, HAProxy
-        then forwards the original request to that replica.
+        ``KVRouterActor`` to rank them, and routes to the chosen worker's
+        replica. With direct streaming enabled, HAProxy then forwards the
+        original request to that replica.
 
-        Requests with no prompt token ids have nothing to score on, so they route
-        to a random candidate. This covers the pre-routing ``/tokenize`` RPC (routed
-        before token ids exist) and token-less fallbacks (batch prompts,
-        truncated/unparseable bodies).
-        TODO (jeffreywang): Move pre-routing tokenization to KVRouterActor while
-        ensuring tokenization correctness.
+        Chat requests carry the raw body and take the fused
+        ``select_worker_chat`` path: the actor renders the chat template,
+        tokenizes, and selects in one Rust call, so prompt token ids never
+        enter Python. Completion requests carry pre-tokenized ids
+        (``select_worker``). Requests with neither have nothing to score on
+        and route to a random candidate (batch prompts, truncated or
+        unparseable bodies).
 
         Args:
             candidate_replicas: The replicas eligible to serve the request.
@@ -113,24 +115,37 @@ class KVAwareRouter(RequestRouter):
         Returns:
             Ranked groups of replicas.
         """
+        routing_body = (
+            pending_request.kwargs.get(REQUEST_ROUTING_BODY_KWARG)
+            if pending_request is not None
+            else None
+        )
         token_ids = (
             pending_request.kwargs.get(REQUEST_TOKEN_IDS_KWARG)
             if pending_request is not None
             else None
         )
-        if not token_ids:
+        if not routing_body and not token_ids:
             return [[random.choice(candidate_replicas)]] if candidate_replicas else []
 
         worker_id_to_replica = {
             get_worker_id(replica.replica_id.unique_id): replica
             for replica in candidate_replicas
         }
-        selection = await self._kv_router_actor.select_worker.remote(
-            pending_request.metadata.request_id,
-            token_ids,
-            list(worker_id_to_replica),
-            _get_expected_output_tokens(pending_request),
-        )
+        if routing_body:
+            selection = await self._kv_router_actor.select_worker_chat.remote(
+                pending_request.metadata.request_id,
+                routing_body,
+                list(worker_id_to_replica),
+                _get_expected_output_tokens(pending_request),
+            )
+        else:
+            selection = await self._kv_router_actor.select_worker.remote(
+                pending_request.metadata.request_id,
+                token_ids,
+                list(worker_id_to_replica),
+                _get_expected_output_tokens(pending_request),
+            )
         return [[worker_id_to_replica[selection["worker_id"]]]]
 
 

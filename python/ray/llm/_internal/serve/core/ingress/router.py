@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException, Request
 from ray import serve
 from ray.llm._internal.serve.observability.logging import get_logger
 from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
+    REQUEST_ROUTING_BODY_KWARG,
     REQUEST_TOKEN_IDS_KWARG,
 )
 from ray.serve._private.http_util import _matches_session_id_header
@@ -143,20 +144,28 @@ class LLMRouter:
                 "limit.",
                 body_truncated,
             )
-        # Tokenize only a parseable, routable body; a truncated or unparseable
-        # body has no routing payload, so fall back to token-less routing.
+        # Chat bodies take the fused path: the raw body rides to the KV router
+        # actor, which renders the template + tokenizes + selects in one Rust
+        # call, so token ids never enter Python. Non-chat routable bodies
+        # (string-prompt completions) keep the in-process tokenize path. A
+        # truncated or unparseable body has no routing payload, so fall back
+        # to token-less routing.
         request_token_ids = None
+        request_routing_body = None
         if self._tokenizer is not None and routing_payload is not None:
-            from ray.llm._internal.serve.routing_policies.kv_aware.tokenizer import (
-                TokenizeError,
-            )
-
-            try:
-                request_token_ids = await self._tokenizer.tokenize(
-                    vars(routing_payload)
+            if getattr(routing_payload, "messages", None) is not None:
+                request_routing_body = body.decode("utf-8", "replace")
+            else:
+                from ray.llm._internal.serve.routing_policies.kv_aware.tokenizer import (
+                    TokenizeError,
                 )
-            except TokenizeError as e:
-                raise HTTPException(status_code=e.status_code, detail=e.message)
+
+                try:
+                    request_token_ids = await self._tokenizer.tokenize(
+                        vars(routing_payload)
+                    )
+                except TokenizeError as e:
+                    raise HTTPException(status_code=e.status_code, detail=e.message)
         # HAProxy forwards the configured session header on the same name,
         # but use the same case-insensitive, separator-tolerant matcher as
         # proxy.py / ingress.py so a `-`/`_` rewrite anywhere in the path
@@ -173,6 +182,7 @@ class LLMRouter:
                 handle=handle,
                 routing_payload=routing_payload,
                 request_token_ids=request_token_ids,
+                request_routing_body=request_routing_body,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -189,6 +199,7 @@ class LLMRouter:
         handle: DeploymentHandle,
         routing_payload: Optional[SimpleNamespace] = None,
         request_token_ids: Optional[List[int]] = None,
+        request_routing_body: Optional[str] = None,
     ) -> Tuple[str, int, str]:
         """Pick a backend HTTP replica via the deployment's request router.
 
@@ -215,6 +226,8 @@ class LLMRouter:
         choose_replica_kwargs = {"_reserve": False}
         if request_token_ids is not None:
             choose_replica_kwargs[REQUEST_TOKEN_IDS_KWARG] = request_token_ids
+        if request_routing_body is not None:
+            choose_replica_kwargs[REQUEST_ROUTING_BODY_KWARG] = request_routing_body
         async with handle.choose_replica(
             *route_args, **choose_replica_kwargs
         ) as selection:

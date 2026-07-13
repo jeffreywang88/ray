@@ -59,6 +59,14 @@ def _maybe_setup_kv_aware_routing(
                 "indexer_threads": llm_config.experimental_configs.get(
                     KV_INDEXER_THREADS_KEY, DEFAULT_KV_INDEXER_THREADS
                 ),
+                # Enables the fused chat-select path (template render +
+                # tokenize + select in Rust) on the served model. Cloud-mirror
+                # sources are not local checkouts, so only strings pass.
+                "model_source": (
+                    llm_config.model_loading_config.model_source
+                    if isinstance(llm_config.model_loading_config.model_source, str)
+                    else None
+                ),
             },
         ),
     ]

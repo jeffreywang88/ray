@@ -1,6 +1,11 @@
 # choose_replica kwarg carrying the prompt token IDs to KV-aware routers.
 REQUEST_TOKEN_IDS_KWARG = "request_token_ids"
 
+# choose_replica kwarg carrying the raw chat-completions body (JSON string) to
+# KV-aware routers for the fused render+encode+select path, which keeps prompt
+# token ids out of Python entirely.
+REQUEST_ROUTING_BODY_KWARG = "request_routing_body"
+
 # experimental_configs key overriding the per-node base port.
 KV_EVENTS_PORT_BASE_KEY = "KV_EVENTS_PORT_BASE"
 DEFAULT_KV_EVENTS_PORT_BASE = 5557

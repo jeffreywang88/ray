@@ -100,12 +100,19 @@ class KVRouterActor:
        in-flight load feeds back into scoring for subsequent requests.
     """
 
-    def __init__(self, indexer_threads: int = DEFAULT_KV_INDEXER_THREADS):
+    def __init__(
+        self,
+        indexer_threads: int = DEFAULT_KV_INDEXER_THREADS,
+        model_source: Optional[str] = None,
+    ):
         # KV-cache block size, learned once from the first replica's reported
         # engine config and passed to the selection service, which uses it to
         # track the worker's active load and index its KV blocks for overlap.
         self._block_size: Optional[int] = None
         self._indexer_threads = indexer_threads
+        # HF repo id or local checkout of the served model; enables the fused
+        # select_chat path (chat-template render + tokenize + select in Rust).
+        self._model_source = model_source
         # _replica_id_by_worker maps a Dynamo worker id to the running replica's full
         # id string, kept in sync with the deployment's live replicas over LongPoll.
         # NOTE (jeffreywang): _replica_id_by_worker is later used by select_worker
@@ -148,11 +155,39 @@ class KVRouterActor:
             )
             return
 
-        self._svc = SelectionService(indexer_threads=self._indexer_threads)
-        logger.info(
-            "Dynamo SelectionService created (indexer threads %d).",
-            self._indexer_threads,
+        model_path = self._resolve_model_path()
+        self._svc = SelectionService(
+            indexer_threads=self._indexer_threads, model_path=model_path
         )
+        logger.info(
+            "Dynamo SelectionService created (indexer threads %d, fused "
+            "chat-select %s).",
+            self._indexer_threads,
+            "enabled" if model_path else "disabled",
+        )
+
+    def _resolve_model_path(self) -> Optional[str]:
+        """Local HF checkout dir for the served model, for the fused
+        render+encode+select path. ``None`` (with a log) when unresolvable, in
+        which case ``select_worker_chat`` fails fast at routing time.
+        """
+        if self._model_source is None:
+            return None
+        import os
+
+        if os.path.isdir(self._model_source):
+            return self._model_source
+        try:
+            from huggingface_hub import snapshot_download
+
+            return snapshot_download(self._model_source)
+        except Exception:
+            logger.exception(
+                "Could not resolve a local checkout for %s; the fused "
+                "select_chat path is disabled.",
+                self._model_source,
+            )
+            return None
 
     def _start_replica_tracking(self) -> None:
         """Subscribe to this deployment's running replicas via LongPollClient."""
@@ -342,6 +377,51 @@ class KVRouterActor:
                 "tenant_id": _TENANT_ID,
                 "selection_id": request_id,
                 "token_ids": token_ids,
+                "allowed_worker_ids": allowed_worker_ids,
+                "expected_output_tokens": expected_output_tokens,
+            }
+        )
+        return {
+            "worker_id": selection["worker_id"],
+            "dp_rank": selection["dp_rank"],
+            "overlap_tokens": selection["overlap"]["longest_matched"],
+            "effective_prefill_tokens": selection["effective_prefill_tokens"],
+        }
+
+    async def select_worker_chat(
+        self,
+        request_id: str,
+        body: str,
+        allowed_worker_ids: List[int],
+        expected_output_tokens: Optional[int] = None,
+    ) -> WorkerSelection:
+        """Fused variant of ``select_worker`` for chat requests: the selection
+        service parses ``body``, applies the model's chat template, tokenizes,
+        and scores in one GIL-releasing Rust call, so prompt token ids never
+        cross into Python. Like ``select``, the result is cached by
+        ``selection_id`` for the by-id reservation replay.
+
+        Args:
+            request_id: Unique identifier for the request being routed.
+            body: The raw chat-completions request body (JSON string).
+            allowed_worker_ids: Candidate worker ids the router may select from.
+            expected_output_tokens: The request's output cap, when the routing
+                payload carries one.
+
+        Returns:
+            The selected worker (see ``WorkerSelection``).
+        """
+        if self._svc is None:
+            raise RuntimeError(
+                "KV-aware routing is unavailable because ai-dynamo is not "
+                "installed in the deployment's environment."
+            )
+        selection = await self._svc.select_chat(
+            {
+                "model_name": _MODEL_NAME,
+                "tenant_id": _TENANT_ID,
+                "selection_id": request_id,
+                "body": body,
                 "allowed_worker_ids": allowed_worker_ids,
                 "expected_output_tokens": expected_output_tokens,
             }
