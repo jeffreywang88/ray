@@ -88,16 +88,11 @@ class MockSelectionService:
         self.reservations = []
 
     async def create_reservation(self, request):
+        # The matching ``select`` cached the chosen worker, normalized prompt,
+        # and expected output tokens, so create_reservation carries only the
+        # ids -- no worker_id, no token_ids, no output cap.
         self.reservations.append(dict(request))
-        self.calls.append(
-            (
-                "create_reservation",
-                request["reservation_id"],
-                request["worker_id"],
-                len(request["token_ids"]),
-                request.get("expected_output_tokens"),
-            )
-        )
+        self.calls.append(("create_reservation", request["reservation_id"]))
 
     async def prefill_complete(self, reservation_id):
         self.calls.append(("prefill_complete", reservation_id))
@@ -121,7 +116,6 @@ class RecordingKVRouterActor(KVRouterActor):
         self._replica_id_by_worker = {}
         self._requests = OrderedDict()
         self._request_ids_by_worker = {}
-        self._effective_prefill_tokens_by_request = {}
         self._pending_tasks = set()
         self._svc = MockSelectionService()
         self._event_log = []
@@ -171,7 +165,6 @@ class LocalKVRouterActor(KVRouterActor):
         self._replica_id_by_worker = {}
         self._requests = OrderedDict()
         self._request_ids_by_worker = {}
-        self._effective_prefill_tokens_by_request = {}
         self._pending_tasks = set()
         self._svc = MockSelectionService()
 
@@ -253,7 +246,7 @@ async def test_basic_lifecycle(build_token_tracking_engine):
     await drain(engine)
 
     assert ray.get(actor.get_event_log.remote()) == [
-        ("on_request_added", ("req-1", WORKER_ID, list(range(10)), MAX_TOKENS)),
+        ("on_request_added", ("req-1", WORKER_ID, 10, MAX_TOKENS)),
         ("on_prefill_complete", ("req-1",)),
         ("on_decode_progress", ("req-1", 1)),
         ("on_decode_progress", ("req-1", 2)),
@@ -291,7 +284,7 @@ async def test_lifecycle_uses_serve_request_id(build_token_tracking_engine):
     assert ray.get(actor.get_event_log.remote()) == [
         (
             "on_request_added",
-            ("serve-route-id", WORKER_ID, list(range(10)), MAX_TOKENS),
+            ("serve-route-id", WORKER_ID, 10, MAX_TOKENS),
         ),
         ("on_prefill_complete", ("serve-route-id",)),
         ("on_decode_progress", ("serve-route-id", 1)),
@@ -461,7 +454,7 @@ async def test_zero_token_request(build_token_tracking_engine):
     await drain(engine)
 
     assert ray.get(actor.get_event_log.remote()) == [
-        ("on_request_added", ("r", WORKER_ID, [1, 2, 3], MAX_TOKENS)),
+        ("on_request_added", ("r", WORKER_ID, 3, MAX_TOKENS)),
         ("on_request_completed", ("r",)),
     ]
 
@@ -535,7 +528,7 @@ def test_is_kv_aware(request_router_config, expected):
 async def test_block_boundary_crossings():
     """Each ceil((prompt+output)/block_size) increase advances total_blocks."""
     actor = LocalKVRouterActor(block_size=16)
-    await actor.on_request_added("r", 1, list(range(10)))
+    await actor.on_request_added("r", 1, 10)
     assert (await actor.get_request_lifecycle("r"))["total_blocks"] == 1  # ceil(10/16)
 
     await actor.on_decode_progress("r", 6)  # 10+6=16 -> still 1 block
@@ -554,9 +547,9 @@ async def test_block_boundary_crossings():
 async def test_active_load_tracking():
     """Active load is per-worker; completion evicts the request entirely."""
     actor = LocalKVRouterActor(block_size=16)
-    await actor.on_request_added("a", 1, list(range(8)))
-    await actor.on_request_added("b", 1, [])
-    await actor.on_request_added("c", 2, [])
+    await actor.on_request_added("a", 1, 8)
+    await actor.on_request_added("b", 1, 0)
+    await actor.on_request_added("c", 2, 0)
     assert await actor.get_worker_active_load(1) == 2
     assert await actor.get_worker_active_load(2) == 1
 
@@ -602,13 +595,10 @@ async def test_tracking_drains_under_churn():
         if launched < total and (not inflight or rng.random() < 0.6):
             request_id = f"r{launched}"
             launched += 1
-            # A routed request carries its effective prefill tokens from select();
-            # admission must drain that map too, not just _requests.
-            actor._effective_prefill_tokens_by_request[request_id] = rng.randint(0, 40)
             await actor.on_request_added(
                 request_id,
                 rng.choice(workers),
-                list(range(rng.randint(1, 40))),
+                rng.randint(1, 40),
                 expected_output_tokens=rng.choice([None, 32]),
             )
             inflight.add(request_id)
@@ -629,7 +619,6 @@ async def test_tracking_drains_under_churn():
     # Everything drained: no request state, no index entries, no active load.
     assert actor._requests == {}
     assert actor._request_ids_by_worker == {}
-    assert actor._effective_prefill_tokens_by_request == {}
     assert await actor.get_active_request_ids() == []
     for worker_id in workers:
         assert await actor.get_worker_active_load(worker_id) == 0
@@ -640,9 +629,9 @@ async def test_remove_worker_evicts_requests():
     """A departed replica's in-flight request state is purged: its completion
     events can never arrive, so the entries would otherwise leak forever."""
     actor = LocalKVRouterActor(block_size=16)
-    await actor.on_request_added("a", 1, list(range(8)))
-    await actor.on_request_added("b", 1, list(range(8)))
-    await actor.on_request_added("c", 2, list(range(8)))
+    await actor.on_request_added("a", 1, 8)
+    await actor.on_request_added("b", 1, 8)
+    await actor.on_request_added("c", 2, 8)
 
     actor.remove_worker(1)
 
@@ -662,13 +651,13 @@ async def test_stale_request_evicted_after_ttl():
     """Backstop for a lost completion on a live replica: a request tracked past
     the TTL is evicted and its reservation freed, so it cannot accumulate."""
     actor = LocalKVRouterActor(block_size=16)
-    await actor.on_request_added("stale", 1, list(range(8)))
-    await actor.on_request_added("fresh_untriggered", 1, list(range(8)))
+    await actor.on_request_added("stale", 1, 8)
+    await actor.on_request_added("fresh_untriggered", 1, 8)
     # Backdate the stale request's admission beyond the TTL (lost completion).
     actor._requests["stale"].created_at -= REQUEST_TRACKING_TTL_S + 1
 
     # A new admission triggers the lazy sweep of the oldest entries.
-    await actor.on_request_added("trigger", 2, list(range(8)))
+    await actor.on_request_added("trigger", 2, 8)
 
     assert "stale" not in await actor.get_active_request_ids()
     assert ("free_reservation", "stale") in actor._svc.calls
@@ -684,18 +673,33 @@ async def test_admission_race_frees_reservation():
     actor = LocalKVRouterActor(block_size=16)
 
     # Simulate the LongPoll remove_worker firing during the create_reservation await.
+    # The by-id reservation no longer carries the worker id, so pin it here.
     book_reservation = actor._svc.create_reservation
 
     async def racing_create_reservation(request):
         await book_reservation(request)
-        actor.remove_worker(request["worker_id"])
+        actor.remove_worker(1)
 
     actor._svc.create_reservation = racing_create_reservation
 
-    await actor.on_request_added("r", 1, list(range(8)))
+    await actor.on_request_added("r", 1, 8)
 
     assert await actor.get_active_request_ids() == []  # evicted mid-flight
     assert ("free_reservation", "r") in actor._svc.calls  # reservation not orphaned
+
+
+@pytest.mark.asyncio
+async def test_books_reservation_by_id_only():
+    """create_reservation replays the selection cached by ``select`` (keyed by
+    the request id, passed back as ``selection_id``), so it carries only the
+    ids -- never the worker id, token ids, output cap, or effective prefill
+    tokens, which the selection service already captured at select time
+    (avoiding a duplicate tokenization/hash and a prompt re-send)."""
+    actor = LocalKVRouterActor(block_size=16)
+
+    await actor.on_request_added("r", WORKER_ID, 16, expected_output_tokens=20)
+
+    assert actor._svc.reservations == [{"selection_id": "r", "reservation_id": "r"}]
 
 
 @pytest.mark.asyncio
@@ -762,7 +766,7 @@ async def test_lifecycle_books_selection_service_load(build_token_tracking_engin
         + ["add_output_block"] * 2
         + ["free_reservation"]
     )
-    assert calls[0] == ("create_reservation", "req-1", WORKER_ID, 12, MAX_TOKENS)
+    assert calls[0] == ("create_reservation", "req-1")
     assert calls[-1] == ("free_reservation", "req-1")
 
 
@@ -770,7 +774,7 @@ async def test_lifecycle_books_selection_service_load(build_token_tracking_engin
 async def test_decode_blocks_book_add_output_block():
     """Each crossed decode block books one add_output_block in the service."""
     actor = LocalKVRouterActor(block_size=16)
-    await actor.on_request_added("r", WORKER_ID, list(range(10)))  # 1 prompt block
+    await actor.on_request_added("r", WORKER_ID, 10)  # 1 prompt block
     await actor.on_decode_progress("r", 6)  # 16 -> still 1 block
     await actor.on_decode_progress("r", 7)  # 17 -> crosses into block 2
     await actor.on_decode_progress("r", 39)  # 49 -> ceil=4, crosses two more
@@ -795,7 +799,7 @@ async def test_expected_output_tokens_sets_decay_fraction(
     remaining fraction; without one the block carries no decay."""
     actor = LocalKVRouterActor(block_size=8)
     await actor.on_request_added(
-        "r", WORKER_ID, list(range(8)), expected_output_tokens=expected_output_tokens
+        "r", WORKER_ID, 8, expected_output_tokens=expected_output_tokens
     )
     await actor.on_decode_progress("r", 8)  # total 16 -> crosses into block 2
 

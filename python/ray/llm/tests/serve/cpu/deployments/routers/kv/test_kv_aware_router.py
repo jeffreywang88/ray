@@ -369,10 +369,14 @@ class _SelectWorkerStub:
         self._worker_id = worker_id
         self.token_ids = None
         self.allowed = None
+        self.expected_output_tokens = None
 
-    async def remote(self, request_id, token_ids, allowed_worker_ids):
+    async def remote(
+        self, request_id, token_ids, allowed_worker_ids, expected_output_tokens=None
+    ):
         self.token_ids = token_ids
         self.allowed = allowed_worker_ids
+        self.expected_output_tokens = expected_output_tokens
         return {
             "worker_id": self._worker_id,
             "dp_rank": 0,

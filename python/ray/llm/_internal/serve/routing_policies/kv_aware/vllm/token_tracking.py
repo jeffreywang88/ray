@@ -94,11 +94,14 @@ class RequestTokenTracker:
         self._cumulative = 0
         self._prefill_marked = False
         self._finished = False
+        # Only the count crosses the wire: the reservation replays the cached
+        # selection by id, and the KV router's decode-block bookkeeping needs
+        # the prompt length, never the token ids.
         forwarder.report(
             "on_request_added",
             request_id,
             forwarder.worker_id,
-            prompt_token_ids,
+            len(prompt_token_ids),
             expected_output_tokens,
         )
 
