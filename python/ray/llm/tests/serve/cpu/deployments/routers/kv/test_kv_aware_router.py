@@ -153,7 +153,10 @@ def test_build_openai_app_attaches_kv_actor():
     actor_cfg = configs[0]
     assert actor_cfg.get_actor_class().__ray_actor_class__ is KVRouterActor
     assert actor_cfg.actor_options["num_cpus"] == 0
-    assert actor_cfg.init_kwargs == {"indexer_threads": 4}
+    assert actor_cfg.init_kwargs["indexer_threads"] == 4
+    # The served model rides along so the actor can build the fused
+    # chat-select preprocessor.
+    assert isinstance(actor_cfg.init_kwargs["model_source"], str)
 
 
 def test_configurable_indexer_threads():
@@ -340,6 +343,7 @@ def make_target_info(unique_ids):
 
 
 class TestOnDeploymentTargets:
+    @pytest.mark.asyncio
     async def test_reconciles_added_and_removed_workers(self):
         actor = _LocalKVRouterActor()
         actor._on_deployment_targets(make_target_info(["a", "b"]))
