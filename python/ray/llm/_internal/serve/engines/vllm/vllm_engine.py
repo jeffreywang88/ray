@@ -357,6 +357,13 @@ class VLLMEngine(LLMEngine):
             self._vllm_args,
             supported_tasks=supported_tasks,
         )
+        # The backend-HTTP app carries its OWN serving objects (init_app_state
+        # runs again on app.state); wrap this instance too so direct-streaming
+        # requests get token forwarding.
+        if self._token_forwarding:
+            serving_chat = getattr(app.state, "openai_serving_chat", None)
+            if serving_chat is not None:
+                self._wrap_serving_chat_for_forwarding(serving_chat)
         return app
 
     async def start(self) -> None:
@@ -429,25 +436,7 @@ class VLLMEngine(LLMEngine):
         self._oai_models = getattr(state, "openai_serving_models", None)
         self._oai_serving_chat = getattr(state, "openai_serving_chat", None)
         if self._token_forwarding and self._oai_serving_chat is not None:
-            # Under direct streaming, HAProxy hits the replica's vLLM HTTP app,
-            # which calls create_chat_completion directly (VLLMEngine.chat is
-            # not on that path) -- wrap it so both paths get forwarding.
-            serving_chat = self._oai_serving_chat
-            orig_create = serving_chat.create_chat_completion
-
-            async def _create_with_forwarding(request, raw_request=None, **kwargs):
-                rid = None
-                try:
-                    if raw_request is not None:
-                        rid = raw_request.headers.get("x-request-id")
-                except Exception:
-                    rid = None
-                rid = rid or getattr(request, "request_id", None)
-                if rid:
-                    await self._stage_forwarded_prompt_ids(request, str(rid))
-                return await orig_create(request, raw_request=raw_request, **kwargs)
-
-            serving_chat.create_chat_completion = _create_with_forwarding
+            self._wrap_serving_chat_for_forwarding(self._oai_serving_chat)
             logger.info(
                 "KV token forwarding enabled (kv_transfer_params token reuse)."
             )
@@ -661,6 +650,26 @@ class VLLMEngine(LLMEngine):
             return ErrorResponse(error=ErrorInfo(**vllm_error.error.model_dump()))
         except Exception:
             raise exc  # re-raise the original so it surfaces as a 500
+
+    def _wrap_serving_chat_for_forwarding(self, serving_chat: Any) -> None:
+        """Wrap create_chat_completion so every request (serve-handle path AND
+        the direct-streaming backend-HTTP app, which builds its own serving
+        objects) stages forwarded prompt ids before preprocessing."""
+        orig_create = serving_chat.create_chat_completion
+
+        async def _create_with_forwarding(request, raw_request=None, **kwargs):
+            rid = None
+            try:
+                if raw_request is not None:
+                    rid = raw_request.headers.get("x-request-id")
+            except Exception:
+                rid = None
+            rid = rid or getattr(request, "request_id", None)
+            if rid:
+                await self._stage_forwarded_prompt_ids(request, str(rid))
+            return await orig_create(request, raw_request=raw_request, **kwargs)
+
+        serving_chat.create_chat_completion = _create_with_forwarding
 
     async def _prefetch_forwarded_prompt_ids(self, request: Any) -> None:
         """Serve-handle-path variant of token forwarding (see the HTTP-path
