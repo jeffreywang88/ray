@@ -104,6 +104,7 @@ class KVRouterActor:
         self,
         indexer_threads: int = DEFAULT_KV_INDEXER_THREADS,
         model_source: Optional[str] = None,
+        fused_threads: Optional[int] = None,
     ):
         # KV-cache block size, learned once from the first replica's reported
         # engine config and passed to the selection service, which uses it to
@@ -113,6 +114,8 @@ class KVRouterActor:
         # HF repo id or local checkout of the served model; enables the fused
         # select_chat path (chat-template render + tokenize + select in Rust).
         self._model_source = model_source
+        # Cap on concurrent fused render+encode jobs; None = demand-grown.
+        self._fused_threads = fused_threads
         # _replica_id_by_worker maps a Dynamo worker id to the running replica's full
         # id string, kept in sync with the deployment's live replicas over LongPoll.
         # NOTE (jeffreywang): _replica_id_by_worker is later used by select_worker
@@ -157,13 +160,16 @@ class KVRouterActor:
 
         model_path = self._resolve_model_path()
         self._svc = SelectionService(
-            indexer_threads=self._indexer_threads, model_path=model_path
+            indexer_threads=self._indexer_threads,
+            model_path=model_path,
+            fused_threads=self._fused_threads,
         )
         logger.info(
             "Dynamo SelectionService created (indexer threads %d, fused "
-            "chat-select %s).",
+            "chat-select %s, fused threads %s).",
             self._indexer_threads,
             "enabled" if model_path else "disabled",
+            self._fused_threads or "demand-grown",
         )
 
     def _resolve_model_path(self) -> Optional[str]:

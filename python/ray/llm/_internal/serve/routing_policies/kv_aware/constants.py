@@ -14,6 +14,10 @@ DEFAULT_KV_EVENTS_PORT_BASE = 5557
 KV_INDEXER_THREADS_KEY = "KV_INDEXER_THREADS"
 DEFAULT_KV_INDEXER_THREADS = 4
 
+# experimental_configs key capping concurrent fused render+encode jobs in the
+# selection service (admission studies). Unset = demand-grown parallelism.
+KV_FUSED_THREADS_KEY = "KV_FUSED_THREADS"
+
 # The engine's KV-event replay (ROUTER) socket sits this many ports above its PUB
 # port, a separate range so it never collides with the PUB ports of colocated
 # replicas (PORT_BASE + replica rank). Dynamo's selection service dials it to recover

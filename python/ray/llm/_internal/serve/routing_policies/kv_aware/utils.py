@@ -6,6 +6,7 @@ import ray
 from ray.llm._internal.serve.core.configs.llm_config import LLMConfig
 from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
     DEFAULT_KV_INDEXER_THREADS,
+    KV_FUSED_THREADS_KEY,
     KV_INDEXER_THREADS_KEY,
 )
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_actor import (
@@ -66,6 +67,10 @@ def _maybe_setup_kv_aware_routing(
                     llm_config.model_loading_config.model_source
                     if isinstance(llm_config.model_loading_config.model_source, str)
                     else None
+                ),
+                # Experimental cap on concurrent fused render+encode jobs.
+                "fused_threads": llm_config.experimental_configs.get(
+                    KV_FUSED_THREADS_KEY
                 ),
             },
         ),
