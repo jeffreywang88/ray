@@ -1,5 +1,5 @@
 import argparse
-import contextvars
+
 import dataclasses
 import inspect
 import json
@@ -87,14 +87,10 @@ vllm = try_import("vllm")
 logger = get_logger(__name__)
 
 
-# Token forwarding: prompt ids fetched from the KV router actor for the
-# request currently being processed on this task. Read (and cleared) by the
-# wrapped renderer tokenize, so the serving path skips re-encoding the prompt.
-_FORWARDED_PROMPT_IDS: "contextvars.ContextVar[Optional[List[int]]]" = (
-    contextvars.ContextVar("kv_forwarded_prompt_ids", default=None)
-)
-
-
+# Token forwarding rides vLLM's decode-side token-reuse mechanism (vLLM PR
+# #48145): prompt ids placed in ``request.kv_transfer_params["prompt_token_ids"]``
+# are fed straight to the engine as a tokens prompt (token-in, text-out),
+# skipping templating + tokenization while tool validation still runs.
 _token_forwarding_logged = False
 
 
@@ -103,45 +99,6 @@ def _log_token_forwarding_first_use() -> None:
     if not _token_forwarding_logged:
         _token_forwarding_logged = True
         logger.info("KV token forwarding: first request served from forwarded ids.")
-
-
-def _install_token_forwarding(base_renderer: Any) -> None:
-    """Wrap the renderer's offloaded tokenize with a forwarded-ids fast path.
-
-    When the contextvar carries this request's prompt ids (computed by the
-    fused routing select and fetched by ``VLLMEngine.chat``), build the
-    ``TokensPrompt`` from them directly instead of re-encoding; otherwise
-    delegate. Offset-requesting calls (echo/token strings) always delegate,
-    since forwarded ids carry no offsets.
-    """
-    # Chat requests render+encode inside apply_chat_template(tokenize=True),
-    # so that offloaded call is the seam; text-prompt flows go through
-    # _tokenize_prompt_async. Wrap both.
-    orig_template = base_renderer._apply_chat_template_async
-
-    async def _template_with_forwarded_ids(model_config, tokenizer, conversation, **kwargs):
-        ids = _FORWARDED_PROMPT_IDS.get()
-        if ids is not None and kwargs.get("tokenize", True) is not False:
-            _FORWARDED_PROMPT_IDS.set(None)
-            _log_token_forwarding_first_use()
-            return list(ids)
-        return await orig_template(model_config, tokenizer, conversation, **kwargs)
-
-    base_renderer._apply_chat_template_async = _template_with_forwarded_ids
-
-    orig_tokenize = base_renderer._tokenize_prompt_async
-
-    async def _tokenize_with_forwarded_ids(prompt, params):
-        ids = _FORWARDED_PROMPT_IDS.get()
-        if ids is not None and not base_renderer._wants_offsets(prompt, params):
-            _FORWARDED_PROMPT_IDS.set(None)
-            _log_token_forwarding_first_use()
-            return base_renderer._build_tokens_prompt(
-                list(ids), prompt, offset_mapping=None
-            )
-        return await orig_tokenize(prompt, params)
-
-    base_renderer._tokenize_prompt_async = _tokenize_with_forwarded_ids
 
 
 def _canonicalize_request_id_header(
@@ -472,14 +429,9 @@ class VLLMEngine(LLMEngine):
         self._oai_models = getattr(state, "openai_serving_models", None)
         self._oai_serving_chat = getattr(state, "openai_serving_chat", None)
         if self._token_forwarding and self._oai_serving_chat is not None:
-            base_renderer = getattr(
-                getattr(self._oai_serving_chat, "online_renderer", None),
-                "renderer",
-                None,
+            logger.info(
+                "KV token forwarding enabled (kv_transfer_params token reuse)."
             )
-            if base_renderer is not None:
-                _install_token_forwarding(base_renderer)
-                logger.info("KV token forwarding enabled on the chat renderer.")
         self._oai_serving_completion = getattr(state, "openai_serving_completion", None)
         self._oai_serving_embedding = getattr(state, "serving_embedding", None)
         self._oai_serving_transcription = getattr(
@@ -693,8 +645,9 @@ class VLLMEngine(LLMEngine):
 
     async def _prefetch_forwarded_prompt_ids(self, request: Any) -> None:
         """Fetch the fused select's prompt ids for this request and stage them
-        for the wrapped renderer tokenize. Best-effort: any miss or error
-        leaves the contextvar unset and the normal render+encode path runs.
+        into ``request.kv_transfer_params`` (vLLM decode-side token reuse).
+        Best-effort: any miss or error leaves the request untouched and the
+        normal render+encode path runs.
         """
         request_id = getattr(request, "request_id", None)
         if not request_id:
@@ -722,7 +675,10 @@ class VLLMEngine(LLMEngine):
             logger.exception("Token-forwarding fetch failed; falling back.")
             return
         if ids:
-            _FORWARDED_PROMPT_IDS.set(ids)
+            params = dict(getattr(request, "kv_transfer_params", None) or {})
+            params["prompt_token_ids"] = list(ids)
+            request.kv_transfer_params = params
+            _log_token_forwarding_first_use()
 
     async def chat(
         self,
