@@ -95,6 +95,16 @@ _FORWARDED_PROMPT_IDS: "contextvars.ContextVar[Optional[List[int]]]" = (
 )
 
 
+_token_forwarding_logged = False
+
+
+def _log_token_forwarding_first_use() -> None:
+    global _token_forwarding_logged
+    if not _token_forwarding_logged:
+        _token_forwarding_logged = True
+        logger.info("KV token forwarding: first request served from forwarded ids.")
+
+
 def _install_token_forwarding(base_renderer: Any) -> None:
     """Wrap the renderer's offloaded tokenize with a forwarded-ids fast path.
 
@@ -104,16 +114,32 @@ def _install_token_forwarding(base_renderer: Any) -> None:
     delegate. Offset-requesting calls (echo/token strings) always delegate,
     since forwarded ids carry no offsets.
     """
-    orig = base_renderer._tokenize_prompt_async
+    # Chat requests render+encode inside apply_chat_template(tokenize=True),
+    # so that offloaded call is the seam; text-prompt flows go through
+    # _tokenize_prompt_async. Wrap both.
+    orig_template = base_renderer._apply_chat_template_async
+
+    async def _template_with_forwarded_ids(model_config, tokenizer, conversation, **kwargs):
+        ids = _FORWARDED_PROMPT_IDS.get()
+        if ids is not None and kwargs.get("tokenize", True) is not False:
+            _FORWARDED_PROMPT_IDS.set(None)
+            _log_token_forwarding_first_use()
+            return list(ids)
+        return await orig_template(model_config, tokenizer, conversation, **kwargs)
+
+    base_renderer._apply_chat_template_async = _template_with_forwarded_ids
+
+    orig_tokenize = base_renderer._tokenize_prompt_async
 
     async def _tokenize_with_forwarded_ids(prompt, params):
         ids = _FORWARDED_PROMPT_IDS.get()
         if ids is not None and not base_renderer._wants_offsets(prompt, params):
             _FORWARDED_PROMPT_IDS.set(None)
+            _log_token_forwarding_first_use()
             return base_renderer._build_tokens_prompt(
                 list(ids), prompt, offset_mapping=None
             )
-        return await orig(prompt, params)
+        return await orig_tokenize(prompt, params)
 
     base_renderer._tokenize_prompt_async = _tokenize_with_forwarded_ids
 
