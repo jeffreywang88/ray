@@ -1,4 +1,5 @@
 import argparse
+import contextvars
 import dataclasses
 import inspect
 import json
@@ -84,6 +85,37 @@ if TYPE_CHECKING:
 
 vllm = try_import("vllm")
 logger = get_logger(__name__)
+
+
+# Token forwarding: prompt ids fetched from the KV router actor for the
+# request currently being processed on this task. Read (and cleared) by the
+# wrapped renderer tokenize, so the serving path skips re-encoding the prompt.
+_FORWARDED_PROMPT_IDS: "contextvars.ContextVar[Optional[List[int]]]" = (
+    contextvars.ContextVar("kv_forwarded_prompt_ids", default=None)
+)
+
+
+def _install_token_forwarding(base_renderer: Any) -> None:
+    """Wrap the renderer's offloaded tokenize with a forwarded-ids fast path.
+
+    When the contextvar carries this request's prompt ids (computed by the
+    fused routing select and fetched by ``VLLMEngine.chat``), build the
+    ``TokensPrompt`` from them directly instead of re-encoding; otherwise
+    delegate. Offset-requesting calls (echo/token strings) always delegate,
+    since forwarded ids carry no offsets.
+    """
+    orig = base_renderer._tokenize_prompt_async
+
+    async def _tokenize_with_forwarded_ids(prompt, params):
+        ids = _FORWARDED_PROMPT_IDS.get()
+        if ids is not None and not base_renderer._wants_offsets(prompt, params):
+            _FORWARDED_PROMPT_IDS.set(None)
+            return base_renderer._build_tokens_prompt(
+                list(ids), prompt, offset_mapping=None
+            )
+        return await orig(prompt, params)
+
+    base_renderer._tokenize_prompt_async = _tokenize_with_forwarded_ids
 
 
 def _canonicalize_request_id_header(
@@ -299,6 +331,17 @@ class VLLMEngine(LLMEngine):
         # Routing stats advertised to Serve's request router; populated in
         # start() once the engine's KV-events endpoint is bound.
         self._routing_stats: Dict[str, Any] = {}
+        # Token forwarding (experimental): fetch the fused select's prompt ids
+        # by request id and skip replica-side re-tokenization.
+        from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
+            KV_TOKEN_FORWARDING_KEY,
+        )
+
+        self._token_forwarding = bool(
+            llm_config.experimental_configs.get(KV_TOKEN_FORWARDING_KEY)
+        )
+        self._kv_router_actor_handle: Any = None
+        self._kv_router_actor_resolved = False
 
         # vLLM Integration points. Will be set through .start()
         self._engine_client = None
@@ -402,6 +445,15 @@ class VLLMEngine(LLMEngine):
 
         self._oai_models = getattr(state, "openai_serving_models", None)
         self._oai_serving_chat = getattr(state, "openai_serving_chat", None)
+        if self._token_forwarding and self._oai_serving_chat is not None:
+            base_renderer = getattr(
+                getattr(self._oai_serving_chat, "online_renderer", None),
+                "renderer",
+                None,
+            )
+            if base_renderer is not None:
+                _install_token_forwarding(base_renderer)
+                logger.info("KV token forwarding enabled on the chat renderer.")
         self._oai_serving_completion = getattr(state, "openai_serving_completion", None)
         self._oai_serving_embedding = getattr(state, "serving_embedding", None)
         self._oai_serving_transcription = getattr(
@@ -613,6 +665,39 @@ class VLLMEngine(LLMEngine):
         except Exception:
             raise exc  # re-raise the original so it surfaces as a 500
 
+    async def _prefetch_forwarded_prompt_ids(self, request: Any) -> None:
+        """Fetch the fused select's prompt ids for this request and stage them
+        for the wrapped renderer tokenize. Best-effort: any miss or error
+        leaves the contextvar unset and the normal render+encode path runs.
+        """
+        request_id = getattr(request, "request_id", None)
+        if not request_id:
+            return
+        if not self._kv_router_actor_resolved:
+            self._kv_router_actor_resolved = True
+            try:
+                from ray import serve
+                from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_actor import (  # noqa: E501
+                    KV_ROUTER_ACTOR_NAME,
+                )
+
+                self._kv_router_actor_handle = serve.get_deployment_actor(
+                    KV_ROUTER_ACTOR_NAME
+                )
+            except Exception as e:
+                logger.warning("KV token forwarding disabled: %s", e)
+        if self._kv_router_actor_handle is None:
+            return
+        try:
+            ids = await self._kv_router_actor_handle.get_prompt_tokens.remote(
+                str(request_id)
+            )
+        except Exception:
+            logger.exception("Token-forwarding fetch failed; falling back.")
+            return
+        if ids:
+            _FORWARDED_PROMPT_IDS.set(ids)
+
     async def chat(
         self,
         request: ChatCompletionRequest,
@@ -626,6 +711,8 @@ class VLLMEngine(LLMEngine):
         raw_request: Optional[Request] = RawRequestInfo.to_starlette_request_optional(
             raw_request_info
         )
+        if self._token_forwarding:
+            await self._prefetch_forwarded_prompt_ids(request)
         try:
             chat_response = await self._oai_serving_chat.create_chat_completion(  # type: ignore[attr-defined]
                 request,

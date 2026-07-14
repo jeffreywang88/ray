@@ -439,6 +439,15 @@ class KVRouterActor:
             "effective_prefill_tokens": selection["effective_prefill_tokens"],
         }
 
+    async def get_prompt_tokens(self, request_id: str) -> Optional[List[int]]:
+        """Token forwarding: prompt ids the matching ``select_chat`` computed
+        for ``request_id``, so the serving replica can skip re-tokenization.
+        ``None`` when unknown (token-less route, evicted, or non-fused select).
+        """
+        if self._svc is None:
+            return None
+        return self._svc.get_prompt_tokens(request_id)
+
     async def on_lifecycle_events(self, events: List[tuple]) -> None:
         """Apply a replica's ``(hook_name, args)`` lifecycle events in order.
 

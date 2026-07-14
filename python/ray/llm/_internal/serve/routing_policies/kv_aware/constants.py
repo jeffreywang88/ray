@@ -18,6 +18,11 @@ DEFAULT_KV_INDEXER_THREADS = 4
 # selection service (admission studies). Unset = demand-grown parallelism.
 KV_FUSED_THREADS_KEY = "KV_FUSED_THREADS"
 
+# experimental_configs key enabling token forwarding: serving replicas fetch
+# the prompt token ids the fused select already computed (by request id) and
+# skip re-rendering + re-tokenizing the prompt.
+KV_TOKEN_FORWARDING_KEY = "KV_TOKEN_FORWARDING"
+
 # The engine's KV-event replay (ROUTER) socket sits this many ports above its PUB
 # port, a separate range so it never collides with the PUB ports of colocated
 # replicas (PORT_BASE + replica rank). Dynamo's selection service dials it to recover
