@@ -429,6 +429,25 @@ class VLLMEngine(LLMEngine):
         self._oai_models = getattr(state, "openai_serving_models", None)
         self._oai_serving_chat = getattr(state, "openai_serving_chat", None)
         if self._token_forwarding and self._oai_serving_chat is not None:
+            # Under direct streaming, HAProxy hits the replica's vLLM HTTP app,
+            # which calls create_chat_completion directly (VLLMEngine.chat is
+            # not on that path) -- wrap it so both paths get forwarding.
+            serving_chat = self._oai_serving_chat
+            orig_create = serving_chat.create_chat_completion
+
+            async def _create_with_forwarding(request, raw_request=None, **kwargs):
+                rid = None
+                try:
+                    if raw_request is not None:
+                        rid = raw_request.headers.get("x-request-id")
+                except Exception:
+                    rid = None
+                rid = rid or getattr(request, "request_id", None)
+                if rid:
+                    await self._stage_forwarded_prompt_ids(request, str(rid))
+                return await orig_create(request, raw_request=raw_request, **kwargs)
+
+            serving_chat.create_chat_completion = _create_with_forwarding
             logger.info(
                 "KV token forwarding enabled (kv_transfer_params token reuse)."
             )
@@ -644,14 +663,19 @@ class VLLMEngine(LLMEngine):
             raise exc  # re-raise the original so it surfaces as a 500
 
     async def _prefetch_forwarded_prompt_ids(self, request: Any) -> None:
-        """Fetch the fused select's prompt ids for this request and stage them
+        """Serve-handle-path variant of token forwarding (see the HTTP-path
+        wrapper installed in build_asgi_app)."""
+        request_id = getattr(request, "request_id", None)
+        if not request_id:
+            return
+        await self._stage_forwarded_prompt_ids(request, str(request_id))
+
+    async def _stage_forwarded_prompt_ids(self, request: Any, request_id: str) -> None:
+        """Fetch the fused select's prompt ids for ``request_id`` and stage them
         into ``request.kv_transfer_params`` (vLLM decode-side token reuse).
         Best-effort: any miss or error leaves the request untouched and the
         normal render+encode path runs.
         """
-        request_id = getattr(request, "request_id", None)
-        if not request_id:
-            return
         if not self._kv_router_actor_resolved:
             self._kv_router_actor_resolved = True
             try:
