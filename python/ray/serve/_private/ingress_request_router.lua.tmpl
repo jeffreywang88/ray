@@ -100,7 +100,10 @@ end
 -- txn.via_ingress_request_router (success) or txn.ingress_request_router_failed
 -- (failure). Both outcomes are timed by the caller; only the silent early
 -- returns in the action handler skip timing because no routing was attempted.
-local function _route_via_ingress_request_router(txn, router, replica_map)
+-- Per-thread round-robin cursor over each app's router pool.
+local ROUTER_RR = 0
+
+local function _route_via_ingress_request_router(txn, router_pool, replica_map)
     -- FORWARD_BODY=false: don't read or forward the body; call the router
     -- with body="" so a Content-Length: 0 POST still goes through routing
     -- (any policy that needs the body must opt in via FORWARD_BODY=true).
@@ -159,7 +162,19 @@ local function _route_via_ingress_request_router(txn, router, replica_map)
     -- leg (last-wins) on a different id than the routing leg (first-wins).
     txn.http:req_set_header("x-request-id", request_id)
 
-    local response = call_router(router, body, truncated, session_id, request_id)
+    -- Spread routing calls round-robin across the router pool, failing over
+    -- to the next router only when one is unreachable (a reachable router's
+    -- non-200 is a real answer and is not retried elsewhere).
+    local n = #router_pool
+    ROUTER_RR = (ROUTER_RR % n) + 1
+    local response = nil
+    for attempt = 0, n - 1 do
+        local router = router_pool[((ROUTER_RR - 1 + attempt) % n) + 1]
+        response = call_router(router, body, truncated, session_id, request_id)
+        if response then
+            break
+        end
+    end
     if not response then
         txn:set_var("txn.ingress_request_router_failed", "router_unreachable")
         return
@@ -214,12 +229,12 @@ core.register_action("route_via_ingress_request_router", {"http-req"}, function(
     if not app then
         return
     end
-    local router = ROUTERS[app]
+    local router_pool = ROUTERS[app]
     local replica_map = REPLICA_TARGETS[app]
-    if not router or not replica_map then
+    if not router_pool or #router_pool == 0 or not replica_map then
         return
     end
 
-    _route_via_ingress_request_router(txn, router, replica_map)
+    _route_via_ingress_request_router(txn, router_pool, replica_map)
     ${METRICS_POST_CALL_ROUTER}
 end, 0)
