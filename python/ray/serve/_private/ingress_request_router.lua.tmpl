@@ -87,6 +87,14 @@ local function extract_replica_id(json_body)
     return json_body:match('"replica_id"%s*:%s*"([^"]+)"')
 end
 
+-- KVAwareRouter2 (payload token forwarding): the router may ride the fused-select
+-- prompt ids back as a compact CSV string (digits + commas only). We set them as
+-- the x-kv-prompt-ids header on the request forwarded to the engine so the engine
+-- skips re-tokenization without a get_prompt_tokens RPC to the KVRouterActor.
+local function extract_kv_prompt_ids(json_body)
+    return json_body:match('"kv_prompt_ids"%s*:%s*"([%d,]*)"')
+end
+
 -- Returns the original Content-Length when `body` is shorter than the
 -- advertised length (truncated by tune.bufsize), or nil otherwise.
 local function truncated_full_length(txn, body)
@@ -184,7 +192,8 @@ local function _route_via_ingress_request_router(txn, router_pool, replica_map)
         return
     end
 
-    local replica_id = extract_replica_id(http_response_body(response))
+    local resp_body = http_response_body(response)
+    local replica_id = extract_replica_id(resp_body)
     if not replica_id then
         txn:set_var("txn.ingress_request_router_failed", "unparseable_replica_id")
         return
@@ -197,6 +206,13 @@ local function _route_via_ingress_request_router(txn, router_pool, replica_map)
         -- Arm `failed`. The frontend recovers it via the fallback proxy.
         txn:set_var("txn.ingress_request_router_failed", "unknown_replica_id")
         return
+    end
+
+    -- KVAwareRouter2: ride the fused-select prompt ids to the engine as a header
+    -- (needs tune.maxrewrite headroom for large ISL; see haproxy global config).
+    local kv_ids = extract_kv_prompt_ids(resp_body)
+    if kv_ids and kv_ids ~= "" then
+        txn.http:req_set_header("x-kv-prompt-ids", kv_ids)
     end
 
     txn:set_var("txn.ingress_request_router_target", server_name)

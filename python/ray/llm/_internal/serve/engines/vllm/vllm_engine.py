@@ -658,18 +658,37 @@ class VLLMEngine(LLMEngine):
         orig_create = serving_chat.create_chat_completion
 
         async def _create_with_forwarding(request, raw_request=None, **kwargs):
-            rid = None
+            # KVAwareRouter2 (payload token forwarding): the ingress rode the
+            # fused-select prompt ids to us in the x-kv-prompt-ids header, so we
+            # stage them WITHOUT a get_prompt_tokens RPC back to the KVRouterActor.
+            ids_csv = None
             try:
                 if raw_request is not None:
-                    rid = raw_request.headers.get("x-request-id")
+                    ids_csv = raw_request.headers.get("x-kv-prompt-ids")
             except Exception:
-                rid = None
-            rid = rid or getattr(request, "request_id", None)
-            if rid:
-                await self._stage_forwarded_prompt_ids(request, str(rid))
+                ids_csv = None
+            if ids_csv:
+                self._stage_forwarded_prompt_ids_from_header(request, ids_csv)
             return await orig_create(request, raw_request=raw_request, **kwargs)
 
         serving_chat.create_chat_completion = _create_with_forwarding
+
+    def _stage_forwarded_prompt_ids_from_header(self, request: Any, ids_csv: str) -> None:
+        """KVAwareRouter2: parse the fused-select prompt ids the ingress rode to
+        this engine in the ``x-kv-prompt-ids`` header (compact CSV) and stage them
+        into ``request.kv_transfer_params`` so the renderer skips re-tokenization.
+        No RPC to the KVRouterActor. Best-effort: a parse miss leaves the request
+        untouched and the normal render+encode path runs.
+        """
+        try:
+            ids = [int(x) for x in ids_csv.split(",") if x]
+        except Exception:
+            return
+        if ids:
+            params = dict(getattr(request, "kv_transfer_params", None) or {})
+            params["prompt_token_ids"] = ids
+            request.kv_transfer_params = params
+            _log_token_forwarding_first_use()
 
     async def _prefetch_forwarded_prompt_ids(self, request: Any) -> None:
         """Serve-handle-path variant of token forwarding (see the HTTP-path

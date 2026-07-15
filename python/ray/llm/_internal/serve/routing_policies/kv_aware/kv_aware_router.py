@@ -13,6 +13,9 @@ from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_actor import (
     KV_ROUTER_ACTOR_NAME,
     get_worker_id,
 )
+from ray.llm._internal.serve.routing_policies.kv_aware.payload_forwarding import (
+    stash_ids,
+)
 from ray.serve._private.constants import (
     SERVE_DEPLOYMENT_ACTOR_PREFIX,
     SERVE_LOGGER_NAME,
@@ -138,6 +141,14 @@ class KVAwareRouter(RequestRouter):
                 routing_body,
                 list(worker_id_to_replica),
                 _get_expected_output_tokens(pending_request),
+            )
+            # KVAwareRouter2: the fused select returned the prompt ids alongside
+            # the worker. Stash them (in-process, same replica as LLMRouter.route)
+            # so route() can ride them to the engine via the response + HAProxy
+            # header, so the engine need not RPC back to this singleton.
+            stash_ids(
+                pending_request.metadata.request_id,
+                selection.get("prompt_token_ids"),
             )
         else:
             selection = await self._kv_router_actor.select_worker.remote(

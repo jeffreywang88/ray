@@ -432,12 +432,25 @@ class KVRouterActor:
                 "expected_output_tokens": expected_output_tokens,
             }
         )
-        return {
+        result = {
             "worker_id": selection["worker_id"],
             "dp_rank": selection["dp_rank"],
             "overlap_tokens": selection["overlap"]["longest_matched"],
             "effective_prefill_tokens": selection["effective_prefill_tokens"],
         }
+        # KVAwareRouter2 (payload token forwarding): materialize the fused-select
+        # prompt ids here (a cheap in-actor Rust cache lookup, NO extra RPC) and
+        # return them so they can ride the route response + HAProxy header to the
+        # engine, eliminating the engine->actor get_prompt_tokens RPC (kv1's second
+        # synchronous hit on this singleton). Ids cross into Python here by design
+        # (kv1 kept them in Rust); that is the trade for removing the RPC.
+        try:
+            ids = self._svc.get_prompt_tokens(request_id)
+        except Exception:
+            ids = None
+        if ids:
+            result["prompt_token_ids"] = list(ids)
+        return result
 
     async def get_prompt_tokens(self, request_id: str) -> Optional[List[int]]:
         """Token forwarding: prompt ids the matching ``select_chat`` computed

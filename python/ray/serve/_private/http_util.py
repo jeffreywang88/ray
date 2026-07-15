@@ -817,6 +817,11 @@ async def start_asgi_http_server(
             access_log=False,
             log_level=None,
             log_config=None,
+            # KVAwareRouter2: the engine backend-HTTP app receives the fused-select
+            # prompt ids in the x-kv-prompt-ids header (up to ~ISL bytes; ~60KB for
+            # ISL 10k). Raise the h11 header-block limit above the 16KB default so
+            # the large header is accepted (harmless for other paths).
+            h11_max_incomplete_event_size=262144,
             **ssl_kwargs,
         )
     )

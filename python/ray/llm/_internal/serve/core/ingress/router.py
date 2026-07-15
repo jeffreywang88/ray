@@ -188,7 +188,24 @@ class LLMRouter:
             raise HTTPException(status_code=400, detail=str(e))
         except (RuntimeError, DeploymentUnavailableError) as e:
             raise HTTPException(status_code=503, detail=str(e))
-        return {"host": host, "port": port, "replica_id": replica_id}
+        response = {"host": host, "port": port, "replica_id": replica_id}
+        # KVAwareRouter2 (payload token forwarding): if choose_replicas stashed the
+        # fused-select prompt ids for this request (same ingress process), ride them
+        # back in the route response as a compact CSV. HAProxy's Lua sets them as the
+        # x-kv-prompt-ids header on the request forwarded to the engine, so the engine
+        # skips re-tokenization WITHOUT a get_prompt_tokens RPC to the KVRouterActor.
+        from ray.llm._internal.serve.routing_policies.kv_aware.payload_forwarding import (
+            pop_ids,
+        )
+
+        req_id = next(
+            (v for k, v in request.headers.items() if k.lower() == "x-request-id"),
+            None,
+        )
+        ids = pop_ids(req_id)
+        if ids:
+            response["kv_prompt_ids"] = ",".join(map(str, ids))
+        return response
 
     @router_app.get("/health")
     async def health(self):
