@@ -457,6 +457,15 @@ class KVRouterActor:
         for ``request_id``, so the serving replica can skip re-tokenization.
         ``None`` when unknown (token-less route, evicted, or non-fused select).
         """
+        # Instrumentation: kv1 hits THIS actor RPC from the engine once per
+        # request; kv2 must NOT (ids ride the payload instead). Drop a durable
+        # marker so a smoke test can assert zero get_prompt_tokens RPCs under kv2.
+        try:
+            import os as _os
+
+            open(f"/tmp/get_prompt_tokens_rpc_{_os.getpid()}", "a").close()
+        except Exception:
+            pass
         if self._svc is None:
             return None
         return self._svc.get_prompt_tokens(request_id)
