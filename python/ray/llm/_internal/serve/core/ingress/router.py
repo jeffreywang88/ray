@@ -115,11 +115,31 @@ class LLMRouter:
         llm_config: Optional["LLMConfig"] = None,
     ):
         self._handle: DeploymentHandle = server
-        self._handle._init()
         self._tokenizer = None
+        # KVAwareRouter4/5: the KVRouterActor lives in-process here (not a
+        # separate deployment actor), so select_worker_chat is a local call.
+        # Held for the engine-facing on_lifecycle_events handle method.
+        self._kv_router = None
         # A non-None llm_config signals pre-routing tokenization, which the
         # builder binds only for a KV-aware request router.
         if llm_config is not None:
+            # KVAwareRouter4/5: instantiate the KVRouterActor as a plain in-process
+            # object and register it in the process global BEFORE self._handle._init()
+            # below. _init() subscribes the handle's request router to LongPoll; a
+            # DEPLOYMENT_TARGETS callback can then initialize the KVAwareRouter, which
+            # reads this global — so it must be set first, or that init falls back to
+            # the (now-absent) named-actor lookup and errors. choose_replicas (same
+            # process) selects locally; on_lifecycle_events delegates to it.
+            # server.deployment_id is the tracked LLMServer id, which
+            # _start_replica_tracking needs (no deployment-actor context here).
+            from ray.llm._internal.serve.routing_policies.kv_aware.inprocess_actor import (  # noqa: E501
+                build_inprocess_kv_router,
+            )
+
+            self._kv_router = build_inprocess_kv_router(
+                llm_config, server.deployment_id
+            )
+
             # Lazy import: this module pulls in vLLM's renderer;
             # keep it off the non-KV ingress import path.
             from ray.llm._internal.serve.routing_policies.kv_aware.tokenizer import (
@@ -127,6 +147,7 @@ class LLMRouter:
             )
 
             self._tokenizer = await asyncio.to_thread(Tokenizer, llm_config)
+        self._handle._init()
 
     @router_app.post("/internal/route")
     async def route(self, request: Request):
@@ -210,6 +231,18 @@ class LLMRouter:
     @router_app.get("/health")
     async def health(self):
         return {"status": "ok"}
+
+    # KVAwareRouter4/5: engine-facing method. With the in-process KVRouterActor
+    # there is no named deployment actor for the engine replicas to call, so they
+    # RPC this handle method on the LLMRouter deployment instead. It books active
+    # load (added / prefill / decode / completed) into the in-process actor's
+    # selection service. (There is no get_prompt_tokens method: the fused prompt
+    # ids ride the payload -> x-kv-prompt-ids header, kv2-style, so the engine
+    # never calls back for them.) With >1 ingress replica (kv5) each replica's
+    # selection service keeps a consistent global load view via Dynamo's
+    # replica-sync plane; see inprocess_actor.build_inprocess_kv_router.
+    async def on_lifecycle_events(self, batch):
+        return await self._kv_router.on_lifecycle_events(batch)
 
     async def _pick_replica(
         self,

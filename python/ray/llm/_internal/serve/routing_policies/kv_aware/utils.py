@@ -2,17 +2,7 @@
 
 import logging
 
-import ray
 from ray.llm._internal.serve.core.configs.llm_config import LLMConfig
-from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
-    DEFAULT_KV_INDEXER_THREADS,
-    KV_FUSED_THREADS_KEY,
-    KV_INDEXER_THREADS_KEY,
-)
-from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_actor import (
-    KV_ROUTER_ACTOR_NAME,
-    KVRouterActor,
-)
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_router import (
     is_kv_aware,
 )
@@ -20,7 +10,6 @@ from ray.llm._internal.serve.routing_policies.kv_aware.vllm.kv_events import (
     configure_kv_events_for_kv_routing,
 )
 from ray.serve._private.constants import SERVE_LOGGER_NAME
-from ray.serve.config import DeploymentActorConfig
 
 logger = logging.getLogger(SERVE_LOGGER_NAME)
 
@@ -50,30 +39,9 @@ def _maybe_setup_kv_aware_routing(
         "request_router_config"
     ]
 
-    deployment_options["deployment_actors"] = [
-        *deployment_options.get("deployment_actors", []),
-        DeploymentActorConfig(
-            name=KV_ROUTER_ACTOR_NAME,
-            actor_class=ray.remote(KVRouterActor),
-            actor_options={"num_cpus": 0},
-            init_kwargs={
-                "indexer_threads": llm_config.experimental_configs.get(
-                    KV_INDEXER_THREADS_KEY, DEFAULT_KV_INDEXER_THREADS
-                ),
-                # Enables the fused chat-select path (template render +
-                # tokenize + select in Rust) on the served model. Cloud-mirror
-                # sources are not local checkouts, so only strings pass.
-                "model_source": (
-                    llm_config.model_loading_config.model_source
-                    if isinstance(llm_config.model_loading_config.model_source, str)
-                    else None
-                ),
-                # Experimental cap on concurrent fused render+encode jobs.
-                "fused_threads": llm_config.experimental_configs.get(
-                    KV_FUSED_THREADS_KEY
-                ),
-            },
-        ),
-    ]
-
+    # KVAwareRouter4/5: the KVRouterActor is NOT attached as a separate deployment
+    # actor. It is instantiated in-process in the LLMRouter ingress replica
+    # (see core/ingress/router.py + kv_aware/inprocess_actor.py) so the
+    # per-request select is a local call, not an actor RPC hop. Only the KV
+    # events wiring (which feeds the in-process actor's radix tree) is kept.
     configure_kv_events_for_kv_routing(llm_config)

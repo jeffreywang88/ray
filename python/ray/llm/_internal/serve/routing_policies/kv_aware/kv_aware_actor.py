@@ -105,7 +105,12 @@ class KVRouterActor:
         indexer_threads: int = DEFAULT_KV_INDEXER_THREADS,
         model_source: Optional[str] = None,
         fused_threads: Optional[int] = None,
+        serve_deployment_id: Optional[Any] = None,
     ):
+        # KVAwareRouter4/5: when instantiated in-process in the LLMRouter (not as
+        # a deployment actor), there is no deployment-actor context, so the tracked
+        # LLMServer deployment id is passed in explicitly.
+        self._serve_deployment_id = serve_deployment_id
         # KV-cache block size, learned once from the first replica's reported
         # engine config and passed to the selection service, which uses it to
         # track the worker's active load and index its KV blocks for overlap.
@@ -197,7 +202,13 @@ class KVRouterActor:
 
     def _start_replica_tracking(self) -> None:
         """Subscribe to this deployment's running replicas via LongPollClient."""
-        deployment_id = serve.get_deployment_actor_context().deployment_id
+        # KVAwareRouter4/5: in-process (under LLMRouter) there is no deployment-actor
+        # context, so the tracked LLMServer deployment id is supplied explicitly.
+        deployment_id = (
+            self._serve_deployment_id
+            if self._serve_deployment_id is not None
+            else serve.get_deployment_actor_context().deployment_id
+        )
         controller = ray.get_actor(SERVE_CONTROLLER_NAME, namespace=SERVE_NAMESPACE)
         self._long_poll_client = LongPollClient(
             controller,

@@ -66,10 +66,34 @@ class KVAwareRouter(RequestRouter):
         call to confirm it finished initializing, so the first routed request finds
         a ready scorer.
         """
-        self._kv_router_actor = self._discover_kv_router_actor()
-        # Synchronization barrier: Ray defers actor methods until __init__ completes,
-        # so awaiting any method blocks until KVRouterActor is constructed.
-        ray.get(self._kv_router_actor.ready.remote())
+        # KVAwareRouter4/5: prefer the in-process KVRouterActor created by the
+        # LLMRouter in this same ingress process (a plain object, not an actor
+        # handle). When present, select_worker_chat is a local coroutine call;
+        # otherwise fall back to the deployment-scoped actor RPC (kv1/kv2/kv3).
+        from ray.llm._internal.serve.routing_policies.kv_aware.inprocess_actor import (
+            get_inprocess_kv_router,
+        )
+
+        inproc = get_inprocess_kv_router()
+        if inproc is not None:
+            self._kv_router_actor = inproc
+            self._kv_router_inprocess = True
+            # Constructed synchronously in LLMRouter.__init__ (selection service +
+            # replica tracking), so it is ready by the time requests route.
+            return
+        # In-process only (kv4/kv5): the actor lives in the LLMRouter ingress
+        # replica and is the sole router serving direct-stream traffic. Other
+        # processes holding an LLMServer handle (the proxy's fallback router) have
+        # no in-process actor and never route data-plane traffic, so degrade to
+        # load-balanced selection instead of raising on every LongPoll init.
+        self._kv_router_inprocess = False
+        self._kv_router_actor = None
+        logger.warning(
+            "No in-process KVRouterActor in this process (%s); KVAwareRouter "
+            "degrades to load-balanced selection here. Expected for the proxy's "
+            "fallback router; the LLMRouter ingress replica owns the real actor.",
+            self._deployment_id,
+        )
 
     def _discover_kv_router_actor(self) -> ActorHandle:
         """Handle to this deployment's ``KVRouterActor`` by its Serve-scoped name."""
@@ -128,34 +152,38 @@ class KVAwareRouter(RequestRouter):
             if pending_request is not None
             else None
         )
-        if not routing_body and not token_ids:
+        # No routing signal, or this process has no in-process KVRouterActor
+        # (proxy fallback router): load-balance.
+        if (not routing_body and not token_ids) or self._kv_router_actor is None:
             return [[random.choice(candidate_replicas)]] if candidate_replicas else []
 
         worker_id_to_replica = {
             get_worker_id(replica.replica_id.unique_id): replica
             for replica in candidate_replicas
         }
+        # KVAwareRouter4/5: in-process the select is a local coroutine call (no RPC
+        # hop); otherwise it is a deployment-actor RPC (.remote()).
+        inproc = getattr(self, "_kv_router_inprocess", False)
+        rid = pending_request.metadata.request_id
+        expected = _get_expected_output_tokens(pending_request)
         if routing_body:
-            selection = await self._kv_router_actor.select_worker_chat.remote(
-                pending_request.metadata.request_id,
-                routing_body,
-                list(worker_id_to_replica),
-                _get_expected_output_tokens(pending_request),
+            args = (rid, routing_body, list(worker_id_to_replica), expected)
+            selection = (
+                await self._kv_router_actor.select_worker_chat(*args)
+                if inproc
+                else await self._kv_router_actor.select_worker_chat.remote(*args)
             )
             # KVAwareRouter2: the fused select returned the prompt ids alongside
             # the worker. Stash them (in-process, same replica as LLMRouter.route)
             # so route() can ride them to the engine via the response + HAProxy
             # header, so the engine need not RPC back to this singleton.
-            stash_ids(
-                pending_request.metadata.request_id,
-                selection.get("prompt_token_ids"),
-            )
+            stash_ids(rid, selection.get("prompt_token_ids"))
         else:
-            selection = await self._kv_router_actor.select_worker.remote(
-                pending_request.metadata.request_id,
-                token_ids,
-                list(worker_id_to_replica),
-                _get_expected_output_tokens(pending_request),
+            args = (rid, token_ids, list(worker_id_to_replica), expected)
+            selection = (
+                await self._kv_router_actor.select_worker(*args)
+                if inproc
+                else await self._kv_router_actor.select_worker.remote(*args)
             )
         return [[worker_id_to_replica[selection["worker_id"]]]]
 
