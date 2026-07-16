@@ -607,7 +607,16 @@ class VLLMEngine(LLMEngine):
         # resolving it per request would block the engine's event loop.
         engine_cls = AsyncLLM
         if is_kv_aware(self.llm_config):
-            engine_cls = enable_token_tracking(AsyncLLM)
+            # KVAwareRouter5: with >1 ingress replica the engine's lifecycle event
+            # can land on a replica that did not do the select, so forward prompt
+            # token ids to book the reservation self-contained by worker_id (the
+            # in-process selector's replica-sync plane then makes the load global).
+            n_ingress = int(
+                self.llm_config.experimental_configs.get("INGRESS_ROUTER_REPLICAS", 1)
+            )
+            engine_cls = enable_token_tracking(
+                AsyncLLM, send_token_ids=n_ingress > 1
+            )
         engine_client = engine_cls(
             vllm_config=vllm_engine_config,
             executor_class=executor_class,

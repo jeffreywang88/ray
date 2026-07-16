@@ -87,22 +87,27 @@ class RequestTokenTracker:
         request_id: str,
         prompt_token_ids: List[int],
         expected_output_tokens: Optional[int],
+        send_token_ids: bool = False,
     ):
         self._forwarder = forwarder
         self._request_id = request_id
         self._cumulative = 0
         self._prefill_marked = False
         self._finished = False
-        # Only the count crosses the wire: the reservation replays the cached
-        # selection by id, and the KV router's decode-block bookkeeping needs
-        # the prompt length, never the token ids.
-        forwarder.report(
-            "on_request_added",
+        # kv4 (single ingress replica): only the prompt token *count* crosses the
+        # wire — on_request_added replays the cached selection by id.
+        # kv5 (N ingress replicas, send_token_ids=True): the event may land on a
+        # replica that did not do the select, so also forward the prompt token ids
+        # to book the reservation self-contained by worker_id.
+        added_args = [
             request_id,
             forwarder.worker_id,
             len(prompt_token_ids),
             expected_output_tokens,
-        )
+        ]
+        if send_token_ids:
+            added_args.append(list(prompt_token_ids))
+        forwarder.report("on_request_added", *added_args)
 
     def on_output(self, output: RequestOutput) -> None:
         """Observe one engine ``RequestOutput`` (forwarded to the caller as-is).
@@ -128,12 +133,21 @@ class RequestTokenTracker:
             self._forwarder.report("on_request_completed", self._request_id)
 
 
-def enable_token_tracking(engine_cls: Type[AsyncLLM]) -> Type[AsyncLLM]:
-    """Decorator adding KV-router request lifecycle tracking."""
+def enable_token_tracking(
+    engine_cls: Type[AsyncLLM], send_token_ids: bool = False
+) -> Type[AsyncLLM]:
+    """Decorator adding KV-router request lifecycle tracking.
+
+    ``send_token_ids`` (kv5, >1 ingress replica): forward the prompt token ids
+    with on_request_added so the reservation can be booked self-contained on any
+    ingress replica's selector (its pending selection is local, does not
+    propagate). Off for kv4 (single replica), which replays the cached selection.
+    """
 
     class TokenTrackingEngine(engine_cls):
         _lifecycle_forwarder: Optional[LifecycleEventForwarder] = None
         _resolve_warned: bool = False
+        _send_token_ids: bool = send_token_ids
 
         def _resolve_lifecycle_forwarder(self) -> Optional[LifecycleEventForwarder]:
             if self._lifecycle_forwarder is None:
@@ -191,6 +205,7 @@ def enable_token_tracking(engine_cls: Type[AsyncLLM]) -> Type[AsyncLLM]:
                 # TODO(jeffreywang): Use an agent-provided expected-OSL hint for
                 # more accurate decode-load estimation.
                 sampling_params.max_tokens,
+                send_token_ids=self._send_token_ids,
             )
             try:
                 async for output in stream:

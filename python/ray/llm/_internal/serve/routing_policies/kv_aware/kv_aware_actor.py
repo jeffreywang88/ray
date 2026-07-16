@@ -106,11 +106,17 @@ class KVRouterActor:
         model_source: Optional[str] = None,
         fused_threads: Optional[int] = None,
         serve_deployment_id: Optional[Any] = None,
+        replica_sync_port: Optional[int] = None,
     ):
         # KVAwareRouter4/5: when instantiated in-process in the LLMRouter (not as
         # a deployment actor), there is no deployment-actor context, so the tracked
         # LLMServer deployment id is passed in explicitly.
         self._serve_deployment_id = serve_deployment_id
+        # KVAwareRouter5: TCP port for this selection service's replica-sync
+        # listener. Set only with >1 ingress replica; then the service joins the
+        # replica-sync plane and books propagate to peer selectors. None = single
+        # replica (kv4), no sync.
+        self._replica_sync_port = replica_sync_port
         # KV-cache block size, learned once from the first replica's reported
         # engine config and passed to the selection service, which uses it to
         # track the worker's active load and index its KV blocks for overlap.
@@ -140,6 +146,10 @@ class KVRouterActor:
         self._long_poll_client: Optional[LongPollClient] = None
         self._create_selection_service()
         self._start_replica_tracking()
+        # KVAwareRouter5: join the replica-sync plane so this selector's load view
+        # stays consistent with the other ingress replicas' selectors.
+        if self._replica_sync_port is not None and self._svc is not None:
+            self._start_peer_sync()
 
     async def ready(self) -> None:
         """Readiness probe for KVAwareRouter to confirm KVRouterActor is initialized
@@ -164,17 +174,23 @@ class KVRouterActor:
             return
 
         model_path = self._resolve_model_path()
-        self._svc = SelectionService(
+        svc_kwargs = dict(
             indexer_threads=self._indexer_threads,
             model_path=model_path,
             fused_threads=self._fused_threads,
         )
+        # KVAwareRouter5: bind a replica-sync listener so peer selectors can
+        # exchange active-load (reservation) state.
+        if self._replica_sync_port is not None:
+            svc_kwargs["replica_sync_port"] = self._replica_sync_port
+        self._svc = SelectionService(**svc_kwargs)
         logger.info(
             "Dynamo SelectionService created (indexer threads %d, fused "
-            "chat-select %s, fused threads %s).",
+            "chat-select %s, fused threads %s, replica_sync_port %s).",
             self._indexer_threads,
             "enabled" if model_path else "disabled",
             self._fused_threads or "demand-grown",
+            self._replica_sync_port,
         )
 
     def _resolve_model_path(self) -> Optional[str]:
@@ -223,6 +239,64 @@ class KVRouterActor:
             call_in_event_loop=asyncio.get_running_loop(),
             client_id=f"{type(self).__name__}:{deployment_id}",
         )
+
+    def _start_peer_sync(self) -> None:
+        """KVAwareRouter5: join the replica-sync plane so active-load booked on
+        any ingress replica's selector is visible to all of them.
+
+        Advertises this selector's ``tcp://ip:port`` sync endpoint in a small
+        detached registry actor (control-plane only) and runs a background loop
+        that reconciles the peer set: ``register_replica_peer`` for newly-seen
+        peers, ``deregister_replica_peer`` for departed ones. Booking then stays
+        local (this process) while the load view stays global.
+        """
+        import ray
+        from ray.llm._internal.serve.routing_policies.kv_aware.inprocess_actor import (
+            get_sync_registry,
+        )
+
+        ctx = serve.get_replica_context()
+        self._sync_self_id = ctx.replica_id.unique_id
+        self._sync_app_name = ctx.app_name
+        ip = ray.util.get_node_ip_address()
+        self._sync_self_endpoint = f"tcp://{ip}:{self._replica_sync_port}"
+        self._sync_registry = get_sync_registry(self._sync_app_name)
+        self._sync_registered_peers: Set[str] = set()
+        self._schedule(self._reconcile_peers_loop())
+
+    async def _reconcile_peers_loop(self) -> None:
+        """Poll the registry and keep ``register_replica_peer`` membership in sync
+        with the live ingress-replica set. Idempotent registration calls."""
+        import ray
+
+        # Register self first so peers can discover this selector.
+        try:
+            await self._sync_registry.register.remote(
+                self._sync_self_id, self._sync_self_endpoint
+            )
+        except Exception:
+            logger.exception("KV replica-sync self-register failed; retrying in loop.")
+        while True:
+            try:
+                peers: Dict[str, str] = await self._sync_registry.peers.remote()
+                want = {
+                    ep for rid, ep in peers.items() if rid != self._sync_self_id
+                }
+                for ep in want - self._sync_registered_peers:
+                    await self._svc.register_replica_peer(ep)
+                    self._sync_registered_peers.add(ep)
+                    logger.info("KV replica-sync: registered peer %s", ep)
+                for ep in self._sync_registered_peers - want:
+                    await self._svc.deregister_replica_peer(ep)
+                    self._sync_registered_peers.discard(ep)
+                    logger.info("KV replica-sync: deregistered peer %s", ep)
+                # Re-advertise self (registry actor could have restarted).
+                await self._sync_registry.register.remote(
+                    self._sync_self_id, self._sync_self_endpoint
+                )
+            except Exception:
+                logger.exception("KV replica-sync reconcile failed; will retry.")
+            await asyncio.sleep(5.0)
 
     def _schedule(self, coro) -> None:
         """Run a coroutine on the actor's event loop, holding a reference until
@@ -509,17 +583,22 @@ class KVRouterActor:
         worker_id: int,
         prompt_tokens: int,
         expected_output_tokens: Optional[int] = None,
+        token_ids: Optional[List[int]] = None,
     ) -> None:
         """Admit a routed request into ``worker_id``'s active load.
 
-        The matching ``select`` (keyed by the same request id) already cached
-        the chosen worker, the normalized prompt, the worker's uncached prefill
-        length, and the expected output tokens in the selection service, so the
-        reservation is a pure by-id replay -- the replica reports only the
-        prompt token *count* (for local decode-block bookkeeping), never the
-        token ids, and no request field is re-sent. Active prefill load still
-        excludes any KV prefix already cached on the worker, since ``select``
-        captured that.
+        kv4 (single ingress replica): the matching ``select`` (keyed by the same
+        request id) cached the chosen worker + normalized prompt + uncached
+        prefill length in THIS selection service, so the reservation is a pure
+        by-id replay (``selection_id``); only the prompt token *count* crosses
+        the wire.
+
+        kv5 (N ingress replicas): the engine's lifecycle event may land on a
+        replica that did NOT do the select (its pending selection is local and
+        does not propagate), so book self-contained by ``worker_id`` + the
+        forwarded ``token_ids`` — the selector recomputes prefix overlap from its
+        own KV-event-fed radix tree. The resulting reservation propagates to peer
+        selectors via the replica-sync plane, keeping every load view global.
         """
         await self._evict_stale_requests()
         self._requests[request_id] = RequestLifecycle(
@@ -529,14 +608,22 @@ class KVRouterActor:
             total_blocks=math.ceil(prompt_tokens / self._block_size),
         )
         self._request_ids_by_worker.setdefault(worker_id, set()).add(request_id)
-        await self._svc.create_reservation(
-            {
-                # The cached selection to replay; select() keyed it by the
-                # same request id. Replay ignores every other request field.
+        if token_ids is not None:
+            # kv5: self-contained booking against an explicit worker + prompt.
+            reservation = {
+                "worker_id": worker_id,
+                "reservation_id": request_id,
+                "model_name": _MODEL_NAME,
+                "tenant_id": _TENANT_ID,
+                "token_ids": token_ids,
+            }
+        else:
+            # kv4: replay the cached selection keyed by the same request id.
+            reservation = {
                 "selection_id": request_id,
                 "reservation_id": request_id,
             }
-        )
+        await self._svc.create_reservation(reservation)
         if request_id not in self._requests:
             await self._svc.free_reservation(request_id)
 
