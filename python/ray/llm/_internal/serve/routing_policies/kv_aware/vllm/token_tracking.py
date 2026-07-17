@@ -1,4 +1,6 @@
 import asyncio
+import math
+import os
 from typing import Any, List, Optional, Type
 
 from vllm.outputs import RequestOutput
@@ -44,6 +46,12 @@ class LifecycleEventForwarder:
         self.worker_id = worker_id
         self._events: asyncio.Queue = asyncio.Queue()
         self._delivery_task: Optional[asyncio.Task] = None
+        # KVAwareRouter8: coalesce for at least this long before each delivery,
+        # bounding the handle-RPC rate (default 5 ms -> <=200 RPC/s per engine
+        # process) instead of draining per loop wakeup under load.
+        self._flush_s = (
+            float(os.environ.get("KV_LIFECYCLE_FLUSH_MS", "5")) / 1000.0
+        )
 
     def report(self, method_name: str, *args) -> None:
         if self._delivery_task is None or self._delivery_task.done():
@@ -54,9 +62,11 @@ class LifecycleEventForwarder:
 
     async def _deliver(self) -> None:
         while True:
-            # Wait for the next event, then drain whatever queued up behind it
-            # into the same batch.
+            # Wait for the next event, coalesce for the flush interval, then
+            # drain whatever queued up behind it into the same batch.
             batch = [await self._events.get()]
+            if self._flush_s > 0:
+                await asyncio.sleep(self._flush_s)
             while not self._events.empty():
                 batch.append(self._events.get_nowait())
             try:
@@ -88,12 +98,24 @@ class RequestTokenTracker:
         prompt_token_ids: List[int],
         expected_output_tokens: Optional[int],
         send_token_ids: bool = False,
+        block_size: Optional[int] = None,
     ):
         self._forwarder = forwarder
         self._request_id = request_id
         self._cumulative = 0
         self._prefill_marked = False
         self._finished = False
+        # KVAwareRouter8: booking is block-granular on the selector side
+        # (on_decode_progress books one add_output_block per crossed
+        # ceil((prompt+cum)/block_size) boundary), so only chunks that CROSS a
+        # boundary need to be reported — filtering here produces a booking
+        # sequence identical to per-chunk reporting while cutting the event
+        # volume ~block_size x. None = report every chunk (kv5 behavior).
+        self._block_size = block_size
+        self._prompt_tokens = len(prompt_token_ids)
+        self._last_blocks = (
+            math.ceil(self._prompt_tokens / block_size) if block_size else 0
+        )
         # kv4 (single ingress replica): only the prompt token *count* crosses the
         # wire — on_request_added replays the cached selection by id.
         # kv5 (N ingress replicas, send_token_ids=True): the event may land on a
@@ -124,6 +146,17 @@ class RequestTokenTracker:
             # The first output token signals prefill completion.
             self._prefill_marked = True
             self._forwarder.report("on_prefill_complete", self._request_id)
+        if self._block_size:
+            # KVAwareRouter8: report only chunks that cross a KV-block boundary
+            # (the selector books per crossed block; sub-block progress is a
+            # no-op there). The cumulative value at a crossing chunk is the
+            # same one per-chunk reporting would deliver, so bookings match.
+            new_blocks = math.ceil(
+                (self._prompt_tokens + self._cumulative) / self._block_size
+            )
+            if new_blocks <= self._last_blocks:
+                return
+            self._last_blocks = new_blocks
         self._forwarder.report("on_decode_progress", self._request_id, self._cumulative)
 
     def finish(self) -> None:
@@ -206,6 +239,13 @@ def enable_token_tracking(
                 # more accurate decode-load estimation.
                 sampling_params.max_tokens,
                 send_token_ids=self._send_token_ids,
+                # KVAwareRouter8: the engine knows its own KV block size; the
+                # tracker uses it to report only block-boundary crossings.
+                block_size=getattr(
+                    getattr(self.vllm_config, "cache_config", None),
+                    "block_size",
+                    None,
+                ),
             )
             try:
                 async for output in stream:
