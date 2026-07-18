@@ -156,6 +156,19 @@ def build_inprocess_kv_router(llm_config: "LLMConfig", serve_deployment_id: Any)
     )
     replica_sync_port = _pick_free_tcp_port() if n_ingress > 1 else None
 
+    # KVAwareRouter12: the Rust selector reads DYN_ROUTER_* from THIS process's
+    # env at SelectionService creation. With select-time booking, the selector's
+    # load view now includes all in-flight work, which can cross the default
+    # router_queue_threshold (16.0) and make the SELECTOR queue requests —
+    # historical kv arms never queued (their lagged bookings hid load from the
+    # threshold), so pin the configured threshold BEFORE building the actor to
+    # keep admission semantics unchanged across arms.
+    qt = llm_config.experimental_configs.get("KV_ROUTER_QUEUE_THRESHOLD")
+    if qt is not None:
+        import os
+
+        os.environ["DYN_ROUTER_QUEUE_THRESHOLD"] = str(qt)
+
     model_source = llm_config.model_loading_config.model_source
     actor = KVRouterActor(
         indexer_threads=llm_config.experimental_configs.get(
