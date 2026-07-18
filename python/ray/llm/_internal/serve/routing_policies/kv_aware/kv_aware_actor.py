@@ -107,11 +107,23 @@ class KVRouterActor:
         fused_threads: Optional[int] = None,
         serve_deployment_id: Optional[Any] = None,
         replica_sync_port: Optional[int] = None,
+        select_reserve: bool = False,
     ):
         # KVAwareRouter4/5: when instantiated in-process in the LLMRouter (not as
         # a deployment actor), there is no deployment-actor context, so the tracked
         # LLMServer deployment id is passed in explicitly.
         self._serve_deployment_id = serve_deployment_id
+        # KVAwareRouter12: book load AT SELECT TIME (select_and_reserve) instead of
+        # on the engine's added-event. The load view then LEADS physical arrival by
+        # the dispatch window (~ms of a multi-second reservation) instead of
+        # LAGGING it by flush+RPC+replay+sync — the stale window that makes
+        # concurrent selects blind to each other and herd onto one replica.
+        self._select_reserve = select_reserve
+        # Reservations booked at select but whose engine added-event has not yet
+        # arrived: request_id -> monotonic select time. Swept by the TTL backstop
+        # so a booked-but-never-arrived request (replica died mid-forward, client
+        # disconnect, Lua fallback misroute) cannot leak its reservation.
+        self._pending_selects: Dict[str, float] = {}
         # KVAwareRouter5: TCP port for this selection service's replica-sync
         # listener. Set only with >1 ingress replica; then the service joins the
         # replica-sync plane and books propagate to peer selectors. None = single
@@ -507,16 +519,22 @@ class KVRouterActor:
                 "KV-aware routing is unavailable because ai-dynamo is not "
                 "installed in the deployment's environment."
             )
-        selection = await self._svc.select_chat(
-            {
-                "model_name": _MODEL_NAME,
-                "tenant_id": _TENANT_ID,
-                "selection_id": request_id,
-                "body": body,
-                "allowed_worker_ids": allowed_worker_ids,
-                "expected_output_tokens": expected_output_tokens,
-            }
-        )
+        select_req = {
+            "model_name": _MODEL_NAME,
+            "tenant_id": _TENANT_ID,
+            "selection_id": request_id,
+            "body": body,
+            "allowed_worker_ids": allowed_worker_ids,
+            "expected_output_tokens": expected_output_tokens,
+        }
+        if self._select_reserve:
+            # KVAwareRouter12: book the selection's load NOW (reservation keyed by
+            # request_id; the engine's settle events join it). Every subsequent
+            # select — including back-to-back on this selector — sees it.
+            select_req["reserve"] = True
+        selection = await self._svc.select_chat(select_req)
+        if self._select_reserve:
+            self._pending_selects[request_id] = time.monotonic()
         result = {
             "worker_id": selection["worker_id"],
             "dp_rank": selection["dp_rank"],
@@ -608,6 +626,14 @@ class KVRouterActor:
             total_blocks=math.ceil(prompt_tokens / self._block_size),
         )
         self._request_ids_by_worker.setdefault(worker_id, set()).add(request_id)
+        if self._select_reserve:
+            # KVAwareRouter12: the reservation was already created AT SELECT TIME
+            # (select_and_reserve, keyed by this request_id) — this event is
+            # state-init only (block cursor / decay / free-once dedup above).
+            # Claim the pending entry if the select happened on THIS replica; on
+            # peers the entry expires via the TTL sweep (idempotent late free).
+            self._pending_selects.pop(request_id, None)
+            return
         if token_ids is not None:
             # kv5: self-contained booking against an explicit worker + prompt.
             reservation = {
@@ -676,6 +702,19 @@ class KVRouterActor:
         past ``REQUEST_TRACKING_TTL_S``, freeing their reservations.
         """
         cutoff = time.monotonic() - REQUEST_TRACKING_TTL_S
+        # KVAwareRouter12: free select-time reservations never claimed by an
+        # engine added-event on THIS replica (never-arrived request, or the added
+        # event landed on a peer — then the request completed normally long ago
+        # and this late free is an idempotent no-op, same tolerance the
+        # evict-then-complete race below already relies on).
+        while self._pending_selects:
+            request_id, t_sel = next(iter(self._pending_selects.items()))
+            if t_sel > cutoff:
+                break
+            self._pending_selects.pop(request_id, None)
+            if request_id in self._requests:
+                continue  # claimed; the normal lifecycle owns the reservation
+            await self._svc.free_reservation(request_id)
         while self._requests:
             request_id, state = next(iter(self._requests.items()))
             if state.created_at > cutoff:

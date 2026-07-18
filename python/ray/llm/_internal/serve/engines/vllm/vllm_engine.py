@@ -614,8 +614,15 @@ class VLLMEngine(LLMEngine):
             n_ingress = int(
                 self.llm_config.experimental_configs.get("INGRESS_ROUTER_REPLICAS", 1)
             )
+            # KVAwareRouter12 (KV_SELECT_RESERVE): the reservation is booked at
+            # select time, so the added-event is state-init only — no token ids
+            # need to ride it (drops a len(prompt) list copy + its pickle from
+            # the engine loop per request).
+            select_reserve = bool(
+                self.llm_config.experimental_configs.get("KV_SELECT_RESERVE")
+            )
             engine_cls = enable_token_tracking(
-                AsyncLLM, send_token_ids=n_ingress > 1
+                AsyncLLM, send_token_ids=(n_ingress > 1) and not select_reserve
             )
         engine_client = engine_cls(
             vllm_config=vllm_engine_config,

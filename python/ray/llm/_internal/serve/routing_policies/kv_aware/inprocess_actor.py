@@ -165,6 +165,10 @@ def build_inprocess_kv_router(llm_config: "LLMConfig", serve_deployment_id: Any)
         fused_threads=llm_config.experimental_configs.get(KV_FUSED_THREADS_KEY),
         serve_deployment_id=serve_deployment_id,
         replica_sync_port=replica_sync_port,
+        # KVAwareRouter12: book load at select time (stale-view herding fix).
+        select_reserve=bool(
+            llm_config.experimental_configs.get("KV_SELECT_RESERVE")
+        ),
     )
     set_inprocess_kv_router(actor)
     return actor
