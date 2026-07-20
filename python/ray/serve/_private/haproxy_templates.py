@@ -71,10 +71,6 @@ HAPROXY_CONFIG_TEMPLATE = """global
     {%- endif %}
     {%- if has_ingress_request_router and ingress_request_router_forward_body %}
     tune.bufsize {{ ingress_request_router_bufsize }}
-    # KVAwareRouter2: reserve rewrite headroom so the Lua can append the (large,
-    # up to ~ISL bytes) x-kv-prompt-ids header to the forwarded request. Must be
-    # <= bufsize/2; 120KB covers ISL 10k token-id CSVs.
-    tune.maxrewrite 122880
     {%- else %}
     tune.bufsize {{ config.bufsize }}
     {%- endif %}

@@ -674,37 +674,23 @@ class VLLMEngine(LLMEngine):
         orig_create = serving_chat.create_chat_completion
 
         async def _create_with_forwarding(request, raw_request=None, **kwargs):
-            # KVAwareRouter2 (payload token forwarding): the ingress rode the
-            # fused-select prompt ids to us in the x-kv-prompt-ids header, so we
-            # stage them WITHOUT a get_prompt_tokens RPC back to the KVRouterActor.
-            ids_csv = None
+            # KVAwareRouter6: prompt ids no longer ride the payload; fetch them via
+            # a get_prompt_tokens RPC to the LLMRouter (broadcast to all ingress
+            # selectors) keyed by x-request-id, then stage them so the renderer
+            # skips re-tokenization.
+            req_id = None
             try:
                 if raw_request is not None:
-                    ids_csv = raw_request.headers.get("x-kv-prompt-ids")
+                    req_id = raw_request.headers.get("x-request-id")
             except Exception:
-                ids_csv = None
-            if ids_csv:
-                self._stage_forwarded_prompt_ids_from_header(request, ids_csv)
+                req_id = None
+            if not req_id:
+                req_id = getattr(request, "request_id", None)
+            if req_id:
+                await self._stage_forwarded_prompt_ids(request, str(req_id))
             return await orig_create(request, raw_request=raw_request, **kwargs)
 
         serving_chat.create_chat_completion = _create_with_forwarding
-
-    def _stage_forwarded_prompt_ids_from_header(self, request: Any, ids_csv: str) -> None:
-        """KVAwareRouter2: parse the fused-select prompt ids the ingress rode to
-        this engine in the ``x-kv-prompt-ids`` header (compact CSV) and stage them
-        into ``request.kv_transfer_params`` so the renderer skips re-tokenization.
-        No RPC to the KVRouterActor. Best-effort: a parse miss leaves the request
-        untouched and the normal render+encode path runs.
-        """
-        try:
-            ids = [int(x) for x in ids_csv.split(",") if x]
-        except Exception:
-            return
-        if ids:
-            params = dict(getattr(request, "kv_transfer_params", None) or {})
-            params["prompt_token_ids"] = ids
-            request.kv_transfer_params = params
-            _log_token_forwarding_first_use()
 
     async def _prefetch_forwarded_prompt_ids(self, request: Any) -> None:
         """Serve-handle-path variant of token forwarding (see the HTTP-path
@@ -715,33 +701,35 @@ class VLLMEngine(LLMEngine):
         await self._stage_forwarded_prompt_ids(request, str(request_id))
 
     async def _stage_forwarded_prompt_ids(self, request: Any, request_id: str) -> None:
-        """Fetch the fused select's prompt ids for ``request_id`` and stage them
-        into ``request.kv_transfer_params`` (vLLM decode-side token reuse).
-        Best-effort: any miss or error leaves the request untouched and the
-        normal render+encode path runs.
+        """KVAwareRouter6: fetch the fused select's prompt ids for ``request_id``
+        and stage them into ``request.kv_transfer_params`` (vLLM decode-side token
+        reuse). Each ingress replica's in-process selector caches only the ids for
+        requests IT selected, so broadcast get_prompt_tokens to ALL ingress
+        replicas and take the one hit. Best-effort: any miss or error leaves the
+        request untouched and the normal render+encode path runs.
         """
         if not self._kv_router_actor_resolved:
             self._kv_router_actor_resolved = True
             try:
-                from ray import serve
-                from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_actor import (  # noqa: E501
-                    KV_ROUTER_ACTOR_NAME,
+                from ray.llm._internal.serve.routing_policies.kv_aware.inprocess_actor import (  # noqa: E501
+                    get_llm_router_handle,
                 )
 
-                self._kv_router_actor_handle = serve.get_deployment_actor(
-                    KV_ROUTER_ACTOR_NAME
-                )
+                self._kv_router_actor_handle = get_llm_router_handle()
             except Exception as e:
                 logger.warning("KV token forwarding disabled: %s", e)
         if self._kv_router_actor_handle is None:
             return
         try:
-            ids = await self._kv_router_actor_handle.get_prompt_tokens.remote(
-                str(request_id)
-            )
+            results = await self._kv_router_actor_handle.broadcast(
+                "get_prompt_tokens", str(request_id)
+            ).results_async(timeout_s=30.0, return_exceptions=True)
         except Exception:
             logger.exception("Token-forwarding fetch failed; falling back.")
             return
+        ids = next(
+            (r for r in results if r and not isinstance(r, BaseException)), None
+        )
         if ids:
             params = dict(getattr(request, "kv_transfer_params", None) or {})
             params["prompt_token_ids"] = list(ids)

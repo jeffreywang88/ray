@@ -208,14 +208,19 @@ class LLMRouter:
         except (RuntimeError, DeploymentUnavailableError) as e:
             raise HTTPException(status_code=503, detail=str(e))
         response = {"host": host, "port": port, "replica_id": replica_id}
-        # KVAwareRouter7 (payload token forwarding): the LLMRouter already tokenized
-        # this request via OnlineRenderer, so ride those prompt ids back in the route
-        # response as a compact CSV. HAProxy's Lua sets them as the x-kv-prompt-ids
-        # header on the request forwarded to the engine, so the engine skips
-        # re-tokenization (kv5-style header path — but the ids come from
-        # OnlineRenderer here, not the fused Rust select).
+        # frpc (decision 3 = RPC token fetch, NOT payload-ride): the prompt ids do
+        # NOT ride the response/header. Stash the OnlineRenderer ids on THIS ingress
+        # replica keyed by x-request-id; the engine fetches them via a broadcast
+        # get_prompt_tokens RPC (only the replica that selected the request has
+        # them). The Rust selection service's pending_tokens is filled only by the
+        # fused select_chat, which the non-fused path never calls, so the stash
+        # must live in the router.
         if request_token_ids:
-            response["kv_prompt_ids"] = ",".join(map(str, request_token_ids))
+            from ray.llm._internal.serve.routing_policies.kv_aware.payload_forwarding import (  # noqa: E501
+                stash_ids,
+            )
+
+            stash_ids(request.headers.get("x-request-id"), request_token_ids)
         return response
 
     @router_app.get("/health")
@@ -233,6 +238,18 @@ class LLMRouter:
     # replica-sync plane; see inprocess_actor.build_inprocess_kv_router.
     async def on_lifecycle_events(self, batch):
         return await self._kv_router.on_lifecycle_events(batch)
+
+    async def get_prompt_tokens(self, request_id):
+        # frpc (decision 3): return the OnlineRenderer prompt ids this ingress
+        # replica stashed for request_id in route(), or None if the request was
+        # selected on a different replica. The engine broadcasts to all ingress
+        # replicas and takes the one non-None hit (per-replica stash, like kv6's
+        # per-replica Rust pending_tokens). Destructive: one fetch per request.
+        from ray.llm._internal.serve.routing_policies.kv_aware.payload_forwarding import (  # noqa: E501
+            pop_ids,
+        )
+
+        return pop_ids(request_id)
 
     async def _pick_replica(
         self,
