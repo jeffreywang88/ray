@@ -185,10 +185,14 @@ class KVRouterActor:
             )
             return
 
-        model_path = self._resolve_model_path()
+        # TASK_FINAL fbase (KVAwareRouter7 lineage): SELECTION-ONLY service — do
+        # NOT pass model_path, so the Rust service builds no fused ChatEncoder.
+        # Chat-template render + tokenization happen in the LLMRouter via vLLM's
+        # OnlineRenderer (kv_aware/tokenizer.py); select() / select_and_reserve()
+        # take explicit token_ids. (ffused is the fused counterpart = kv12.)
+        model_path = None
         svc_kwargs = dict(
             indexer_threads=self._indexer_threads,
-            model_path=model_path,
             fused_threads=self._fused_threads,
         )
         # KVAwareRouter5: bind a replica-sync listener so peer selectors can
@@ -468,22 +472,28 @@ class KVRouterActor:
                 "KV-aware routing is unavailable because ai-dynamo is not "
                 "installed in the deployment's environment."
             )
-        # ``select`` records this request's chosen worker, normalized prompt,
-        # effective prefill tokens, and expected output tokens in the selection
-        # service's in-flight cache, keyed by ``selection_id``. The matching
-        # ``on_request_added`` then books the reservation by that id alone, so
-        # the prompt is tokenized/hashed once here and never re-sent (see
-        # ``create_reservation`` there).
-        selection = await self._svc.select(
-            {
-                "model_name": _MODEL_NAME,
-                "tenant_id": _TENANT_ID,
-                "selection_id": request_id,
-                "token_ids": token_ids,
-                "allowed_worker_ids": allowed_worker_ids,
-                "expected_output_tokens": expected_output_tokens,
-            }
-        )
+        # TASK_FINAL fbase: NON-fused select over OnlineRenderer-computed token
+        # ids. With select-time booking (KV_SELECT_RESERVE) call the STANDALONE
+        # ``select_and_reserve`` pymethod (reservation_id = request_id) so load is
+        # booked BEFORE the route response returns — the stale-view herding fix,
+        # non-fused form (mirrors the fork's fused select_chat reserve branch, no
+        # ChatEncoder, no dynamo rebuild). ``on_request_added`` then treats the
+        # engine event as state-init only. Otherwise fall back to ``select`` and
+        # book on the added-event (flate arm / legacy).
+        req = {
+            "model_name": _MODEL_NAME,
+            "tenant_id": _TENANT_ID,
+            "selection_id": request_id,
+            "token_ids": token_ids,
+            "allowed_worker_ids": allowed_worker_ids,
+            "expected_output_tokens": expected_output_tokens,
+        }
+        if self._select_reserve:
+            req["reservation_id"] = request_id
+            selection = await self._svc.select_and_reserve(req)
+            self._pending_selects[request_id] = time.monotonic()
+        else:
+            selection = await self._svc.select(req)
         return {
             "worker_id": selection["worker_id"],
             "dp_rank": selection["dp_rank"],

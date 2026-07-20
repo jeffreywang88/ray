@@ -165,28 +165,26 @@ class LLMRouter:
                 "limit.",
                 body_truncated,
             )
-        # Chat bodies take the fused path: the raw body rides to the KV router
-        # actor, which renders the template + tokenizes + selects in one Rust
-        # call, so token ids never enter Python. Non-chat routable bodies
-        # (string-prompt completions) keep the in-process tokenize path. A
-        # truncated or unparseable body has no routing payload, so fall back
-        # to token-less routing.
+        # KVAwareRouter7: tokenization + chat-template rendering happen HERE in the
+        # LLMRouter via vLLM's OnlineRenderer (the Tokenizer wrapper), NOT fused in
+        # the Rust SelectionService. So BOTH chat and completion routable bodies go
+        # through the in-process tokenizer to get prompt token ids, and the selector
+        # does replica SELECTION ONLY (select_worker, given token_ids). A truncated
+        # or unparseable body has no routing payload, so fall back to token-less
+        # (load-balanced) routing.
         request_token_ids = None
         request_routing_body = None
         if self._tokenizer is not None and routing_payload is not None:
-            if getattr(routing_payload, "messages", None) is not None:
-                request_routing_body = body.decode("utf-8", "replace")
-            else:
-                from ray.llm._internal.serve.routing_policies.kv_aware.tokenizer import (
-                    TokenizeError,
-                )
+            from ray.llm._internal.serve.routing_policies.kv_aware.tokenizer import (
+                TokenizeError,
+            )
 
-                try:
-                    request_token_ids = await self._tokenizer.tokenize(
-                        vars(routing_payload)
-                    )
-                except TokenizeError as e:
-                    raise HTTPException(status_code=e.status_code, detail=e.message)
+            try:
+                request_token_ids = await self._tokenizer.tokenize(
+                    vars(routing_payload)
+                )
+            except TokenizeError as e:
+                raise HTTPException(status_code=e.status_code, detail=e.message)
         # HAProxy forwards the configured session header on the same name,
         # but use the same case-insensitive, separator-tolerant matcher as
         # proxy.py / ingress.py so a `-`/`_` rewrite anywhere in the path
@@ -210,22 +208,14 @@ class LLMRouter:
         except (RuntimeError, DeploymentUnavailableError) as e:
             raise HTTPException(status_code=503, detail=str(e))
         response = {"host": host, "port": port, "replica_id": replica_id}
-        # KVAwareRouter2 (payload token forwarding): if choose_replicas stashed the
-        # fused-select prompt ids for this request (same ingress process), ride them
-        # back in the route response as a compact CSV. HAProxy's Lua sets them as the
-        # x-kv-prompt-ids header on the request forwarded to the engine, so the engine
-        # skips re-tokenization WITHOUT a get_prompt_tokens RPC to the KVRouterActor.
-        from ray.llm._internal.serve.routing_policies.kv_aware.payload_forwarding import (
-            pop_ids,
-        )
-
-        req_id = next(
-            (v for k, v in request.headers.items() if k.lower() == "x-request-id"),
-            None,
-        )
-        ids = pop_ids(req_id)
-        if ids:
-            response["kv_prompt_ids"] = ",".join(map(str, ids))
+        # KVAwareRouter7 (payload token forwarding): the LLMRouter already tokenized
+        # this request via OnlineRenderer, so ride those prompt ids back in the route
+        # response as a compact CSV. HAProxy's Lua sets them as the x-kv-prompt-ids
+        # header on the request forwarded to the engine, so the engine skips
+        # re-tokenization (kv5-style header path — but the ids come from
+        # OnlineRenderer here, not the fused Rust select).
+        if request_token_ids:
+            response["kv_prompt_ids"] = ",".join(map(str, request_token_ids))
         return response
 
     @router_app.get("/health")
