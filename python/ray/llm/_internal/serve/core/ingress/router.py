@@ -123,23 +123,13 @@ class LLMRouter:
         # A non-None llm_config signals pre-routing tokenization, which the
         # builder binds only for a KV-aware request router.
         if llm_config is not None:
-            # KVAwareRouter4/5: instantiate the KVRouterActor as a plain in-process
-            # object and register it in the process global BEFORE self._handle._init()
-            # below. _init() subscribes the handle's request router to LongPoll; a
-            # DEPLOYMENT_TARGETS callback can then initialize the KVAwareRouter, which
-            # reads this global — so it must be set first, or that init falls back to
-            # the (now-absent) named-actor lookup and errors. choose_replicas (same
-            # process) selects locally; on_lifecycle_events delegates to it.
-            # server.deployment_id is the tracked LLMServer id, which
-            # _start_replica_tracking needs (no deployment-actor context here).
-            from ray.llm._internal.serve.routing_policies.kv_aware.inprocess_actor import (  # noqa: E501
-                build_inprocess_kv_router,
-            )
-
-            self._kv_router = build_inprocess_kv_router(
-                llm_config, server.deployment_id
-            )
-
+            # TASK_FINAL factor (decision 1 = SEPARATE DEPLOYMENT ACTOR): the
+            # KVRouterActor is attached as a named Serve deployment actor in
+            # utils._maybe_setup_kv_aware_routing, NOT built in-process here. The
+            # LLMRouter still renders+tokenizes via OnlineRenderer;
+            # KVAwareRouter.initialize_state discovers the named actor and the
+            # select becomes a .remote() RPC (self._kv_router stays None; the
+            # engine calls the named actor directly for lifecycle).
             # Lazy import: this module pulls in vLLM's renderer;
             # keep it off the non-KV ingress import path.
             from ray.llm._internal.serve.routing_policies.kv_aware.tokenizer import (

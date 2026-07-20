@@ -81,19 +81,23 @@ class KVAwareRouter(RequestRouter):
             # Constructed synchronously in LLMRouter.__init__ (selection service +
             # replica tracking), so it is ready by the time requests route.
             return
-        # In-process only (kv4/kv5): the actor lives in the LLMRouter ingress
-        # replica and is the sole router serving direct-stream traffic. Other
-        # processes holding an LLMServer handle (the proxy's fallback router) have
-        # no in-process actor and never route data-plane traffic, so degrade to
-        # load-balanced selection instead of raising on every LongPoll init.
+        # TASK_FINAL factor (decision 1 = SEPARATE DEPLOYMENT ACTOR): no in-process
+        # actor in this process, so discover the named KVRouterActor deployment
+        # actor and RPC it (kv1/kv2/kv3 form). One actor owns the load view;
+        # choose_replicas takes the .remote() branch. Degrade only if the actor is
+        # genuinely absent (e.g. the proxy's fallback router before attach).
         self._kv_router_inprocess = False
-        self._kv_router_actor = None
-        logger.warning(
-            "No in-process KVRouterActor in this process (%s); KVAwareRouter "
-            "degrades to load-balanced selection here. Expected for the proxy's "
-            "fallback router; the LLMRouter ingress replica owns the real actor.",
-            self._deployment_id,
-        )
+        try:
+            self._kv_router_actor = self._discover_kv_router_actor()
+            ray.get(self._kv_router_actor.ready.remote())
+        except Exception as e:
+            self._kv_router_actor = None
+            logger.warning(
+                "KVRouterActor for %s not found; KVAwareRouter degrades to "
+                "load-balanced selection here: %s",
+                self._deployment_id,
+                e,
+            )
 
     def _discover_kv_router_actor(self) -> ActorHandle:
         """Handle to this deployment's ``KVRouterActor`` by its Serve-scoped name."""

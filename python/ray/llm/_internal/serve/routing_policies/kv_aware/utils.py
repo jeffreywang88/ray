@@ -2,7 +2,17 @@
 
 import logging
 
+import ray
 from ray.llm._internal.serve.core.configs.llm_config import LLMConfig
+from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
+    DEFAULT_KV_INDEXER_THREADS,
+    KV_FUSED_THREADS_KEY,
+    KV_INDEXER_THREADS_KEY,
+)
+from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_actor import (
+    KV_ROUTER_ACTOR_NAME,
+    KVRouterActor,
+)
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_router import (
     is_kv_aware,
 )
@@ -10,6 +20,7 @@ from ray.llm._internal.serve.routing_policies.kv_aware.vllm.kv_events import (
     configure_kv_events_for_kv_routing,
 )
 from ray.serve._private.constants import SERVE_LOGGER_NAME
+from ray.serve.config import DeploymentActorConfig
 
 logger = logging.getLogger(SERVE_LOGGER_NAME)
 
@@ -39,9 +50,36 @@ def _maybe_setup_kv_aware_routing(
         "request_router_config"
     ]
 
-    # KVAwareRouter4/5: the KVRouterActor is NOT attached as a separate deployment
-    # actor. It is instantiated in-process in the LLMRouter ingress replica
-    # (see core/ingress/router.py + kv_aware/inprocess_actor.py) so the
-    # per-request select is a local call, not an actor RPC hop. Only the KV
-    # events wiring (which feeds the in-process actor's radix tree) is kept.
+    # TASK_FINAL factor (decision 1 = SEPARATE DEPLOYMENT ACTOR): revert the kv4
+    # in-process consolidation — attach the KVRouterActor as a named Serve
+    # deployment actor (one instance owns the load view, so NO replica_sync and
+    # NO serve_deployment_id; the deployment-actor context supplies the tracked
+    # id). Everything else stays fbase: the LLMRouter still renders+tokenizes via
+    # OnlineRenderer and rides ids; the select becomes a .remote() RPC to this
+    # actor; lifecycle events go to it by name. select_reserve carries the
+    # select-time booking through.
+    deployment_options["deployment_actors"] = [
+        *deployment_options.get("deployment_actors", []),
+        DeploymentActorConfig(
+            name=KV_ROUTER_ACTOR_NAME,
+            actor_class=ray.remote(KVRouterActor),
+            actor_options={"num_cpus": 0},
+            init_kwargs={
+                "indexer_threads": llm_config.experimental_configs.get(
+                    KV_INDEXER_THREADS_KEY, DEFAULT_KV_INDEXER_THREADS
+                ),
+                "model_source": (
+                    llm_config.model_loading_config.model_source
+                    if isinstance(llm_config.model_loading_config.model_source, str)
+                    else None
+                ),
+                "fused_threads": llm_config.experimental_configs.get(
+                    KV_FUSED_THREADS_KEY
+                ),
+                "select_reserve": bool(
+                    llm_config.experimental_configs.get("KV_SELECT_RESERVE")
+                ),
+            },
+        ),
+    ]
     configure_kv_events_for_kv_routing(llm_config)

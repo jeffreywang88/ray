@@ -185,15 +185,16 @@ def enable_token_tracking(
         def _resolve_lifecycle_forwarder(self) -> Optional[LifecycleEventForwarder]:
             if self._lifecycle_forwarder is None:
                 try:
-                    # KVAwareRouter4/5: the KVRouterActor lives in-process in the
-                    # LLMRouter, so forward lifecycle events to its deployment
-                    # handle method rather than a named KVRouterActor. A
-                    # DeploymentHandle supports handle.on_lifecycle_events.remote().
-                    from ray.llm._internal.serve.routing_policies.kv_aware.inprocess_actor import (  # noqa: E501
-                        get_llm_router_handle,
+                    # TASK_FINAL factor (decision 1 = SEPARATE DEPLOYMENT ACTOR):
+                    # the KVRouterActor is a named Serve deployment actor, so the
+                    # engine forwards lifecycle events to it BY NAME (kv1/kv2 form),
+                    # not to the LLMRouter handle. on_lifecycle_events is a method
+                    # on the named actor.
+                    from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_actor import (  # noqa: E501
+                        KV_ROUTER_ACTOR_NAME,
                     )
 
-                    actor = get_llm_router_handle()
+                    actor = serve.get_deployment_actor(KV_ROUTER_ACTOR_NAME)
                     worker_id = get_worker_id(
                         serve.get_replica_context().replica_id.unique_id
                     )
