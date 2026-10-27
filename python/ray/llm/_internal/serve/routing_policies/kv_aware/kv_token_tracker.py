@@ -11,7 +11,13 @@ import ray
 from ray import serve
 from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
     DEFAULT_KV_INDEXER_THREADS,
+    DEFAULT_KV_LIFECYCLE_PORT_BASE,
+    DEFAULT_KV_REPLICA_SYNC_PORT_BASE,
     KV_INDEXER_THREADS_KEY,
+    KV_LIFECYCLE_PORT_BASE_KEY,
+    KV_REPLICA_SYNC_KEY,
+    KV_REPLICA_SYNC_METADATA_KEY,
+    KV_REPLICA_SYNC_PORT_BASE_KEY,
     LIFECYCLE_EVENT_BROADCAST_TIMEOUT_S,
     REQUEST_TRACKING_TTL_S,
 )
@@ -190,10 +196,28 @@ class KVTokenTracker:
         indexer_threads: int = DEFAULT_KV_INDEXER_THREADS,
         serve_deployment_id: Optional[Any] = None,
         ingress_replica_rank: Optional[int] = None,
+        replica_sync_port: Optional[int] = None,
+        router_deployment_id: Optional[Any] = None,
     ):
         # The tracked LLMServer deployment id, passed in by the LLMRouter
         # that builds the tracker.
         self._serve_deployment_id = serve_deployment_id
+        # Replica-mesh mode: the selection service replicates its own
+        # admissions, prefill completions and frees to the peer LLMRouter
+        # replicas' services, discovered from this LLMRouter deployment's targets.
+        self._replica_sync_port = replica_sync_port
+        self._router_deployment_id = router_deployment_id
+        # Peer router replica unique id -> replica-mesh endpoint.
+        self._replica_sync_peers: Dict[str, str] = {}
+        self._own_replica_unique_id: Optional[str] = None
+        try:
+            self._own_replica_unique_id = (
+                serve.get_replica_context().replica_id.unique_id
+            )
+        except RayServeException:
+            pass
+        self._lifecycle_receiver = None
+        self._lifecycle_endpoint: Optional[str] = None
         self._ingress_replica_rank = ingress_replica_rank
         if self._ingress_replica_rank is None:
             try:
@@ -255,24 +279,34 @@ class KVTokenTracker:
             )
             return
 
-        self._svc = SelectionService(indexer_threads=self._indexer_threads)
+        self._svc = SelectionService(
+            indexer_threads=self._indexer_threads,
+            replica_sync_port=self._replica_sync_port,
+        )
         logger.info(
-            "Dynamo SelectionService created (indexer threads %d).",
+            "Dynamo SelectionService created (indexer threads %d, replica mesh "
+            "port %s).",
             self._indexer_threads,
+            self._replica_sync_port,
         )
 
     def _start_replica_tracking(self) -> None:
         """Subscribe to this deployment's running replicas via LongPollClient."""
         deployment_id = self._serve_deployment_id
         controller = ray.get_actor(SERVE_CONTROLLER_NAME, namespace=SERVE_NAMESPACE)
+        key_listeners = {
+            (
+                LongPollNamespace.DEPLOYMENT_TARGETS,
+                deployment_id,
+            ): self._on_deployment_targets,
+        }
+        if self._router_deployment_id is not None:
+            key_listeners[
+                (LongPollNamespace.DEPLOYMENT_TARGETS, self._router_deployment_id)
+            ] = self._on_router_targets
         self._long_poll_client = LongPollClient(
             controller,
-            {
-                (
-                    LongPollNamespace.DEPLOYMENT_TARGETS,
-                    deployment_id,
-                ): self._on_deployment_targets,
-            },
+            key_listeners,
             # Built inside the LLMRouter ingress replica's async __init__, so this
             # binds LongPoll callbacks to that event loop.
             call_in_event_loop=asyncio.get_running_loop(),
@@ -354,6 +388,73 @@ class KVTokenTracker:
                 len(removed),
                 len(self._replica_id_by_worker),
             )
+
+    @property
+    def replica_sync_enabled(self) -> bool:
+        return self._replica_sync_port is not None
+
+    @property
+    def lifecycle_endpoint(self) -> Optional[str]:
+        """Where engine replicas report lifecycle events of requests this
+        router selected; None unless replica-mesh mode is on."""
+        return self._lifecycle_endpoint
+
+    def replica_sync_routing_stats(self) -> Dict[str, Any]:
+        """Routing stats advertising this router's replica-mesh endpoint."""
+        if not self.replica_sync_enabled:
+            return {}
+        endpoint = f"tcp://{ray.util.get_node_ip_address()}:{self._replica_sync_port}"
+        return {KV_REPLICA_SYNC_METADATA_KEY: {"endpoint": endpoint}}
+
+    async def start_lifecycle_receiver(self, port: int) -> None:
+        """Receive the lifecycle events of requests this router selected."""
+        from ray.llm._internal.serve.routing_policies.kv_aware.lifecycle import (
+            LifecycleReceiver,
+        )
+
+        receiver = LifecycleReceiver(
+            bind_endpoint=f"tcp://*:{port}", handler=self.on_lifecycle_events
+        )
+        if await receiver.start():
+            self._lifecycle_receiver = receiver
+            self._lifecycle_endpoint = f"tcp://{ray.util.get_node_ip_address()}:{port}"
+
+    def _on_router_targets(self, target_info: DeploymentTargetInfo) -> None:
+        """LongPoll listener: keep the selection service's replica-mesh peers in
+        sync with the running LLMRouter replicas that advertise an endpoint."""
+        peers: Dict[str, str] = {}
+        for replica in target_info.running_replicas:
+            unique_id = replica.replica_id.unique_id
+            metadata = replica.routing_stats.get(KV_REPLICA_SYNC_METADATA_KEY)
+            if unique_id == self._own_replica_unique_id or not isinstance(
+                metadata, dict
+            ):
+                continue
+            if metadata.get("endpoint"):
+                peers[unique_id] = metadata["endpoint"]
+        if peers == self._replica_sync_peers or self._svc is None:
+            return
+        stale = {
+            endpoint
+            for unique_id, endpoint in self._replica_sync_peers.items()
+            if peers.get(unique_id) != endpoint
+        }
+        new = {
+            endpoint
+            for unique_id, endpoint in peers.items()
+            if self._replica_sync_peers.get(unique_id) != endpoint
+        }
+        self._replica_sync_peers = peers
+        for endpoint in stale:
+            self._schedule(self._svc.deregister_replica_peer(endpoint))
+        for endpoint in new:
+            self._schedule(self._svc.register_replica_peer(endpoint))
+        logger.info(
+            "KV replica mesh peers updated: +%d -%d, %d peer(s).",
+            len(new),
+            len(stale),
+            len(peers),
+        )
 
     def remove_worker(self, worker_id: int) -> None:
         """Evict a departed replica's worker and its KV blocks from the
@@ -704,6 +805,16 @@ def get_kv_token_tracker() -> Optional["KVTokenTracker"]:
 LLM_ROUTER_DEPLOYMENT_NAME = "LLMRouter"
 
 
+def get_lifecycle_port(llm_config: "LLMConfig") -> int:
+    """This LLMRouter replica's lifecycle-event port (base + node-local rank)."""
+    base = int(
+        llm_config.experimental_configs.get(
+            KV_LIFECYCLE_PORT_BASE_KEY, DEFAULT_KV_LIFECYCLE_PORT_BASE
+        )
+    )
+    return base + serve.get_replica_context().rank.local_rank
+
+
 def get_llm_router_handle():
     """Handle to the in-app LLMRouter deployment, for engine replicas to reach
     its ``on_lifecycle_events`` method. Resolved in the current Serve app.
@@ -719,11 +830,25 @@ def build_kv_token_tracker(
     so the same-process ``KVAwareRouter`` can reach it. Must be called from the
     ingress replica's event loop (the tracker binds a LongPollClient to it).
     """
+    experimental_configs = llm_config.experimental_configs
+    replica_sync_kwargs = {}
+    if experimental_configs.get(KV_REPLICA_SYNC_KEY):
+        context = serve.get_replica_context()
+        replica_sync_kwargs = {
+            "replica_sync_port": int(
+                experimental_configs.get(
+                    KV_REPLICA_SYNC_PORT_BASE_KEY, DEFAULT_KV_REPLICA_SYNC_PORT_BASE
+                )
+            )
+            + context.rank.local_rank,
+            "router_deployment_id": context.replica_id.deployment_id,
+        }
     tracker = KVTokenTracker(
-        indexer_threads=llm_config.experimental_configs.get(
+        indexer_threads=experimental_configs.get(
             KV_INDEXER_THREADS_KEY, DEFAULT_KV_INDEXER_THREADS
         ),
         serve_deployment_id=serve_deployment_id,
+        **replica_sync_kwargs,
     )
     set_kv_token_tracker(tracker)
     return tracker
