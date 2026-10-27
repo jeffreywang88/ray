@@ -59,3 +59,25 @@ REQUEST_TRACKING_TTL_S = 3600
 # Bound best-effort lifecycle broadcast delivery so one slow ingress replica
 # cannot stall an engine replica's whole lifecycle-event queue indefinitely.
 LIFECYCLE_EVENT_BROADCAST_TIMEOUT_S = 3
+
+# experimental_configs key: replicate token load among LLMRouter replicas through
+# Dynamo's selection-service replica mesh instead of Ray-RPC broadcasts. Each
+# router's SelectionService publishes its own admissions, prefill completions and
+# frees to its peers, and engine replicas report a request's lifecycle events
+# only to the router that selected it.
+KV_REPLICA_SYNC_KEY = "KV_REPLICA_SYNC"
+# experimental_configs keys overriding the per-node base ports of each LLMRouter
+# replica's replica-mesh PUB socket and lifecycle-event PULL socket. A router
+# binds base + its node-local rank.
+KV_REPLICA_SYNC_PORT_BASE_KEY = "KV_REPLICA_SYNC_PORT_BASE"
+DEFAULT_KV_REPLICA_SYNC_PORT_BASE = 9557
+KV_LIFECYCLE_PORT_BASE_KEY = "KV_LIFECYCLE_PORT_BASE"
+DEFAULT_KV_LIFECYCLE_PORT_BASE = 9757
+# routing_stats key under which each LLMRouter advertises its replica-mesh endpoint
+# to its peers.
+KV_REPLICA_SYNC_METADATA_KEY = "kv_replica_sync_metadata"
+# Router-owned header carrying the selecting router's lifecycle-event endpoint to
+# the engine replica, which reports the request's lifecycle events there.
+KV_LIFECYCLE_ENDPOINT_HEADER = (
+    SERVE_INGRESS_ROUTER_HEADER_PREFIX + "kv-lifecycle-endpoint"
+)

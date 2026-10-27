@@ -397,6 +397,132 @@ async def test_delayed_peer_broadcast_does_not_resurrect_completed_request():
                 await tracker._svc.delete_worker(worker_id)
 
 
+async def _register_engine_worker(tracker: KVTokenTracker, worker_id: int) -> None:
+    """Register one engine replica's KV-event endpoint with ``tracker``."""
+    tracker._register_block_size(16, "engine-replica-0")
+    await tracker._upsert_worker(
+        worker_id,
+        "engine-replica-0",
+        {
+            "endpoint": "tcp://127.0.0.1:59998",
+            "block_size": 16,
+            "max_num_batched_tokens": 8192,
+            "dp_rank": 0,
+        },
+    )
+
+
+class _PeerRecordingService:
+    """Selection-service stand-in recording replica-mesh peer changes."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def register_replica_peer(self, endpoint):
+        self.calls.append(("register", endpoint))
+        return True
+
+    async def deregister_replica_peer(self, endpoint):
+        self.calls.append(("deregister", endpoint))
+        return True
+
+
+def _router_targets(endpoints_by_id):
+    from ray.serve._private.common import (
+        DeploymentTargetInfo,
+        ReplicaID,
+        RunningReplicaInfo,
+    )
+
+    deployment_id = DeploymentID(name="LLMRouter", app_name="app")
+    return DeploymentTargetInfo(
+        is_available=True,
+        running_replicas=[
+            RunningReplicaInfo(
+                replica_id=ReplicaID(unique_id=uid, deployment_id=deployment_id),
+                node_id="node",
+                node_ip="10.0.0.1",
+                availability_zone="az",
+                actor_name=f"actor-{uid}",
+                max_ongoing_requests=1000,
+                routing_stats=(
+                    {"kv_replica_sync_metadata": {"endpoint": endpoint}}
+                    if endpoint
+                    else {}
+                ),
+            )
+            for uid, endpoint in endpoints_by_id.items()
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_router_targets_drive_replica_mesh_peers():
+    """Peers follow the LLMRouter replicas that advertise a mesh endpoint,
+    excluding this router itself."""
+    tracker = _NoLongPollTracker(ingress_replica_rank=0)
+    tracker._svc = _PeerRecordingService()
+    tracker._own_replica_unique_id = "self"
+
+    tracker._on_router_targets(
+        _router_targets({"self": "tcp://a:1", "b": "tcp://b:1", "c": None})
+    )
+    await asyncio.gather(*tracker._pending_tasks)
+    assert tracker._svc.calls == [("register", "tcp://b:1")]
+
+    # "b" restarts on a new endpoint and "c" starts advertising one.
+    tracker._svc.calls.clear()
+    tracker._on_router_targets(
+        _router_targets({"self": "tcp://a:1", "b": "tcp://b:2", "c": "tcp://c:1"})
+    )
+    await asyncio.gather(*tracker._pending_tasks)
+    assert sorted(tracker._svc.calls) == [
+        ("deregister", "tcp://b:1"),
+        ("register", "tcp://b:2"),
+        ("register", "tcp://c:1"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_replica_mesh_replicates_owner_load_to_peer():
+    """With replica-mesh replication the peer sees the owner's booking and its
+    release without any reservation broadcast or lifecycle event of its own."""
+    pytest.importorskip("dynamo.llm")
+    from ray._common.network_utils import find_free_port
+
+    worker_id = get_worker_id("engine-replica-0")
+    ports = [find_free_port(), find_free_port()]
+    owner = _NoLongPollTracker(ingress_replica_rank=0, replica_sync_port=ports[0])
+    peer = _NoLongPollTracker(ingress_replica_rank=1, replica_sync_port=ports[1])
+    trackers = (owner, peer)
+    try:
+        for tracker in trackers:
+            await _register_engine_worker(tracker, worker_id)
+        await owner._svc.register_replica_peer(f"tcp://127.0.0.1:{ports[1]}")
+        await peer._svc.register_replica_peer(f"tcp://127.0.0.1:{ports[0]}")
+        await asyncio.sleep(0.5)
+
+        await owner.select_worker("req-mesh", list(range(64)), [worker_id], 32)
+        await async_wait_for_condition(
+            lambda: _active_requests(peer, worker_id) == 1, timeout=10
+        )
+        assert "req-mesh" not in peer._requests
+
+        await owner.on_lifecycle_events(
+            [
+                ("on_prefill_complete", ("req-mesh",)),
+                ("on_request_completed", ("req-mesh",)),
+            ]
+        )
+        await async_wait_for_condition(
+            lambda: _active_requests(peer, worker_id) == 0, timeout=10
+        )
+    finally:
+        for tracker in trackers:
+            if tracker._svc is not None:
+                await tracker._svc.delete_worker(worker_id)
+
+
 # ---- LongPoll replica-membership tracking -----------------------------------
 
 
