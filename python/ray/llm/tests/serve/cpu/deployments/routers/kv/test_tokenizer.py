@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 import sys
@@ -21,6 +22,7 @@ from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
 )
 from ray.llm._internal.serve.routing_policies.kv_aware.vllm.tokenizer import (
     TokenizeError,
+    _run_inline,
     build_tokenize_request,
 )
 from ray.serve._private.constants import (
@@ -227,6 +229,22 @@ class TestBuildTokenizeRequest:
         request = build_tokenize_request(payload, request_path=request_path)
         for attr, value in expected.items():
             assert getattr(request, attr) == value
+
+
+class TestRunInline:
+    def test_returns_result_of_coroutine_that_never_suspends(self):
+        async def render():
+            return [1, 2]
+
+        assert _run_inline(render()) == [1, 2]
+
+    def test_rejects_coroutine_that_suspends(self):
+        # A future vLLM await must fail loudly, not hang a worker thread.
+        async def render():
+            await asyncio.sleep(0)
+
+        with pytest.raises(RuntimeError, match="suspended"):
+            _run_inline(render())
 
 
 class TestRoute:

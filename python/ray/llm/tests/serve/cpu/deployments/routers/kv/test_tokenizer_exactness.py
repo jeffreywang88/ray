@@ -9,14 +9,18 @@ parameter semantics (special-token defaults, ``add_generation_prompt``,
 ``chat_template_kwargs`` passthrough, untrusted-template refusal).
 """
 
+import asyncio
 import json
 import sys
+import threading
+import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from starlette.datastructures import Headers
 from transformers import AutoTokenizer
+from vllm import envs
 from vllm.entrypoints.anthropic.protocol import AnthropicMessagesRequest
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.renderers.inputs.preprocess import extract_prompt_components
@@ -349,20 +353,27 @@ class TestAnthropicMessagesExactness:
         )
         _, (prompt,) = await serving.online_renderer.render_chat(chat_request)
         expected_ids = serving._extract_prompt_components(prompt).token_ids
-        render = AsyncMock(wraps=tokenizer._renderer.render_chat)
-        monkeypatch.setattr(tokenizer._renderer, "render_chat", render)
+        # Count renders on the loop (probes) and in worker hops (requests).
+        renderer = tokenizer._renderer.renderer
+        render = MagicMock(wraps=renderer.render_chat)
+        render_async = AsyncMock(wraps=renderer.render_chat_async)
+        monkeypatch.setattr(renderer, "render_chat", render)
+        monkeypatch.setattr(renderer, "render_chat_async", render_async)
+
+        def render_count():
+            return render.call_count + render_async.await_count
 
         assert (
             await tokenizer.tokenize(body, request_path="/v1/messages") == expected_ids
         )
-        first_render_count = render.await_count
+        first_render_count = render_count()
         if effort != "auto":
             assert first_render_count == 1
         # The next request renders its prompt once, without repeating probes.
         assert (
             await tokenizer.tokenize(body, request_path="/v1/messages") == expected_ids
         )
-        assert render.await_count == first_render_count + 1
+        assert render_count() == first_render_count + 1
 
     async def test_resolved_template_matches_engine_conversion(
         self, anthropic_tokenizer
@@ -495,6 +506,115 @@ class TestAnthropicMessagesExactness:
         else:
             render.assert_awaited_once()
         assert store.pop("key") is None
+
+
+class TestOneHop:
+    """Text-only requests validate, render and tokenize in one worker hop."""
+
+    def _spy(self, monkeypatch, tokenizer):
+        renderer = tokenizer._renderer.renderer
+        threads = []
+        render_chat = renderer.render_chat
+
+        def render(*args, **kwargs):
+            threads.append(threading.current_thread())
+            return render_chat(*args, **kwargs)
+
+        render_async = AsyncMock(wraps=renderer.render_chat_async)
+        monkeypatch.setattr(renderer, "render_chat", render)
+        monkeypatch.setattr(renderer, "render_chat_async", render_async)
+        return threads, render_async
+
+    async def test_text_renders_off_the_loop(
+        self, monkeypatch, tokenizer, hf_tokenizer
+    ):
+        threads, render_async = self._spy(monkeypatch, tokenizer)
+        messages = [{"role": "user", "content": "What is the capital of France?"}]
+        ids = await tokenizer.tokenize(
+            {"model": "test-model", "messages": messages},
+            request_path="/v1/chat/completions",
+        )
+        assert ids == _hf_chat_ids(hf_tokenizer, messages)
+        assert threads and threads[0] is not threading.current_thread()
+        render_async.assert_not_awaited()
+
+    async def test_media_uses_the_async_path(self, monkeypatch, tokenizer):
+        threads, render_async = self._spy(monkeypatch, tokenizer)
+        image = {"type": "image_url", "image_url": {"url": "https://x.com/a.png"}}
+        with pytest.raises(TokenizeError) as e:
+            await tokenizer.tokenize(
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": [image]}],
+                },
+                request_path="/v1/chat/completions",
+            )
+        assert e.value.status_code == 400
+        assert not threads
+        render_async.assert_awaited_once()
+
+    async def test_concurrent_requests_match_sequential(self):
+        tokenizer = _build_tokenizer(
+            renderer_num_workers=4,
+            enable_auto_tool_choice=True,
+            tool_call_parser="hermes",
+        )
+        requests = (
+            [
+                (
+                    {
+                        "model": "test-model",
+                        "messages": [{"role": "user", "content": f"Hi {i}"}],
+                    },
+                    "/v1/chat/completions",
+                )
+                for i in range(16)
+            ]
+            + [
+                ({"model": "test-model", "prompt": f"Count to {i}"}, "/v1/completions")
+                for i in range(16)
+            ]
+            + [
+                (_claude_code_body(), "/v1/messages"),
+                (_EQUIVALENT_CHAT_BODY, "/v1/chat/completions"),
+            ]
+            * 8
+        )
+        expected = [
+            await tokenizer.tokenize(json.loads(json.dumps(p)), request_path=path)
+            for p, path in requests
+        ]
+        for _ in range(3):
+            got = await asyncio.gather(
+                *(
+                    tokenizer.tokenize(json.loads(json.dumps(p)), request_path=path)
+                    for p, path in requests
+                )
+            )
+            assert got == expected
+
+    async def test_render_timeout_replaces_the_pool(self, monkeypatch):
+        tokenizer = _build_tokenizer()
+        renderer = tokenizer._renderer.renderer
+        render_chat = renderer.render_chat
+
+        def slow_render(*args, **kwargs):
+            time.sleep(0.5)
+            return render_chat(*args, **kwargs)
+
+        monkeypatch.setattr(envs, "VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT", 0.05)
+        monkeypatch.setattr(renderer, "render_chat", slow_render)
+        replace = MagicMock(wraps=renderer._replace_executor)
+        monkeypatch.setattr(renderer, "_replace_executor", replace)
+        with pytest.raises(TimeoutError):
+            await tokenizer.tokenize(
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                request_path="/v1/chat/completions",
+            )
+        replace.assert_called_once()
 
 
 if __name__ == "__main__":
