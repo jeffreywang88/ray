@@ -4,15 +4,13 @@ from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine.async_llm import AsyncLLM
 
-from ray import serve
 from ray.llm._internal.serve.observability.logging import get_logger
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_token_tracker import (
     get_llm_router_handle,
-    get_worker_id,
 )
 from ray.llm._internal.serve.routing_policies.kv_aware.lifecycle import (
     LifecycleEventForwarder,
-    get_request_lifecycle_endpoint,
+    get_request_lifecycle_owner,
 )
 from ray.llm._internal.serve.utils.server_utils import get_serve_request_id
 
@@ -26,14 +24,13 @@ class RequestTokenTracker:
         self,
         forwarder: LifecycleEventForwarder,
         request_id: str,
+        owner: str,
         report_decode_progress: bool = False,
-        owner_endpoint: Optional[str] = None,
     ):
         self._forwarder = forwarder
         self._request_id = request_id
-        # Lifecycle endpoint of the LLMRouter that selected this replica, when
-        # load replicates over the replica mesh; None broadcasts to all routers.
-        self._owner_endpoint = owner_endpoint
+        # Replica id of the LLMRouter that selected this replica.
+        self._owner = owner
         self._cumulative = 0
         self._prefill_marked = False
         self._finished = False
@@ -54,11 +51,11 @@ class RequestTokenTracker:
             # The first output token signals prefill completion.
             self._prefill_marked = True
             self._forwarder.report_to(
-                self._owner_endpoint, "on_prefill_complete", self._request_id
+                self._owner, "on_prefill_complete", self._request_id
             )
         if self._report_decode_progress:
             self._forwarder.report_to(
-                self._owner_endpoint,
+                self._owner,
                 "on_decode_progress",
                 self._request_id,
                 self._cumulative,
@@ -69,7 +66,7 @@ class RequestTokenTracker:
         if not self._finished:
             self._finished = True
             self._forwarder.report_to(
-                self._owner_endpoint, "on_request_completed", self._request_id
+                self._owner, "on_request_completed", self._request_id
             )
 
 
@@ -86,14 +83,10 @@ def enable_token_tracking(
         def _resolve_lifecycle_forwarder(self) -> Optional[LifecycleEventForwarder]:
             if self._lifecycle_forwarder is None:
                 try:
-                    # The KVTokenTracker lives inside the LLMRouter, so
-                    # forward lifecycle events to its deployment handle method.
-                    handle = get_llm_router_handle()
-                    worker_id = get_worker_id(
-                        serve.get_replica_context().replica_id.unique_id
-                    )
+                    # The KVTokenTracker lives inside the LLMRouter, so forward
+                    # lifecycle events to its deployment handle method.
                     self._lifecycle_forwarder = LifecycleEventForwarder(
-                        handle, worker_id
+                        get_llm_router_handle()
                     )
                 except Exception as e:
                     # Warn once: resolution is retried per request until it succeeds.
@@ -111,11 +104,16 @@ def enable_token_tracking(
             stream = super().generate(
                 prompt, sampling_params, request_id, *args, **kwargs
             )
-            forwarder = self._resolve_lifecycle_forwarder()
+            # Only the router that selected this replica booked load for the
+            # request, and only its route names an owner.
+            owner = get_request_lifecycle_owner()
             # CUMULATIVE repeats output-so-far per chunk; our accounting sums
             # deltas, so skip it rather than over-count. vLLM's OpenAI layer only
             # uses DELTA/FINAL_ONLY (*Request.to_sampling_params):
             # https://github.com/vllm-project/vllm/tree/main/vllm/entrypoints/openai
+            forwarder = (
+                self._resolve_lifecycle_forwarder() if owner is not None else None
+            )
             if forwarder is None or (
                 sampling_params.output_kind == RequestOutputKind.CUMULATIVE
             ):
@@ -127,8 +125,8 @@ def enable_token_tracking(
             tracker = RequestTokenTracker(
                 forwarder,
                 lifecycle_request_id,
+                owner,
                 report_decode_progress=self._report_decode_progress,
-                owner_endpoint=get_request_lifecycle_endpoint(),
             )
             try:
                 async for output in stream:

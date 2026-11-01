@@ -10,7 +10,7 @@ from ray import serve
 from ray.llm._internal.common.utils.lora_utils import get_base_model_id
 from ray.llm._internal.serve.observability.logging import get_logger
 from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
-    KV_LIFECYCLE_ENDPOINT_HEADER,
+    KV_LIFECYCLE_OWNER_HEADER,
     KV_TOKEN_KEY_HEADER,
     KV_TOKEN_METADATA_KEY,
     REQUEST_TOKEN_IDS_KWARG,
@@ -137,6 +137,7 @@ class LLMRouter:
     _warned_no_token_endpoint: bool = False
     _base_model_id: Optional[str] = None
     _kv_token_tracker = None
+    _lifecycle_owner: Optional[str] = None
 
     async def __init__(
         self,
@@ -159,23 +160,17 @@ class LLMRouter:
             # tracked LLMServer deployment.
             from ray.llm._internal.serve.routing_policies.kv_aware.kv_token_tracker import (  # noqa: E501
                 build_kv_token_tracker,
-                get_lifecycle_port,
-                get_llm_router_handle,
             )
 
             self._kv_token_tracker = build_kv_token_tracker(
                 llm_config, server.deployment_id
             )
-            if self._kv_token_tracker.replica_sync_enabled:
-                # Peers learn this router's load from its selection service over
-                # the replica mesh; engines report lifecycle events here.
-                await self._kv_token_tracker.start_lifecycle_receiver(
-                    get_lifecycle_port(llm_config)
-                )
-            else:
-                self._kv_token_tracker.start_reservation_broadcast(
-                    get_llm_router_handle()
-                )
+            # Peers learn this router's load from its selection service over
+            # the replica mesh; engines report the lifecycle events of requests
+            # this replica selected back to it by replica id.
+            self._lifecycle_owner = (
+                serve.get_replica_context().replica_id.to_full_id_str()
+            )
             # Lazy import: this module pulls in vLLM's renderer;
             # keep it off the non-KV ingress import path.
             from ray.llm._internal.serve.routing_policies.kv_aware.vllm.tokenizer import (  # noqa: E501
@@ -266,13 +261,8 @@ class LLMRouter:
             )
             if token_key:
                 request_headers[KV_TOKEN_KEY_HEADER] = token_key
-        lifecycle_endpoint = (
-            self._kv_token_tracker.lifecycle_endpoint
-            if self._kv_token_tracker is not None
-            else None
-        )
-        if lifecycle_endpoint:
-            request_headers[KV_LIFECYCLE_ENDPOINT_HEADER] = lifecycle_endpoint
+        if self._lifecycle_owner is not None:
+            request_headers[KV_LIFECYCLE_OWNER_HEADER] = self._lifecycle_owner
         if request_headers:
             response[
                 RAY_SERVE_INGRESS_REQUEST_ROUTER_OPT_HEADERS_FIELD
@@ -313,9 +303,10 @@ class LLMRouter:
     async def on_lifecycle_events(self, batch):
         """Engine-facing intake for request lifecycle events.
 
-        Engine replicas broadcast each batch to every LLMRouter replica to
-        book request load; this applies it to the KVTokenTracker on this
-        ingress replica's event loop.
+        Engine replicas send each batch to the LLMRouter replica that selected
+        the batch's requests; this applies it to the KVTokenTracker on this
+        ingress replica's event loop, whose selection service replicates the
+        change to its peers.
         """
         return await self._kv_token_tracker.on_lifecycle_events(batch)
 
@@ -325,10 +316,6 @@ class LLMRouter:
         if self._kv_token_tracker is None:
             return {}
         return self._kv_token_tracker.replica_sync_routing_stats()
-
-    async def on_reservations_created(self, batch):
-        """Ingress-facing intake for already-selected reservation bookings."""
-        return await self._kv_token_tracker.on_reservations_created(batch)
 
     def _push_prompt_tokens(
         self,
