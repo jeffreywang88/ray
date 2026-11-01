@@ -7,14 +7,15 @@ routers' selection services can release the load they booked for a request.
   ``LifecycleOwnerMiddleware`` exposes to the engine as the request's owner.
 - ``LifecycleEventForwarder`` calls that owner's ``on_lifecycle_events`` over a
   Serve handle pinned to it. The owner's selection service replicates the
-  change to its peers over Dynamo's replica mesh.
+  change to its peers over Dynamo's replica mesh. Events with no owner are
+  broadcast to every router replica.
 
 This module stays free of engine imports so any engine integration can use it.
 """
 
 import asyncio
 import contextvars
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ray.llm._internal.serve.observability.logging import get_logger
 from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
@@ -71,7 +72,8 @@ class LifecycleEventForwarder:
     One delivery task per owner replica drains that owner's queue over a handle
     pinned to the replica, awaiting one call at a time so the owner applies
     events in the order they were reported. Events that pile up during a call
-    are sent together in the next one.
+    are sent together in the next one. Events for owner ``None`` are broadcast
+    to every router replica the same way.
     """
 
     def __init__(self, handle: DeploymentHandle):
@@ -79,10 +81,10 @@ class LifecycleEventForwarder:
             # Pinned handles share this handle's router and its replica set.
             handle._init()
         self._handle = handle
-        self._queues: Dict[str, asyncio.Queue] = {}
-        self._tasks: Dict[str, asyncio.Task] = {}
+        self._queues: Dict[Optional[str], asyncio.Queue] = {}
+        self._tasks: Dict[Optional[str], asyncio.Task] = {}
 
-    def report_to(self, owner: str, method_name: str, *args) -> None:
+    def report_to(self, owner: Optional[str], method_name: str, *args) -> None:
         queue = self._queues.get(owner)
         if queue is None:
             queue = self._queues[owner] = asyncio.Queue()
@@ -93,8 +95,33 @@ class LifecycleEventForwarder:
             )
         queue.put_nowait((method_name, args))
 
-    async def _deliver(self, owner: str, queue: asyncio.Queue) -> None:
-        handle = self._handle.options(replica_id=owner)
+    async def _send(
+        self, pinned: Optional[DeploymentHandle], batch: List[tuple]
+    ) -> None:
+        if pinned is not None:
+            await asyncio.wait_for(
+                pinned.on_lifecycle_events.remote(batch),
+                LIFECYCLE_EVENT_DELIVERY_TIMEOUT_S,
+            )
+            return
+        # return_exceptions so one failed replica cannot mask delivery to the
+        # rest; failures are logged and dropped.
+        results = await self._handle.broadcast(
+            "on_lifecycle_events", batch
+        ).results_async(
+            timeout_s=LIFECYCLE_EVENT_DELIVERY_TIMEOUT_S, return_exceptions=True
+        )
+        errors = [r for r in results if isinstance(r, Exception)]
+        if errors:
+            logger.warning(
+                "KV lifecycle events dropped on %d/%d router replicas: %s",
+                len(errors),
+                len(results),
+                errors[0],
+            )
+
+    async def _deliver(self, owner: Optional[str], queue: asyncio.Queue) -> None:
+        pinned = None if owner is None else self._handle.options(replica_id=owner)
         while True:
             # Wait for the next event, then drain whatever queued up behind it
             # into the same batch.
@@ -110,13 +137,11 @@ class LifecycleEventForwarder:
             while not queue.empty():
                 batch.append(queue.get_nowait())
             try:
-                await asyncio.wait_for(
-                    handle.on_lifecycle_events.remote(batch),
-                    LIFECYCLE_EVENT_DELIVERY_TIMEOUT_S,
-                )
+                await self._send(pinned, batch)
             except DeploymentUnavailableError:
-                # The owner replica is gone, and with it the load it booked, so
-                # drop its queue; a later event for it starts a new one.
+                # The owner replica is gone with the load it booked, and its peers
+                # drop their copies when it leaves the mesh, so drop its queue; a
+                # later event for it starts a new one.
                 logger.info(
                     "Dropping KV lifecycle events for departed router %s.", owner
                 )

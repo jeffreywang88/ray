@@ -24,12 +24,15 @@ class RequestTokenTracker:
         self,
         forwarder: LifecycleEventForwarder,
         request_id: str,
-        owner: str,
+        owner: Optional[str],
         report_decode_progress: bool = False,
     ):
         self._forwarder = forwarder
         self._request_id = request_id
-        # Replica id of the LLMRouter that selected this replica.
+        # Replica id of the LLMRouter that selected this replica. ``None`` when
+        # no router named itself, e.g. a request HAProxy served through its
+        # fallback after the router booked it: only the completion is then
+        # broadcast, so whichever router holds a booking for it releases it.
         self._owner = owner
         self._cumulative = 0
         self._prefill_marked = False
@@ -47,6 +50,8 @@ class RequestTokenTracker:
             # No new tokens this step (e.g. a finish-only chunk).
             return
         self._cumulative += step_tokens
+        if self._owner is None:
+            return
         if not self._prefill_marked:
             # The first output token signals prefill completion.
             self._prefill_marked = True
@@ -104,16 +109,11 @@ def enable_token_tracking(
             stream = super().generate(
                 prompt, sampling_params, request_id, *args, **kwargs
             )
-            # Only the router that selected this replica booked load for the
-            # request, and only its route names an owner.
-            owner = get_request_lifecycle_owner()
+            forwarder = self._resolve_lifecycle_forwarder()
             # CUMULATIVE repeats output-so-far per chunk; our accounting sums
             # deltas, so skip it rather than over-count. vLLM's OpenAI layer only
             # uses DELTA/FINAL_ONLY (*Request.to_sampling_params):
             # https://github.com/vllm-project/vllm/tree/main/vllm/entrypoints/openai
-            forwarder = (
-                self._resolve_lifecycle_forwarder() if owner is not None else None
-            )
             if forwarder is None or (
                 sampling_params.output_kind == RequestOutputKind.CUMULATIVE
             ):
@@ -125,7 +125,8 @@ def enable_token_tracking(
             tracker = RequestTokenTracker(
                 forwarder,
                 lifecycle_request_id,
-                owner,
+                # The router that selected this replica names itself in its route.
+                get_request_lifecycle_owner(),
                 report_decode_progress=self._report_decode_progress,
             )
             try:

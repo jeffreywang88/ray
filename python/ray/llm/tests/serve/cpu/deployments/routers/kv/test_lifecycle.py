@@ -35,7 +35,8 @@ class _Router:
 
 class _PinnedHandle:
     """LLMRouter DeploymentHandle stand-in: ``options(replica_id=...)`` pins
-    ``on_lifecycle_events`` calls to that router; a missing one is departed."""
+    ``on_lifecycle_events`` calls to that router; a missing one is departed.
+    ``broadcast`` calls every router."""
 
     is_initialized = True
 
@@ -52,6 +53,18 @@ class _PinnedHandle:
         if router is None:
             raise DeploymentUnavailableError(_DEPLOYMENT_ID)
         await router.on_lifecycle_events(batch)
+
+    def broadcast(self, method_name, batch):
+        routers = list(self._routers.values())
+
+        class _Response:
+            async def results_async(self, *, timeout_s, return_exceptions):
+                return await asyncio.gather(
+                    *(getattr(r, method_name)(batch) for r in routers),
+                    return_exceptions=return_exceptions,
+                )
+
+        return _Response()
 
 
 def _events(batches):
@@ -114,6 +127,20 @@ async def test_departed_owner_drops_its_queue():
         assert "gone" not in forwarder._queues
         assert "gone" not in forwarder._tasks
         assert _events(routers["live"].batches) == [("on_request_completed", ("r2",))]
+    finally:
+        forwarder.close()
+
+
+@pytest.mark.asyncio
+async def test_events_without_owner_are_broadcast():
+    """With no owner, every router receives the events, even when one fails."""
+    routers = {"a": _Router(), "b": _Router(fail=True), "c": _Router()}
+    forwarder = LifecycleEventForwarder(_PinnedHandle(routers))
+    try:
+        forwarder.report_to(None, "on_request_completed", "r1")
+        await forwarder.flush()
+        for name in ("a", "c"):
+            assert _events(routers[name].batches) == [("on_request_completed", ("r1",))]
     finally:
         forwarder.close()
 

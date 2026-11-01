@@ -219,7 +219,23 @@ class _PinnedHandle:
         return _PinnedHandle(self._targets, replica_id)
 
     async def remote(self, events):
-        method = self._targets[self._replica_id].on_lifecycle_events
+        return await self._call(self._targets[self._replica_id], events)
+
+    def broadcast(self, method_name, events):
+        handle = self
+
+        class _Response:
+            async def results_async(self, *, timeout_s, return_exceptions):
+                return await asyncio.gather(
+                    *(handle._call(t, events) for t in handle._targets.values()),
+                    return_exceptions=return_exceptions,
+                )
+
+        return _Response()
+
+    @staticmethod
+    async def _call(target, events):
+        method = target.on_lifecycle_events
         if hasattr(method, "remote"):
             return await method.remote(events)
         return await method(events)
@@ -227,14 +243,16 @@ class _PinnedHandle:
 
 @pytest.fixture
 def build_token_tracking_engine(monkeypatch):
-    def _build(script, target, report_decode_progress=False, **engine_kwargs):
+    def _build(
+        script, target, report_decode_progress=False, owner=OWNER, **engine_kwargs
+    ):
         monkeypatch.setattr(
             token_tracking,
             "get_llm_router_handle",
             lambda: _PinnedHandle({OWNER: target}),
         )
         monkeypatch.setattr(
-            token_tracking, "get_request_lifecycle_owner", lambda: OWNER
+            token_tracking, "get_request_lifecycle_owner", lambda: owner
         )
         return enable_token_tracking(
             MockAsyncLLM, report_decode_progress=report_decode_progress
@@ -540,19 +558,24 @@ def test_decorator_returns_subclass():
 
 
 @pytest.mark.asyncio
-async def test_passthrough_without_owner_endpoint():
-    """A request no KV router selected carries no owner endpoint, so the engine
-    is a pure pass-through."""
-    engine = enable_token_tracking(MockAsyncLLM)(delta_steps(2))
+async def test_without_owner_broadcasts_completion_only(build_token_tracking_engine):
+    """A request no router named (e.g. one HAProxy served through its fallback
+    after a router booked it) broadcasts only its completion, so whichever
+    router holds a booking for it releases it."""
+    actor = RecordingKVTokenTracker.remote(block_size=16)
+    engine = build_token_tracking_engine(
+        delta_steps(3), actor, report_decode_progress=True, owner=None
+    )
 
     outputs = await consume(
         engine.generate(
             PROMPT, SamplingParams(output_kind=RequestOutputKind.DELTA), "r"
         )
     )
+    await drain(engine)
 
-    assert len(outputs) == 2
-    assert engine._lifecycle_forwarder is None
+    assert len(outputs) == 3
+    assert ray.get(actor.get_event_log.remote()) == [("on_request_completed", ("r",))]
 
 
 @pytest.mark.asyncio
