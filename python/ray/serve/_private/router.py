@@ -1021,11 +1021,21 @@ class AsyncioRouter:
         wrapped.__cause__ = e
         return wrapped
 
-    def _resolve_pinned_replica(self, replica_id: str) -> Optional[RunningReplica]:
-        """Resolve a ``replica_id`` pin to its replica, bypassing the router."""
+    async def _resolve_pinned_replica(
+        self, replica_id: str
+    ) -> Optional[RunningReplica]:
+        """Resolve a ``replica_id`` pin to its replica, bypassing the router.
+
+        Like a routed request, waits while the handle knows no replicas (e.g.
+        before its first update), then fails fast if the replica isn't running.
+        """
         if not replica_id:
             return None
-        replica = self._active_request_router.curr_replicas.get(
+        request_router = self._active_request_router
+        while not request_router.curr_replicas:
+            request_router._replicas_updated_event.clear()
+            await request_router._replicas_updated_event.wait()
+        replica = request_router.curr_replicas.get(
             ReplicaID.from_full_id_str(replica_id)
         )
         if replica is None:
@@ -1050,7 +1060,9 @@ class AsyncioRouter:
 
             num_curr_replicas = len(self._active_request_router.curr_replicas)
             with self._metrics_manager.wrap_queued_request(is_retry, num_curr_replicas):
-                pinned_replica = self._resolve_pinned_replica(pr.metadata.replica_id)
+                pinned_replica = await self._resolve_pinned_replica(
+                    pr.metadata.replica_id
+                )
                 replica = (
                     pinned_replica
                     if pinned_replica is not None

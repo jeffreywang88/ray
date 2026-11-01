@@ -262,6 +262,7 @@ class FakeRequestRouter(RequestRouter):
         self._dropped_replicas: Set[ReplicaID] = set()
         self._use_queue_len_cache = use_queue_len_cache
         self._use_replica_queue_len_cache = use_queue_len_cache
+        self._lazily_constructed_replicas_updated_event = None
         self.on_request_routed_called = False
         self.routed_requests: List[
             Tuple[PendingRequest, ReplicaID, Optional[ReplicaResult]]
@@ -314,6 +315,7 @@ class FakeRequestRouter(RequestRouter):
 
     def set_replica_to_return(self, replica: FakeReplica):
         self._replica_to_return = replica
+        self._replicas_updated_event.set()
 
     def set_replica_to_return_on_retry(self, replica: FakeReplica):
         self._replica_to_return_on_retry = replica
@@ -913,6 +915,29 @@ class TestAssignRequest:
         )
         with pytest.raises(DeploymentUnavailableError):
             await router.assign_request(request_metadata)
+
+    async def test_replica_id_pin_waits_for_first_replicas(
+        self,
+        setup_router: Tuple[AsyncioRouter, FakeRequestRouter],
+    ):
+        """A pin on a handle that knows no replicas yet waits for them instead
+        of failing."""
+        router, fake_request_router = setup_router
+        pinned_id = ReplicaID(
+            unique_id="pinned", deployment_id=DeploymentID(name="test")
+        )
+        request_metadata = RequestMetadata(
+            request_id="test-request-1",
+            internal_request_id="test-internal-request-1",
+            replica_id=pinned_id.to_full_id_str(),
+        )
+        assign = asyncio.ensure_future(router.assign_request(request_metadata))
+        await asyncio.sleep(0.1)
+        assert not assign.done()
+
+        fake_request_router.set_replica_to_return(FakeReplica(pinned_id))
+        replica_result = await asyncio.wait_for(assign, timeout=5)
+        assert replica_result._replica_id == pinned_id
 
     @pytest.mark.parametrize(
         "setup_router",
