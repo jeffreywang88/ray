@@ -6,32 +6,31 @@ import sys
 import pytest
 
 from ray._common.network_utils import find_free_port
-from ray.llm._internal.serve.routing_policies.kv_aware import token_channel
 from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
-    KV_LIFECYCLE_ENDPOINT_HEADER,
+    KV_LIFECYCLE_OWNER_HEADER,
 )
 from ray.llm._internal.serve.routing_policies.kv_aware.lifecycle import (
-    LifecycleEndpointMiddleware,
     LifecycleEventForwarder,
+    LifecycleOwnerMiddleware,
     LifecycleReceiver,
     decode_lifecycle_events,
     encode_lifecycle_events,
-    get_request_lifecycle_endpoint,
+    get_request_lifecycle_owner,
 )
 
 
-class _BroadcastRecorder:
-    """DeploymentHandle stand-in recording broadcast lifecycle batches."""
+class _BroadcastHandle:
+    """LLMRouter DeploymentHandle stand-in recording broadcast batches."""
 
     def __init__(self):
         self.batches = []
 
     def broadcast(self, method_name, batch):
-        recorder = self
+        handle = self
 
         class _Response:
-            async def results_async(self, *, timeout_s=None, return_exceptions=False):
-                recorder.batches.append((method_name, list(batch)))
+            async def results_async(self, *, timeout_s, return_exceptions):
+                handle.batches.append((method_name, list(batch)))
                 return [None]
 
         return _Response()
@@ -49,11 +48,7 @@ def test_events_round_trip():
     assert decode_lifecycle_events(encode_lifecycle_events(events)) == events
 
 
-@pytest.mark.asyncio
-async def test_report_to_delivers_to_owner_in_order():
-    """Events for one owner arrive at its receiver in report order, without a
-    Serve broadcast."""
-    endpoint = f"tcp://127.0.0.1:{find_free_port()}"
+async def _start_receiver(endpoint):
     received = []
 
     async def handler(events):
@@ -61,22 +56,30 @@ async def test_report_to_delivers_to_owner_in_order():
 
     receiver = LifecycleReceiver(bind_endpoint=endpoint, handler=handler)
     assert await receiver.start()
-    handle = _BroadcastRecorder()
-    forwarder = LifecycleEventForwarder(handle, worker_id=1)
-    try:
-        # The PUSH socket connects in the background; until it does, a report
-        # falls back to the broadcast path.
-        forwarder._sender = token_channel.TokenSender()
-        forwarder._sender.connect([endpoint])
-        await asyncio.sleep(0.5)
+    return receiver, received
 
-        forwarder.report_to(endpoint, "on_prefill_complete", "r1")
-        forwarder.report_to(endpoint, "on_request_completed", "r1")
-        await _wait_for(lambda: len(received) == 2)
-        assert received == [
-            ("on_prefill_complete", ("r1",)),
-            ("on_request_completed", ("r1",)),
-        ]
+
+_EVENTS = [
+    ("on_prefill_complete", ("r1",)),
+    ("on_decode_progress", ("r1", 32)),
+    ("on_request_completed", ("r1",)),
+]
+
+
+@pytest.mark.asyncio
+async def test_report_to_delivers_to_owner_in_order():
+    """Events for one owner arrive at its receiver in report order, including
+    those reported before the PUSH socket finished connecting, without a
+    broadcast."""
+    endpoint = f"tcp://127.0.0.1:{find_free_port()}"
+    receiver, received = await _start_receiver(endpoint)
+    handle = _BroadcastHandle()
+    forwarder = LifecycleEventForwarder(handle)
+    try:
+        for name, args in _EVENTS:
+            forwarder.report_to(endpoint, name, *args)
+        await _wait_for(lambda: len(received) == len(_EVENTS))
+        assert received == _EVENTS
         assert handle.batches == []
     finally:
         forwarder.close()
@@ -84,11 +87,33 @@ async def test_report_to_delivers_to_owner_in_order():
 
 
 @pytest.mark.asyncio
-async def test_report_to_without_owner_broadcasts():
-    handle = _BroadcastRecorder()
-    forwarder = LifecycleEventForwarder(handle, worker_id=1)
+async def test_report_to_queues_until_owner_listens():
+    """Events reported before the owner's receiver binds are delivered once it
+    does, rather than dropped."""
+    endpoint = f"tcp://127.0.0.1:{find_free_port()}"
+    forwarder = LifecycleEventForwarder(_BroadcastHandle())
+    receiver = None
     try:
-        forwarder.report_to(None, "on_request_completed", "r1")
+        for name, args in _EVENTS:
+            forwarder.report_to(endpoint, name, *args)
+        receiver, received = await _start_receiver(endpoint)
+        await _wait_for(lambda: len(received) == len(_EVENTS))
+        assert received == _EVENTS
+    finally:
+        forwarder.close()
+        if receiver is not None:
+            await receiver.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", [None, "not-an-endpoint"])
+async def test_events_without_a_reachable_owner_are_broadcast(owner):
+    """With no owner, or one whose push cannot be queued, events go to every
+    router replica."""
+    handle = _BroadcastHandle()
+    forwarder = LifecycleEventForwarder(handle)
+    try:
+        forwarder.report_to(owner, "on_request_completed", "r1")
         await forwarder.flush()
         assert handle.batches == [
             ("on_lifecycle_events", [("on_request_completed", ("r1",))])
@@ -98,20 +123,20 @@ async def test_report_to_without_owner_broadcasts():
 
 
 @pytest.mark.asyncio
-async def test_middleware_exposes_owner_endpoint_to_the_request():
+async def test_middleware_exposes_owner_to_the_request():
     seen = []
 
     async def app(scope, receive, send):
-        seen.append(get_request_lifecycle_endpoint())
+        seen.append(get_request_lifecycle_owner())
 
-    middleware = LifecycleEndpointMiddleware(app)
-    header = KV_LIFECYCLE_ENDPOINT_HEADER.encode()
+    middleware = LifecycleOwnerMiddleware(app)
+    header = KV_LIFECYCLE_OWNER_HEADER.encode()
     await middleware(
         {"type": "http", "headers": [(header, b"tcp://10.0.0.1:9757")]}, None, None
     )
     await middleware({"type": "http", "headers": []}, None, None)
     assert seen == ["tcp://10.0.0.1:9757", None]
-    assert get_request_lifecycle_endpoint() is None
+    assert get_request_lifecycle_owner() is None
 
 
 if __name__ == "__main__":

@@ -51,33 +51,30 @@ DEFAULT_KV_INDEXER_THREADS = 4
 # events missed before its SUB connected.
 DEFAULT_KV_EVENTS_REPLAY_PORT_OFFSET = 1000
 
-# TTL for a request's lifecycle tracking on the KV router actor. A live
-# replica whose completion event was lost (e.g. a batch dropped on a
-# transient actor outage) would otherwise leave its entry tracked forever.
+# TTL for a request's lifecycle tracking on the KV router. A live replica
+# whose completion event was lost (e.g. a call dropped on a transient actor
+# outage) would otherwise leave its entry tracked forever.
 REQUEST_TRACKING_TTL_S = 3600
 
-# Bound best-effort lifecycle broadcast delivery so one slow ingress replica
-# cannot stall an engine replica's whole lifecycle-event queue indefinitely.
-LIFECYCLE_EVENT_BROADCAST_TIMEOUT_S = 3
+# Bound best-effort lifecycle delivery so one slow ingress replica cannot stall
+# an engine replica's lifecycle events for it indefinitely.
+LIFECYCLE_EVENT_DELIVERY_TIMEOUT_S = 3
 
-# experimental_configs key: replicate token load among LLMRouter replicas through
-# Dynamo's selection-service replica mesh instead of Ray-RPC broadcasts. Each
-# router's SelectionService publishes its own admissions, prefill completions and
-# frees to its peers, and engine replicas report a request's lifecycle events
-# only to the router that selected it.
-KV_REPLICA_SYNC_KEY = "KV_REPLICA_SYNC"
-# experimental_configs keys overriding the per-node base ports of each LLMRouter
-# replica's replica-mesh PUB socket and lifecycle-event PULL socket. A router
-# binds base + its node-local rank.
+# LLMRouter replicas replicate token load through Dynamo's selection-service
+# replica mesh. Each router's SelectionService publishes its own admissions,
+# prefill completions and frees to its peers, and engine replicas report a
+# request's lifecycle events only to the router that selected it.
+# Peers learn each router's replica-mesh endpoint from its routing stats, so a
+# router binds its PUB socket on any free port. This experimental_configs key
+# pins it to base + the router's node-local rank instead (e.g. for firewalls).
 KV_REPLICA_SYNC_PORT_BASE_KEY = "KV_REPLICA_SYNC_PORT_BASE"
-DEFAULT_KV_REPLICA_SYNC_PORT_BASE = 9557
-KV_LIFECYCLE_PORT_BASE_KEY = "KV_LIFECYCLE_PORT_BASE"
-DEFAULT_KV_LIFECYCLE_PORT_BASE = 9757
 # routing_stats key under which each LLMRouter advertises its replica-mesh endpoint
 # to its peers.
 KV_REPLICA_SYNC_METADATA_KEY = "kv_replica_sync_metadata"
-# Router-owned header carrying the selecting router's lifecycle-event endpoint to
-# the engine replica, which reports the request's lifecycle events there.
-KV_LIFECYCLE_ENDPOINT_HEADER = (
-    SERVE_INGRESS_ROUTER_HEADER_PREFIX + "kv-lifecycle-endpoint"
-)
+# Engines learn the selecting router's lifecycle endpoint from the request, so a
+# router binds its lifecycle-event PULL socket on any free port. This
+# experimental_configs key pins it to base + the router's node-local rank instead.
+KV_LIFECYCLE_PORT_BASE_KEY = "KV_LIFECYCLE_PORT_BASE"
+# Router-owned header carrying the selecting router's lifecycle endpoint to the
+# engine replica, which reports the request's lifecycle events there.
+KV_LIFECYCLE_OWNER_HEADER = SERVE_INGRESS_ROUTER_HEADER_PREFIX + "kv-lifecycle-owner"

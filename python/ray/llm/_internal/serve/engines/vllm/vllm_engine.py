@@ -63,7 +63,7 @@ from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_router import (
     is_kv_aware,
 )
 from ray.llm._internal.serve.routing_policies.kv_aware.lifecycle import (
-    LifecycleEndpointMiddleware,
+    LifecycleOwnerMiddleware,
 )
 from ray.llm._internal.serve.routing_policies.kv_aware.vllm.kv_events import (
     assign_replica_kv_events_endpoint,
@@ -392,7 +392,7 @@ class VLLMEngine(LLMEngine):
             # vLLM builds the middleware stack eagerly; clearing it makes Starlette
             # rebuild it with this middleware.
             app.middleware_stack = None
-            app.add_middleware(LifecycleEndpointMiddleware)
+            app.add_middleware(LifecycleOwnerMiddleware)
         return app
 
     async def start(self) -> None:

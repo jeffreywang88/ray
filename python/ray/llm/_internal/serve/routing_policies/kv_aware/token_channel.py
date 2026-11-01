@@ -56,16 +56,22 @@ def _new_socket(context: zmq.Context[_SocketT], socket_type: int) -> _SocketT:
 
 
 class TokenSender:
-    """Best-effort one-way prompt-token sender for selected LLMServer replicas."""
+    """Best-effort one-way prompt-token sender for selected LLMServer replicas.
+
+    With ``immediate`` (the default) a push fails until its socket connects;
+    otherwise payloads queue up to ``send_queue_limit`` while it connects.
+    """
 
     def __init__(
         self,
         *,
         send_queue_limit: int = KV_TOKEN_ZMQ_SEND_QUEUE_LIMIT,
         max_sockets: int = KV_TOKEN_ZMQ_MAX_SOCKETS,
+        immediate: bool = True,
     ):
         self._send_queue_limit = send_queue_limit
         self._max_sockets = max_sockets
+        self._immediate = immediate
         self._context = None
         self._sockets: OrderedDict[str, zmq.Socket] = OrderedDict()
 
@@ -129,7 +135,7 @@ class TokenSender:
         socket.setsockopt(zmq.SNDHWM, self._send_queue_limit)
         # Fail the send when the replica is not connected, instead of queueing
         # a payload it may never receive.
-        socket.setsockopt(zmq.IMMEDIATE, 1)
+        socket.setsockopt(zmq.IMMEDIATE, 1 if self._immediate else 0)
         try:
             socket.connect(endpoint)
         except zmq.ZMQError as e:

@@ -3,11 +3,13 @@
 Engine replicas report ``on_prefill_complete`` / ``on_request_completed`` so the
 routers' selection services can release the load they booked for a request.
 
-- ``LifecycleEventForwarder`` broadcasts each event to every LLMRouter replica
-  over a Serve handle. With replica-mesh replication enabled it instead pushes the
-  event to the router that selected the request (``report_to``), whose selection
-  service replicates the change to its peers.
-- ``LifecycleReceiver`` is that router's ZMQ PULL endpoint.
+- The router that selected a request names its lifecycle endpoint in a request
+  header, which ``LifecycleOwnerMiddleware`` exposes to the engine as the
+  request's owner.
+- ``LifecycleEventForwarder`` pushes each event to that owner over ZMQ. The
+  owner's selection service replicates the change to its peers over Dynamo's
+  replica mesh. Events with no owner are broadcast to every router replica.
+- ``LifecycleReceiver`` is the owner's ZMQ PULL endpoint.
 
 This module stays free of engine imports so any engine integration can use it.
 """
@@ -24,31 +26,32 @@ import zmq.asyncio as zmq_asyncio
 from ray.llm._internal.serve.observability.logging import get_logger
 from ray.llm._internal.serve.routing_policies.kv_aware import token_channel
 from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
-    KV_LIFECYCLE_ENDPOINT_HEADER,
+    KV_LIFECYCLE_OWNER_HEADER,
     KV_TOKEN_ZMQ_RECEIVE_QUEUE_LIMIT,
-    LIFECYCLE_EVENT_BROADCAST_TIMEOUT_S,
+    LIFECYCLE_EVENT_DELIVERY_TIMEOUT_S,
 )
+from ray.serve.handle import DeploymentHandle
 
 logger = get_logger(__name__)
 
 # Most messages the receiver drains into one handler call.
 _MAX_DRAIN = 256
-_LIFECYCLE_ENDPOINT_HEADER_BYTES = KV_LIFECYCLE_ENDPOINT_HEADER.encode("latin-1")
+_LIFECYCLE_OWNER_HEADER_BYTES = KV_LIFECYCLE_OWNER_HEADER.encode("latin-1")
 
-# The selecting router's lifecycle endpoint for the request being served.
-_request_lifecycle_endpoint: contextvars.ContextVar[
+# Lifecycle endpoint of the LLMRouter replica that selected the request being served.
+_request_lifecycle_owner: contextvars.ContextVar[
     Optional[str]
-] = contextvars.ContextVar("kv_request_lifecycle_endpoint", default=None)
+] = contextvars.ContextVar("kv_request_lifecycle_owner", default=None)
 
 
-def get_request_lifecycle_endpoint() -> Optional[str]:
+def get_request_lifecycle_owner() -> Optional[str]:
     """Lifecycle endpoint of the router that selected the current request."""
-    return _request_lifecycle_endpoint.get()
+    return _request_lifecycle_owner.get()
 
 
-class LifecycleEndpointMiddleware:
-    """ASGI middleware exposing the router-supplied lifecycle endpoint header
-    to the engine through ``get_request_lifecycle_endpoint``."""
+class LifecycleOwnerMiddleware:
+    """ASGI middleware exposing the router-supplied lifecycle owner header to
+    the engine through ``get_request_lifecycle_owner``."""
 
     def __init__(self, app: Any):
         self.app = app
@@ -56,12 +59,12 @@ class LifecycleEndpointMiddleware:
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope.get("type") == "http":
             for name, value in scope.get("headers") or ():
-                if name == _LIFECYCLE_ENDPOINT_HEADER_BYTES:
-                    token = _request_lifecycle_endpoint.set(value.decode("latin-1"))
+                if name == _LIFECYCLE_OWNER_HEADER_BYTES:
+                    token = _request_lifecycle_owner.set(value.decode("latin-1"))
                     try:
                         await self.app(scope, receive, send)
                     finally:
-                        _request_lifecycle_endpoint.reset(token)
+                        _request_lifecycle_owner.reset(token)
                     return
         await self.app(scope, receive, send)
 
@@ -75,84 +78,78 @@ def decode_lifecycle_events(payload: bytes) -> List[tuple]:
 
 
 class LifecycleEventForwarder:
-    """Ordered, non-blocking bridge from the engine to the LLMRouter replicas'
-    KVTokenTrackers, which maintain per-replica token load statistics.
+    """Ordered, non-blocking bridge from the engine to the KVTokenTracker of the
+    LLMRouter replica that selected each request.
 
-    ``report`` broadcasts to every ingress replica: it only enqueues locally, and
-    a single delivery task per replica drains the queue to the trackers, awaiting
-    one broadcast at a time so events arrive everywhere in the order they were
-    reported. Events that pile up during a call are sent together in the next one.
-
-    ``report_to`` sends to one router's lifecycle endpoint over ZMQ and falls back
-    to ``report`` when the endpoint is unknown or the push cannot be queued.
+    ``report_to`` pushes to the owner's lifecycle endpoint over a ZMQ PUSH
+    socket per owner, so a request's events arrive in the order they were
+    reported; a socket queues events while it connects, so a router's first
+    events are not lost. Events with no owner, or whose push cannot be queued,
+    are broadcast to every router replica over a Serve handle: a single delivery
+    task drains them, one broadcast at a time, in the order they were reported.
     """
 
-    def __init__(self, handle: Any, worker_id: int):
-        self.handle = handle
-        self.worker_id = worker_id
-        self._events: asyncio.Queue = asyncio.Queue()
-        self._delivery_task: Optional[asyncio.Task] = None
+    def __init__(self, handle: DeploymentHandle):
+        self._handle = handle
         self._sender: Optional[token_channel.TokenSender] = None
+        self._broadcasts: asyncio.Queue = asyncio.Queue()
+        self._broadcast_task: Optional[asyncio.Task] = None
 
-    def report(self, method_name: str, *args) -> None:
-        if self._delivery_task is None or self._delivery_task.done():
-            self._delivery_task = asyncio.get_running_loop().create_task(
-                self._deliver()
-            )
-        self._events.put_nowait((method_name, args))
-
-    def report_to(self, endpoint: Optional[str], method_name: str, *args) -> None:
-        if endpoint:
+    def report_to(self, owner: Optional[str], method_name: str, *args) -> None:
+        if owner is not None:
             if self._sender is None:
-                self._sender = token_channel.TokenSender()
+                self._sender = token_channel.TokenSender(immediate=False)
             payload = encode_lifecycle_events([(method_name, args)])
-            if self._sender.push(endpoint, "lifecycle", payload):
+            if self._sender.push(owner, "lifecycle", payload):
                 return
-        self.report(method_name, *args)
+        if self._broadcast_task is None or self._broadcast_task.done():
+            self._broadcast_task = asyncio.get_running_loop().create_task(
+                self._deliver_broadcasts()
+            )
+        self._broadcasts.put_nowait((method_name, args))
 
-    async def _deliver(self) -> None:
+    async def _deliver_broadcasts(self) -> None:
         while True:
             # Wait for the next event, then drain whatever queued up behind it
             # into the same batch.
-            batch = [await self._events.get()]
-            while not self._events.empty():
-                batch.append(self._events.get_nowait())
+            batch = [await self._broadcasts.get()]
+            while not self._broadcasts.empty():
+                batch.append(self._broadcasts.get_nowait())
             try:
                 # return_exceptions so one failed replica cannot mask delivery
                 # to the rest; failures are logged and dropped below.
-                results = await self.handle.broadcast(
+                results = await self._handle.broadcast(
                     "on_lifecycle_events", batch
                 ).results_async(
-                    timeout_s=LIFECYCLE_EVENT_BROADCAST_TIMEOUT_S,
+                    timeout_s=LIFECYCLE_EVENT_DELIVERY_TIMEOUT_S,
                     return_exceptions=True,
                 )
                 errors = [r for r in results if isinstance(r, Exception)]
                 if errors:
                     logger.warning(
-                        "KV lifecycle events dropped on %d/%d ingress replicas: %s",
+                        "KV lifecycle events dropped on %d/%d router replicas: %s",
                         len(errors),
                         len(results),
                         errors[0],
                     )
             except Exception as e:
                 # Best-effort delivery: any failure (no LLMRouter replica being
-                # available during a redeploy, backpressure, a booking error) is
-                # dropped so the engine's token stream is never disrupted; report()
-                # restarts the delivery task on the next event.
+                # available during a redeploy, a booking error) is dropped so the
+                # engine's token stream is never disrupted.
                 logger.warning("Dropping KV lifecycle events: %s", e)
             finally:
                 for _ in batch:
-                    self._events.task_done()
+                    self._broadcasts.task_done()
 
     async def flush(self) -> None:
-        """Wait until every reported event has been delivered."""
-        await self._events.join()
+        """Wait until every broadcast event has been delivered or dropped."""
+        await self._broadcasts.join()
 
     def close(self) -> None:
-        """Cancel the delivery task and close sockets on engine shutdown."""
-        if self._delivery_task is not None:
-            self._delivery_task.cancel()
-            self._delivery_task = None
+        """Cancel the broadcast task and close sockets on engine shutdown."""
+        if self._broadcast_task is not None:
+            self._broadcast_task.cancel()
+            self._broadcast_task = None
         if self._sender is not None:
             self._sender.close()
             self._sender = None

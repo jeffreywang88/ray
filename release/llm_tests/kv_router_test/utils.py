@@ -264,10 +264,11 @@ class LLMRouter(_LLMRouter):
         return snapshot
 
     async def get_lifecycle_snapshot(self, request_id, worker_id):
-        """(Test only) This replica's id, its view of a request's lifecycle and
-        the load it books on ``worker_id``."""
+        """(Test only) This replica's id and lifecycle endpoint, its view of a
+        request's lifecycle and the load it books on ``worker_id``."""
         return {
             "replica_id": self.get_replica_id(),
+            "lifecycle_endpoint": self._kv_token_tracker.lifecycle_endpoint,
             "lifecycle": await self.get_request_lifecycle(request_id),
             "active_requests": await self.get_worker_active_requests(worker_id),
         }

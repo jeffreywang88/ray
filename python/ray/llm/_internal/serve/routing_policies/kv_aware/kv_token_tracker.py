@@ -9,16 +9,13 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, TypedDict
 
 import ray
 from ray import serve
+from ray._common.network_utils import find_free_port
 from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
     DEFAULT_KV_INDEXER_THREADS,
-    DEFAULT_KV_LIFECYCLE_PORT_BASE,
-    DEFAULT_KV_REPLICA_SYNC_PORT_BASE,
     KV_INDEXER_THREADS_KEY,
     KV_LIFECYCLE_PORT_BASE_KEY,
-    KV_REPLICA_SYNC_KEY,
     KV_REPLICA_SYNC_METADATA_KEY,
     KV_REPLICA_SYNC_PORT_BASE_KEY,
-    LIFECYCLE_EVENT_BROADCAST_TIMEOUT_S,
     REQUEST_TRACKING_TTL_S,
 )
 from ray.serve._private.common import DeploymentTargetInfo
@@ -90,85 +87,6 @@ class WorkerSelection(TypedDict):
     effective_prefill_tokens: int
 
 
-class ReservationBroadcast(TypedDict):
-    """Selected-worker booking state replicated to peer ingress routers."""
-
-    request_id: str
-    source_ingress_replica_rank: Optional[int]
-    worker_id: int
-    dp_rank: int
-    sequence_hashes: List[int]
-    isl_tokens: int
-    expected_output_tokens: Optional[int]
-    effective_prefill_tokens: int
-    # Must match the name vLLM stamped on the request's KV-cache events, so a
-    # peer's selection service books this reservation in the same LoRA
-    # namespace the selecting ingress scored it in.
-    lora_name: Optional[str]
-
-
-class ReservationBroadcastForwarder:
-    """Best-effort background replication of selected-worker reservations.
-
-    ``report`` only enqueues the selected-worker booking facts Dynamo already
-    returned. Sending the broadcast and waiting for its results happen on the
-    delivery task, off the request's selection and dispatch path.
-    """
-
-    def __init__(self, handle: Any):
-        self._handle = handle
-        if getattr(handle, "is_initialized", True) is False:
-            # Keep broadcast routing off the ingress replica's request loop.
-            handle._init(_run_router_in_separate_loop=True)
-        self._reservations: asyncio.Queue = asyncio.Queue()
-        self._delivery_task: Optional[asyncio.Task] = None
-
-    def report(self, reservation: ReservationBroadcast) -> None:
-        if self._delivery_task is None or self._delivery_task.done():
-            self._delivery_task = asyncio.get_running_loop().create_task(
-                self._deliver()
-            )
-        self._reservations.put_nowait(reservation)
-
-    async def _deliver(self) -> None:
-        while True:
-            batch = [await self._reservations.get()]
-            while not self._reservations.empty():
-                batch.append(self._reservations.get_nowait())
-            try:
-                results = await self._handle.broadcast(
-                    "on_reservations_created", batch
-                ).results_async(
-                    timeout_s=LIFECYCLE_EVENT_BROADCAST_TIMEOUT_S,
-                    return_exceptions=True,
-                )
-                errors = [r for r in results if isinstance(r, Exception)]
-                if errors:
-                    logger.warning(
-                        "KV reservation broadcasts dropped on %d/%d ingress "
-                        "replicas: %s",
-                        len(errors),
-                        len(results),
-                        errors[0],
-                    )
-            except Exception as e:
-                logger.warning(
-                    "Dropping selection service reservation broadcast: %s", e
-                )
-            finally:
-                for _ in batch:
-                    self._reservations.task_done()
-
-    async def flush(self) -> None:
-        """Wait until every reported reservation broadcast has been attempted."""
-        await self._reservations.join()
-
-    def close(self) -> None:
-        if self._delivery_task is not None:
-            self._delivery_task.cancel()
-            self._delivery_task = None
-
-
 class KVTokenTracker:
     """Tracks per-replica KV-cache overlap and token load inside the LLMRouter
     ingress replica.
@@ -183,49 +101,43 @@ class KVTokenTracker:
        every replica's KV events; each node records which workers hold that KV block.
     4. Scoring (``select_worker``) atomically ranks candidate workers by
        KV-cache overlap and current token load, reserves the chosen worker, and
-       records local lifecycle state. The selected reservation is replicated to
-       peer ingress replicas in the background so every selection service can
-       apply the engine's subsequent lifecycle events. A separate
-       select-then-reserve flow causes herding because concurrent requests can
-       select the same worker from stale load state before any reservation is
-       visible.
+       records local lifecycle state. A separate select-then-reserve flow causes
+       herding because concurrent requests can select the same worker from stale
+       load state before any reservation is visible.
+    5. Engine replicas report a request's lifecycle events only to the router
+       that selected it. That router's selection service replicates the
+       reservation, prefill completion and free to the peer LLMRouter replicas'
+       services over Dynamo's replica mesh, so every router scores on the same
+       load.
     """
 
     def __init__(
         self,
         indexer_threads: int = DEFAULT_KV_INDEXER_THREADS,
         serve_deployment_id: Optional[Any] = None,
-        ingress_replica_rank: Optional[int] = None,
         replica_sync_port: Optional[int] = None,
         router_deployment_id: Optional[Any] = None,
     ):
         # The tracked LLMServer deployment id, passed in by the LLMRouter
         # that builds the tracker.
         self._serve_deployment_id = serve_deployment_id
-        # Replica-mesh mode: the selection service replicates its own
+        # Replica-mesh PUB port. The selection service replicates its own
         # admissions, prefill completions and frees to the peer LLMRouter
         # replicas' services, discovered from this LLMRouter deployment's targets.
+        # None runs a standalone service without peers.
         self._replica_sync_port = replica_sync_port
         self._router_deployment_id = router_deployment_id
         # Peer router replica unique id -> replica-mesh endpoint.
         self._replica_sync_peers: Dict[str, str] = {}
         self._own_replica_unique_id: Optional[str] = None
+        self._lifecycle_receiver = None
+        self._lifecycle_endpoint: Optional[str] = None
         try:
             self._own_replica_unique_id = (
                 serve.get_replica_context().replica_id.unique_id
             )
         except RayServeException:
             pass
-        self._lifecycle_receiver = None
-        self._lifecycle_endpoint: Optional[str] = None
-        self._ingress_replica_rank = ingress_replica_rank
-        if self._ingress_replica_rank is None:
-            try:
-                replica_rank = serve.get_replica_context().rank
-            except RayServeException:
-                replica_rank = None
-            if replica_rank is not None:
-                self._ingress_replica_rank = replica_rank.rank
         # KV-cache block size, learned once from the first replica's reported
         # engine config and passed to the selection service, which uses it to
         # track the worker's active load and index its KV blocks for overlap.
@@ -246,13 +158,7 @@ class KVTokenTracker:
         # Reverse index of in-flight request ids per worker, kept in lockstep with
         # _requests, so remove_worker is O(k) in the worker's requests, not O(N).
         self._request_ids_by_worker: Dict[int, Set[str]] = {}
-        # Request ids whose completion arrived before their reservation broadcast.
-        # Ordered oldest-first so the stale sweep can bound memory.
-        self._completed_request_ids: "OrderedDict[str, float]" = OrderedDict()
         self._pending_tasks: Set[asyncio.Task] = set()
-        self._reservation_forwarder: Optional[ReservationBroadcastForwarder] = None
-        self._reservation_updates: asyncio.Queue = asyncio.Queue()
-        self._reservation_apply_task: Optional[asyncio.Task] = None
         self._long_poll_client: Optional[LongPollClient] = None
         self._create_selection_service()
         self._start_replica_tracking()
@@ -260,10 +166,6 @@ class KVTokenTracker:
     def get_block_size(self) -> int:
         """Return the KV-cache block size used for decode-block accounting."""
         return self._block_size
-
-    def start_reservation_broadcast(self, handle: Any) -> None:
-        """Configure background reservation replication to this deployment."""
-        self._reservation_forwarder = ReservationBroadcastForwarder(handle)
 
     def _create_selection_service(self) -> None:
         """Create the router-local Dynamo selection service for this deployment."""
@@ -390,21 +292,10 @@ class KVTokenTracker:
             )
 
     @property
-    def replica_sync_enabled(self) -> bool:
-        return self._replica_sync_port is not None
-
-    @property
     def lifecycle_endpoint(self) -> Optional[str]:
         """Where engine replicas report lifecycle events of requests this
-        router selected; None unless replica-mesh mode is on."""
+        router selected; None until ``start_lifecycle_receiver`` succeeds."""
         return self._lifecycle_endpoint
-
-    def replica_sync_routing_stats(self) -> Dict[str, Any]:
-        """Routing stats advertising this router's replica-mesh endpoint."""
-        if not self.replica_sync_enabled:
-            return {}
-        endpoint = f"tcp://{ray.util.get_node_ip_address()}:{self._replica_sync_port}"
-        return {KV_REPLICA_SYNC_METADATA_KEY: {"endpoint": endpoint}}
 
     async def start_lifecycle_receiver(self, port: int) -> None:
         """Receive the lifecycle events of requests this router selected."""
@@ -415,9 +306,21 @@ class KVTokenTracker:
         receiver = LifecycleReceiver(
             bind_endpoint=f"tcp://*:{port}", handler=self.on_lifecycle_events
         )
-        if await receiver.start():
-            self._lifecycle_receiver = receiver
-            self._lifecycle_endpoint = f"tcp://{ray.util.get_node_ip_address()}:{port}"
+        if not await receiver.start():
+            # Engines would fall back to broadcasting every event, so fail the
+            # replica rather than run without its own lifecycle endpoint.
+            raise RuntimeError(
+                f"Failed to bind the KV lifecycle endpoint on port {port}."
+            )
+        self._lifecycle_receiver = receiver
+        self._lifecycle_endpoint = f"tcp://{ray.util.get_node_ip_address()}:{port}"
+
+    def replica_sync_routing_stats(self) -> Dict[str, Any]:
+        """Routing stats advertising this router's replica-mesh endpoint."""
+        if self._replica_sync_port is None:
+            return {}
+        endpoint = f"tcp://{ray.util.get_node_ip_address()}:{self._replica_sync_port}"
+        return {KV_REPLICA_SYNC_METADATA_KEY: {"endpoint": endpoint}}
 
     def _on_router_targets(self, target_info: DeploymentTargetInfo) -> None:
         """LongPoll listener: keep the selection service's replica-mesh peers in
@@ -563,20 +466,6 @@ class KVTokenTracker:
             len(token_ids),
             expected_output_tokens,
         )
-        if self._reservation_forwarder is not None:
-            self._reservation_forwarder.report(
-                {
-                    "request_id": request_id,
-                    "source_ingress_replica_rank": self._ingress_replica_rank,
-                    "worker_id": selection["worker_id"],
-                    "dp_rank": selection["dp_rank"],
-                    "sequence_hashes": selection["sequence_hashes"],
-                    "isl_tokens": selection["isl_tokens"],
-                    "expected_output_tokens": expected_output_tokens,
-                    "effective_prefill_tokens": selection["effective_prefill_tokens"],
-                    "lora_name": lora_name,
-                }
-            )
         return {
             "worker_id": selection["worker_id"],
             "dp_rank": selection["dp_rank"],
@@ -594,7 +483,6 @@ class KVTokenTracker:
         old = self._requests.pop(request_id, None)
         if old is not None:
             self._untrack_worker_request(request_id, old.worker_id)
-        self._completed_request_ids.pop(request_id, None)
         if self._block_size is None:
             raise RuntimeError(
                 "KV block size is unavailable before worker registration."
@@ -607,79 +495,6 @@ class KVTokenTracker:
             total_blocks=math.ceil(prompt_tokens / block_size),
         )
         self._request_ids_by_worker.setdefault(worker_id, set()).add(request_id)
-
-    async def on_reservations_created(
-        self, reservations: List[ReservationBroadcast]
-    ) -> None:
-        """Queue already-selected requests for this ingress's selection service.
-
-        This method runs as a Serve RPC on LLMRouter replicas. Keep it short:
-        route handling shares the same replica, so the heavier Dynamo
-        ``create_reservation`` calls are applied by a background task.
-        """
-        if self._svc is None or self._block_size is None:
-            return
-        pending = []
-        for reservation in reservations:
-            # The selecting ingress receives its own broadcast after it has
-            # already booked the atomic reservation. It must skip even if the
-            # request already completed locally before the broadcast arrived.
-            if reservation["source_ingress_replica_rank"] == self._ingress_replica_rank:
-                continue
-            pending.append(reservation)
-        if not pending:
-            return
-        if self._reservation_apply_task is None or self._reservation_apply_task.done():
-            self._reservation_apply_task = asyncio.create_task(
-                self._apply_reservation_updates()
-            )
-        self._reservation_updates.put_nowait(pending)
-
-    async def _apply_reservation_updates(self) -> None:
-        while True:
-            batches = [await self._reservation_updates.get()]
-            while not self._reservation_updates.empty():
-                batches.append(self._reservation_updates.get_nowait())
-            reservations = [reservation for batch in batches for reservation in batch]
-            try:
-                await self._apply_reservations(reservations)
-            except Exception:
-                logger.exception("Failed to apply KV reservation broadcast batch.")
-            finally:
-                for _ in batches:
-                    self._reservation_updates.task_done()
-
-    async def _apply_reservations(
-        self, reservations: List[ReservationBroadcast]
-    ) -> None:
-        await self._evict_stale_requests()
-        for reservation in reservations:
-            request_id = reservation["request_id"]
-            if (
-                request_id in self._requests
-                or request_id in self._completed_request_ids
-            ):
-                continue
-            await self._svc.create_reservation(
-                {
-                    "model_name": _MODEL_NAME,
-                    "tenant_id": _TENANT_ID,
-                    "selection_id": request_id,
-                    "worker_id": reservation["worker_id"],
-                    "dp_rank": reservation["dp_rank"],
-                    "sequence_hashes": reservation["sequence_hashes"],
-                    "isl_tokens": reservation["isl_tokens"],
-                    "expected_output_tokens": reservation["expected_output_tokens"],
-                    "effective_prefill_tokens": reservation["effective_prefill_tokens"],
-                    "lora_name": reservation["lora_name"],
-                }
-            )
-            self._track_request_state(
-                request_id,
-                reservation["worker_id"],
-                reservation["isl_tokens"],
-                reservation["expected_output_tokens"],
-            )
 
     async def on_lifecycle_events(self, events: List[tuple]) -> None:
         """Apply a replica's ``(hook_name, args)`` lifecycle events in order.
@@ -735,16 +550,10 @@ class KVTokenTracker:
         """Free ``request_id`` from the selection service's active load and the
         local view."""
         state = self._requests.pop(request_id, None)
-        self._mark_request_completed(request_id)
         if state is None:
             return
         self._untrack_worker_request(request_id, state.worker_id)
         await self._svc.free_reservation(request_id)
-
-    def _mark_request_completed(self, request_id: str) -> None:
-        """Remember completions that beat reservation admission on this ingress."""
-        self._completed_request_ids.pop(request_id, None)
-        self._completed_request_ids[request_id] = time.monotonic()
 
     def _untrack_worker_request(self, request_id: str, worker_id: int) -> None:
         """Drop a request from the per-worker reverse index, keeping it in
@@ -760,11 +569,6 @@ class KVTokenTracker:
         past ``REQUEST_TRACKING_TTL_S``, freeing their reservations.
         """
         cutoff = time.monotonic() - REQUEST_TRACKING_TTL_S
-        while self._completed_request_ids:
-            request_id, completed_at = next(iter(self._completed_request_ids.items()))
-            if completed_at > cutoff:
-                break
-            self._completed_request_ids.pop(request_id, None)
         while self._requests:
             request_id, state = next(iter(self._requests.items()))
             if state.created_at > cutoff:
@@ -777,7 +581,12 @@ class KVTokenTracker:
                 request_id,
                 REQUEST_TRACKING_TTL_S,
             )
-            await self._svc.free_reservation(request_id)
+            try:
+                await self._svc.free_reservation(request_id)
+            except Exception as e:
+                # The selection service's own active-request expiry may have
+                # freed it already; that must not fail the selection that swept.
+                logger.debug("Stale KV request %s was already freed: %s", request_id, e)
 
     def _get_decay_fraction(self, state: RequestLifecycle) -> Optional[float]:
         """Fraction of output still expected, or ``None`` without an estimate;
@@ -801,18 +610,17 @@ def get_kv_token_tracker() -> Optional["KVTokenTracker"]:
 
 # The LLMRouter ingress deployment name (``serve.deployment(LLMRouter)`` with no
 # name override -> the class name). Engine replicas RPC its ``on_lifecycle_events``
-# handle method to book request load.
+# handle method on the replica that selected a request.
 LLM_ROUTER_DEPLOYMENT_NAME = "LLMRouter"
 
 
 def get_lifecycle_port(llm_config: "LLMConfig") -> int:
-    """This LLMRouter replica's lifecycle-event port (base + node-local rank)."""
-    base = int(
-        llm_config.experimental_configs.get(
-            KV_LIFECYCLE_PORT_BASE_KEY, DEFAULT_KV_LIFECYCLE_PORT_BASE
-        )
-    )
-    return base + serve.get_replica_context().rank.local_rank
+    """This LLMRouter replica's lifecycle-event port: any free port, or base +
+    node-local rank when ``KV_LIFECYCLE_PORT_BASE`` pins it."""
+    port_base = llm_config.experimental_configs.get(KV_LIFECYCLE_PORT_BASE_KEY)
+    if port_base is None:
+        return find_free_port()
+    return int(port_base) + serve.get_replica_context().rank.local_rank
 
 
 def get_llm_router_handle():
@@ -831,24 +639,19 @@ def build_kv_token_tracker(
     ingress replica's event loop (the tracker binds a LongPollClient to it).
     """
     experimental_configs = llm_config.experimental_configs
-    replica_sync_kwargs = {}
-    if experimental_configs.get(KV_REPLICA_SYNC_KEY):
-        context = serve.get_replica_context()
-        replica_sync_kwargs = {
-            "replica_sync_port": int(
-                experimental_configs.get(
-                    KV_REPLICA_SYNC_PORT_BASE_KEY, DEFAULT_KV_REPLICA_SYNC_PORT_BASE
-                )
-            )
-            + context.rank.local_rank,
-            "router_deployment_id": context.replica_id.deployment_id,
-        }
+    context = serve.get_replica_context()
+    port_base = experimental_configs.get(KV_REPLICA_SYNC_PORT_BASE_KEY)
     tracker = KVTokenTracker(
         indexer_threads=experimental_configs.get(
             KV_INDEXER_THREADS_KEY, DEFAULT_KV_INDEXER_THREADS
         ),
         serve_deployment_id=serve_deployment_id,
-        **replica_sync_kwargs,
+        replica_sync_port=(
+            find_free_port()
+            if port_base is None
+            else int(port_base) + context.rank.local_rank
+        ),
+        router_deployment_id=context.replica_id.deployment_id,
     )
     set_kv_token_tracker(tracker)
     return tracker
