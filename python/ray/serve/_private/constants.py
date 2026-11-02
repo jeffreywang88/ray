@@ -1194,17 +1194,4 @@ RAY_SERVE_EVENT_LOOP_MONITORING_INTERVAL_S = get_env_float_positive(
 # - 100-500ms: problematic, likely blocking code
 # - > 500ms: severe, definitely blocking
 # - > 5s: catastrophic
-SERVE_EVENT_LOOP_LATENCY_HISTOGRAM_BOUNDARIES_MS: List[float] = [
-    1,  # 1ms
-    5,  # 5ms
-    10,  # 10ms
-    25,  # 25ms
-    50,  # 50ms
-    100,  # 100ms
-    250,  # 250ms
-    500,  # 500ms
-    1000,  # 1s
-    2500,  # 2.5s
-    5000,  # 5s
-    10000,  # 10s
-]
+SERVE_EVENT_LOOP_LATENCY_HISTOGRAM_BOUNDARIES_MS: List[float] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 25, 50]
