@@ -4685,6 +4685,38 @@
     long_running: false
     script: python prefix_router_overhead_benchmark.py
 
+# Cluster scaling of Ray Serve LLM orchestration: Dynamo Mocker engines calibrated to an
+# InferenceX datapoint (DeepSeek-V4.1-Flash, DEP4, c128), driven by AgentX.
+- name: llm_serve_agentx_cluster_scale
+  # Manual until the Dynamo wheel in byod_llm_agentx_cluster_scale.sh is published.
+  frequency: manual
+  python: "3.12"
+  group: llm-serve
+  team: llm
+  working_dir: llm_tests/serve/agentx_cluster_scale
+
+  cluster:
+    byod:
+      type: llm-cu130
+      post_build_script: byod_llm_agentx_cluster_scale.sh
+    anyscale_sdk_2026: true
+    cluster_compute: compute_aws.yaml
+
+  run:
+    timeout: 21600
+    long_running: false
+    script: python run.py --client-nodes 8 --agentx-bin /home/ray/agentx-venv/bin/agentx
+
+  variations:
+    - __suffix__: c128_n128
+    - __suffix__: smoke
+      run:
+        timeout: 3600
+        script: >-
+          python run.py --nodes 2 --client-nodes 1 --concurrency-per-engine 4
+          --speedup 1 --decode-speedup 1 --duration-s 300
+          --agentx-bin /home/ray/agentx-venv/bin/agentx
+
 # Runs performance benchmark tests against vLLM service
 - name: llm_serve_llama_3dot1_8B_tp_2
   frequency: nightly

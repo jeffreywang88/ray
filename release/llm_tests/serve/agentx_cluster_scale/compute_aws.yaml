@@ -1,0 +1,25 @@
+cloud: {{env["ANYSCALE_CLOUD_NAME"]}}
+
+head_node:
+    # Runs the driver and the Serve controller; no engines.
+    instance_type: m5.4xlarge
+    resources:
+      CPU: 0
+
+worker_nodes:
+    # Engine nodes. Each stands for one 8-GPU host running
+    # --chips-per-node / --gpus-per-replica Mocker engines (--node-cpus 16).
+    - instance_type: m5.4xlarge
+      min_nodes: 0
+      max_nodes: 128
+      market_type: ON_DEMAND
+      resources:
+        CPU: 16
+    # AgentX load generators, one shard per node (--client-nodes).
+    - instance_type: m5.4xlarge
+      min_nodes: 0
+      max_nodes: 16
+      market_type: ON_DEMAND
+      resources:
+        CPU: 0
+        agentx_client: 1
