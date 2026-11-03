@@ -62,14 +62,16 @@ there are 256 replicas, so the theoretical output is about 1.44M tok/s.
 `$TEST_OUTPUT_JSON` and `<--output-dir>/result.json` hold:
 
 - `perf_metrics`: per phase, output tok/s (total and per replica), p90 interactivity,
-  req/s, mean and p90 TTFT, and `tok_s_scaling_efficiency` (phase tok/s / (engines x
-  replica tok/s)) and `p90_interactivity_ratio` (phase / replica).
+  req/s, mean and p90 TTFT, routing p50 and p99 (HAProxy's time in the ingress router,
+  from `ray_serve_haproxy_ingress_router_latency_ms`), and `tok_s_scaling_efficiency`
+  (phase tok/s / (engines x replica tok/s)) and `p90_interactivity_ratio` (phase /
+  replica).
 - `phases`: every metric per phase, including the router count, KV hit ratio and peak
   CPU of the engine and client nodes.
 - `speedup`, `decode_speedup` and the `calibration` history.
-- `issues`: the run is invalid, and exits 1, if a phase had failed requests, the
-  calibration did not converge, or an engine or client node's CPU peaked above
-  `--max-cpu-pct`. A low scaling efficiency is a result, not an issue.
+- `issues`: the run is invalid, and exits 1, if a phase had failed requests or more
+  than 0.1 router fallbacks/s, the calibration did not converge, or an engine or client
+  node's CPU peaked above `--max-cpu-pct`. A low scaling efficiency is a result, not an issue.
 
 ## Running
 

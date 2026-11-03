@@ -6,7 +6,7 @@ per-request inter-token latency, in tokens/s/user. Percentiles interpolate
 linearly between samples.
 """
 
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import numpy as np
 
@@ -19,12 +19,23 @@ def _positive(values: np.ndarray) -> np.ndarray:
     return values[np.isfinite(values) & (values > 0)]
 
 
+def _window_ns(load: Dict[str, Any]) -> Tuple[int, int]:
+    starts, ends = load["columns"]["start_ns"], load["columns"]["end_ns"]
+    return int(starts[starts >= 0].min()), int(ends[ends >= 0].max())
+
+
+def profiling_window(load: Dict[str, Any]) -> Tuple[float, float]:
+    """First request start and last request end, in seconds since the epoch."""
+    start_ns, end_ns = _window_ns(load)
+    return start_ns / 1e9, end_ns / 1e9
+
+
 def summarize(
     load: Dict[str, Any], num_replicas: int, gpus_per_replica: int
 ) -> Dict[str, float]:
     cols = load["columns"]
-    starts, ends = cols["start_ns"], cols["end_ns"]
-    duration_s = (ends[ends >= 0].max() - starts[starts >= 0].min()) / 1e9
+    start_ns, end_ns = _window_ns(load)
+    duration_s = (end_ns - start_ns) / 1e9
     output_tok_s = np.nansum(cols["osl"]) / duration_s
     itl_s = _positive(cols["itl_ms"]) / 1000
     ttft_ms = _positive(cols["ttft_ms"])

@@ -12,6 +12,7 @@ import agentx
 import calibration
 import cluster
 import metrics
+import routing
 from mock_engine import ENGINE_DEPLOYMENT, build_app
 
 from ray import serve
@@ -20,6 +21,8 @@ from ray.autoscaler.sdk import request_resources
 logger = logging.getLogger(__name__)
 
 APP_NAME = "llm"
+# Above this, HAProxy is bypassing the router for a meaningful share of requests.
+MAX_FALLBACKS_PER_S = 0.1
 PERF_METRICS = (
     ("output_tok_s", "THROUGHPUT"),
     ("output_tok_s_per_replica", "THROUGHPUT"),
@@ -27,6 +30,8 @@ PERF_METRICS = (
     ("req_s", "THROUGHPUT"),
     ("mean_ttft_ms", "LATENCY"),
     ("p90_ttft_ms", "LATENCY"),
+    ("route_p50_ms", "LATENCY"),
+    ("route_p99_ms", "LATENCY"),
     ("tok_s_scaling_efficiency", "THROUGHPUT"),
     ("p90_interactivity_ratio", "THROUGHPUT"),
 )
@@ -119,16 +124,19 @@ def run_phase(
             node_ids, phase.engines, ENGINE_DEPLOYMENT, args.routers_per_node
         )
         samplers = cluster.start_cpu_samplers(node_ids + client_ids)
+        scraper = routing.RoutingScraper().start()
         load = agentx.run_load(
             load_config,
             cluster.ingress_urls(engine_nodes),
             args.concurrency_per_engine * phase.engines,
             client_ids,
         )
+        scraper.stop()
         cpu = cluster.stop_cpu_samplers(samplers)
     finally:
         serve.shutdown()
     result = metrics.summarize(load, phase.engines, args.gpus_per_replica)
+    result.update(scraper.summary(*metrics.profiling_window(load)))
     result.update(
         nodes=phase.nodes,
         engines=phase.engines,
@@ -169,6 +177,8 @@ def _issues(args, phases: Dict[str, Dict[str, Any]], converged: bool) -> List[st
     for name, m in phases.items():
         if m["failed_requests"]:
             issues.append(f"{name}: {m['failed_requests']} failed requests")
+        if (m["fallbacks_per_s"] or 0) > MAX_FALLBACKS_PER_S:
+            issues.append(f"{name}: {m['fallbacks_per_s']:.2f} router fallbacks/s")
         for role in ("engine", "client"):
             cpu = m[f"{role}_node_cpu_max"]
             if cpu > args.max_cpu_pct:
@@ -185,7 +195,7 @@ def _perf_metrics(phases: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
         }
         for name, m in phases.items()
         for key, metric_type in PERF_METRICS
-        if key in m
+        if m.get(key) is not None
     ]
 
 
