@@ -12,12 +12,15 @@ import sys
 
 import ray
 
+# HAProxy's routing body limit stays at Serve's default (8 MiB). The traces'
+# prompts reach 990k tokens (median 142k), several MB of JSON. A body over the
+# limit reaches the router truncated, so it is routed without KV overlap; the
+# benchmark counts truncations and fails the run if there are any.
 SERVE_ENV = {
     "RAY_SERVE_ENABLE_HA_PROXY": "1",
     "RAY_SERVE_LLM_ENABLE_DIRECT_STREAMING": "1",
     "RAY_SERVE_INGRESS_REQUEST_ROUTER_FORWARD_BODY": "1",
     "RAY_SERVE_HAPROXY_MAXCONN": "65536",
-    "RAY_SERVE_HAPROXY_INGRESS_REQUEST_ROUTER_BUFSIZE": "524288",
     "RAY_SERVE_INGRESS_REQUEST_ROUTER_METRICS_ENABLED": "1",
 }
 

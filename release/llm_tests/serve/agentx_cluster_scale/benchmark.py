@@ -34,6 +34,9 @@ PERF_METRICS = (
     ("route_p99_ms", "LATENCY"),
     ("tok_s_scaling_efficiency", "THROUGHPUT"),
     ("p90_interactivity_ratio", "THROUGHPUT"),
+    # Prompt tokens the engines served from cache: how well KV-aware routing
+    # keeps each session on the engine holding its prefix.
+    ("kv_hit_ratio", "THROUGHPUT"),
 )
 
 
@@ -179,6 +182,12 @@ def _issues(args, phases: Dict[str, Dict[str, Any]], converged: bool) -> List[st
             issues.append(f"{name}: {m['failed_requests']} failed requests")
         if (m["fallbacks_per_s"] or 0) > MAX_FALLBACKS_PER_S:
             issues.append(f"{name}: {m['fallbacks_per_s']:.2f} router fallbacks/s")
+        if m["truncated_bodies"]:
+            # The router routed these without tokens, so without KV overlap.
+            issues.append(
+                f"{name}: HAProxy truncated {m['truncated_bodies']:.0f} request "
+                "bodies; raise RAY_SERVE_HAPROXY_INGRESS_REQUEST_ROUTER_BUFSIZE"
+            )
         for role in ("engine", "client"):
             cpu = m[f"{role}_node_cpu_max"]
             if cpu > args.max_cpu_pct:

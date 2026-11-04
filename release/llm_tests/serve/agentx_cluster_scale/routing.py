@@ -1,8 +1,13 @@
-"""Ingress routing latency and fallbacks from HAProxy's Serve metrics.
+"""Ingress routing metrics from every node's Prometheus endpoint.
 
 Needs RAY_SERVE_INGRESS_REQUEST_ROUTER_METRICS_ENABLED=1. Every node's metrics
 endpoint is scraped periodically; a phase's numbers come from the difference
-between the snapshots that bracket its profiling window.
+between the snapshots that bracket its profiling window:
+
+- HAProxy's time in the ingress router (latency histogram), its router
+  fallbacks, and bodies it truncated before forwarding them to the router.
+- Where each Mocker request's prompt token ids came from (``mock_engine``):
+  the router's token channel, or the engine's own tokenization.
 """
 
 import collections
@@ -15,13 +20,27 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
+from mock_engine import (
+    PROMPTS_METRIC,
+    SOURCE_CHANNEL,
+    SOURCE_NO_KEY,
+    SOURCE_STORE_MISS,
+)
+
 import ray
 
 LATENCY_BUCKET = "ray_serve_haproxy_ingress_router_latency_ms_bucket"
-FALLBACKS = "ray_serve_haproxy_ingress_router_fallbacks_total"
+# Counter name prefix -> snapshot key. A ``source`` tag is appended to the key.
+COUNTERS = {
+    "ray_serve_haproxy_ingress_router_fallbacks_total": "fallbacks",
+    "ray_serve_haproxy_ingress_router_truncations_total": "truncations",
+    f"ray_{PROMPTS_METRIC}_total": "prompts",
+}
 LE = re.compile(r'le="([^"]+)"')
+SOURCE = re.compile(r'source="([^"]+)"')
 
-Snapshot = Tuple[float, Dict[float, float], float]
+# (time, latency buckets, counters)
+Snapshot = Tuple[float, Dict[float, float], Dict[str, float]]
 
 
 def _auth_headers() -> Dict[str, str]:
@@ -33,22 +52,35 @@ def _auth_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-def _scrape(url: str, headers: Dict[str, str]) -> Tuple[Dict[float, float], float]:
+def _scrape(
+    url: str, headers: Dict[str, str]
+) -> Tuple[Dict[float, float], Dict[str, float]]:
     request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=10) as response:
         return parse(response.read().decode())
 
 
-def parse(text: str) -> Tuple[Dict[float, float], float]:
-    """Latency buckets summed over all label sets, and the fallback count."""
+def parse(text: str) -> Tuple[Dict[float, float], Dict[str, float]]:
+    """Latency buckets and counters, each summed over all label sets."""
     buckets: Dict[float, float] = collections.defaultdict(float)
-    fallbacks = 0.0
+    counters: Dict[str, float] = collections.defaultdict(float)
     for line in text.splitlines():
         if line.startswith(LATENCY_BUCKET):
             buckets[float(LE.search(line).group(1))] += float(line.rsplit(None, 1)[1])
-        elif line.startswith(FALLBACKS):
-            fallbacks += float(line.rsplit(None, 1)[1])
-    return buckets, fallbacks
+            continue
+        for prefix, key in COUNTERS.items():
+            # The next character must end the name, so a longer metric
+            # name that shares the prefix is not counted.
+            if line.startswith(prefix) and line[len(prefix) : len(prefix) + 1] in (
+                "{",
+                " ",
+            ):
+                source = SOURCE.search(line)
+                if source:
+                    key = f"{key}:{source.group(1)}"
+                counters[key] += float(line.rsplit(None, 1)[1])
+                break
+    return buckets, counters
 
 
 def histogram_quantile(cumulative: Dict[float, float], q: float) -> float:
@@ -68,6 +100,24 @@ def histogram_quantile(cumulative: Dict[float, float], q: float) -> float:
             )
         prev_bound, prev_count = bound, count
     return prev_bound
+
+
+def _delta(after: Dict, before: Dict) -> Dict:
+    return {k: v - before.get(k, 0.0) for k, v in after.items()}
+
+
+def prompt_sources(counters: Dict[str, float]) -> Dict[str, Optional[float]]:
+    """Mocker prompts by source, and the share the engine had to tokenize."""
+    channel = counters.get(f"prompts:{SOURCE_CHANNEL}", 0.0)
+    no_key = counters.get(f"prompts:{SOURCE_NO_KEY}", 0.0)
+    store_miss = counters.get(f"prompts:{SOURCE_STORE_MISS}", 0.0)
+    total = channel + no_key + store_miss
+    return {
+        "prompts_from_token_channel": channel,
+        "prompts_engine_tokenized_no_key": no_key,
+        "prompts_engine_tokenized_store_miss": store_miss,
+        "engine_tokenized_share": (no_key + store_miss) / total if total else None,
+    }
 
 
 class RoutingScraper:
@@ -102,26 +152,36 @@ class RoutingScraper:
                     scrapes = None
                 if scrapes:
                     buckets: Dict[float, float] = collections.defaultdict(float)
-                    for node_buckets, _ in scrapes:
+                    counters: Dict[str, float] = collections.defaultdict(float)
+                    for node_buckets, node_counters in scrapes:
                         for bound, count in node_buckets.items():
                             buckets[bound] += count
-                    self._snapshots.append(
-                        (now, dict(buckets), sum(f for _, f in scrapes))
-                    )
+                        for key, value in node_counters.items():
+                            counters[key] += value
+                    self._snapshots.append((now, dict(buckets), dict(counters)))
                 self._stop.wait(self._interval_s)
 
     def summary(self, start_s: float, end_s: float) -> Dict[str, Optional[float]]:
-        """Routing p50/p99 and fallbacks/s between the snapshots inside the window."""
-        empty = {"route_p50_ms": None, "route_p99_ms": None, "fallbacks_per_s": None}
+        """Metrics between the first and last snapshots inside the window."""
+        empty = {
+            "route_p50_ms": None,
+            "route_p99_ms": None,
+            "fallbacks_per_s": None,
+            "truncated_bodies": None,
+            **prompt_sources({}),
+        }
         inside = [s for s in self._snapshots if start_s <= s[0] <= end_s]
         if len(inside) < 2:
             return empty
-        (t0, b0, f0), (t1, b1, f1) = inside[0], inside[-1]
-        delta = {bound: count - b0.get(bound, 0.0) for bound, count in b1.items()}
-        if delta.get(math.inf, 0.0) <= 0:
-            return empty
-        return {
-            "route_p50_ms": histogram_quantile(delta, 0.5),
-            "route_p99_ms": histogram_quantile(delta, 0.99),
-            "fallbacks_per_s": (f1 - f0) / (t1 - t0),
+        (t0, b0, c0), (t1, b1, c1) = inside[0], inside[-1]
+        buckets, counters = _delta(b1, b0), _delta(c1, c0)
+        result = {
+            **empty,
+            "fallbacks_per_s": counters.get("fallbacks", 0.0) / (t1 - t0),
+            "truncated_bodies": counters.get("truncations", 0.0),
+            **prompt_sources(counters),
         }
+        if buckets.get(math.inf, 0.0) > 0:
+            result["route_p50_ms"] = histogram_quantile(buckets, 0.5)
+            result["route_p99_ms"] = histogram_quantile(buckets, 0.99)
+        return result

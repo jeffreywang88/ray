@@ -14,6 +14,30 @@ Metrics use InferenceX's definitions:
 - **Output tok/s**: output tokens of error-free profiling requests / (last end - first start).
 - **p90 interactivity**: 1 / p90 of the per-request inter-token latency (tok/s/user).
 
+## What the engines stand in for
+
+`mock_engine.MockerServer` replaces `LLMServer` + vLLM. KV-aware routing sees the same
+thing from it as from a vLLM replica:
+
+- **KV events:** the Mocker publishes vLLM-format events on ZMQ (content-hashed blocks with
+  their token ids), so every router indexes it as it would a vLLM replica.
+- **Prompt:** the engine runs the token ids the router hashed. They normally arrive over the
+  router's token channel. When they don't, the engine tokenizes the request with the router's
+  own vLLM renderer, as vLLM's OpenAI server does. That happens when the router could not
+  tokenize (truncated body), when its push failed (its first push to each engine always fails,
+  since the ZMQ socket is not connected yet), or when the payload had not arrived. A prompt the
+  router never hashed would miss every block the router indexed for the session and add
+  blocks no request shares, so the KV hit ratio would fall with the number of
+  router × engine pairs.
+- **Lifecycle events:** reported with the installed Ray's protocol: to the selecting router
+  over ZMQ when it names itself in the `kv-lifecycle-owner` header (replica mesh,
+  ray-project/ray#67791), otherwise broadcast to every `LLMRouter` replica.
+
+HAProxy's routing body limit stays at Serve's 8 MiB default. The traces' prompts have a
+median of 142k tokens and reach 990k, so most bodies are larger than 512 KiB. A body over the
+limit reaches the router truncated, and the router routes it without tokens. Every phase counts
+truncations, and a run with any is invalid.
+
 ## Phases
 
 | Phase     | Nodes | Engines            | Sessions            |
@@ -66,12 +90,15 @@ there are 256 replicas, so the theoretical output is about 1.44M tok/s.
   from `ray_serve_haproxy_ingress_router_latency_ms`), and `tok_s_scaling_efficiency`
   (phase tok/s / (engines x replica tok/s)) and `p90_interactivity_ratio` (phase /
   replica).
-- `phases`: every metric per phase, including the router count, KV hit ratio and peak
-  CPU of the engine and client nodes.
+- `phases`: every metric per phase, including the router count, KV hit ratio, peak
+  CPU of the engine and client nodes, HAProxy's `truncated_bodies`, and where the engines'
+  prompts came from (`prompts_from_token_channel`, `prompts_engine_tokenized_no_key`,
+  `prompts_engine_tokenized_store_miss`, `engine_tokenized_share`).
 - `speedup`, `decode_speedup` and the `calibration` history.
-- `issues`: the run is invalid, and exits 1, if a phase had failed requests or more
-  than 0.1 router fallbacks/s, the calibration did not converge, or an engine or client
-  node's CPU peaked above `--max-cpu-pct`. A low scaling efficiency is a result, not an issue.
+- `issues`: the run is invalid, and exits 1, if a phase had failed requests, more
+  than 0.1 router fallbacks/s or any truncated request body, the calibration did not
+  converge, or an engine or client node's CPU peaked above `--max-cpu-pct`. A low scaling
+  efficiency is a result, not an issue.
 
 ## Running
 
