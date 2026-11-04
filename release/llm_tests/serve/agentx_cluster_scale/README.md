@@ -78,7 +78,7 @@ there are 256 replicas, so the theoretical output is about 1.44M tok/s.
 - Release test: `llm_serve_agentx_cluster_scale` in `release/release_tests.yaml`, with
   `compute_aws.yaml`. The image layer `byod_llm_agentx_cluster_scale.sh` installs AgentX
   in its own venv and the Dynamo wheel with the Python `MockerWorker`, pinned by URL and
-  sha256 under `s3://air-example-data/rayllm-ossci/dynamo/dc9d9a0/`.
+  sha256 under `s3://air-example-data/rayllm-ossci/dynamo/295c175/`.
 - Anywhere else: a Ray cluster whose head has no `CPU` resource, engine workers with
   `--node-cpus` CPUs, and optionally `agentx_client` workers. Submit it as a Ray job with
   this directory as the working dir, so replicas on every node can import `mock_engine`:

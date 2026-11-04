@@ -5,12 +5,13 @@
 set -exo pipefail
 
 # Dynamo with the Python MockerWorker the benchmark's engines use, built from
-# jeffreywang88/dynamo@dc9d9a0 (kvbench-mocker); no Dynamo release has it yet.
+# ai-dynamo/dynamo main @ 2d126e0 plus jeffreywang88/dynamo@295c175
+# (kvbench-mocker-main); no Dynamo release has it yet.
 # --no-deps: ai-dynamo-runtime constrains pydantic and uvloop, both already
 # pinned by the base llm image's vLLM install.
 cat > /tmp/ai-dynamo-runtime.txt <<'EOF'
-ai-dynamo-runtime @ https://air-example-data.s3.us-west-2.amazonaws.com/rayllm-ossci/dynamo/dc9d9a0/ai_dynamo_runtime-1.7.0-cp311-abi3-manylinux_2_35_x86_64.whl \
-    --hash=sha256:35e13eb1f530e7a173d825abd5baac98b3564c3e5b83be5b4e1de4468608d8c0
+ai-dynamo-runtime @ https://air-example-data.s3.us-west-2.amazonaws.com/rayllm-ossci/dynamo/295c175/ai_dynamo_runtime-1.7.0-cp311-abi3-manylinux_2_35_x86_64.whl \
+    --hash=sha256:7db4e71dcf1e76db9e05f80724c0116f3bcd09913f2bea72976127cb1f76d8ef
 EOF
 pip3 install --no-cache-dir --no-deps --require-hashes -r /tmp/ai-dynamo-runtime.txt
 
