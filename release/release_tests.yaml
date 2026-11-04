@@ -4688,7 +4688,7 @@
 # Cluster scaling of Ray Serve LLM orchestration: Dynamo Mocker engines calibrated to an
 # InferenceX datapoint (DeepSeek-V4.1-Flash, DEP4, c128), driven by AgentX.
 - name: llm_serve_agentx_cluster_scale
-  # Manual until the Dynamo wheel in byod_llm_agentx_cluster_scale.sh is published.
+  # Manual until the Dynamo wheel in byod_llm_agentx_cluster_scale.sh is uploaded.
   frequency: manual
   python: "3.12"
   group: llm-serve
