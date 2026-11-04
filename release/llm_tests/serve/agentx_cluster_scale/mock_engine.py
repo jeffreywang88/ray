@@ -6,7 +6,6 @@ request lifecycle events to every ``LLMRouter`` replica and serves
 ``/v1/chat/completions``. The ingress router is the real ``LLMRouter``.
 """
 
-import asyncio
 import json
 import time
 import uuid
@@ -27,13 +26,16 @@ from ray.llm._internal.serve.routing_policies.kv_aware import token_channel
 from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
     KV_TOKEN_KEY_HEADER,
     KV_TOKEN_METADATA_KEY,
-    LIFECYCLE_EVENT_BROADCAST_TIMEOUT_S,
 )
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_router import (
     KVAwareRouter,
 )
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_token_tracker import (
     get_llm_router_handle,
+    get_worker_id,
+)
+from ray.llm._internal.serve.routing_policies.kv_aware.vllm.token_tracking import (
+    LifecycleEventForwarder,
 )
 from ray.serve.config import RequestRouterConfig
 from ray.serve.deployment import Application
@@ -48,50 +50,6 @@ DEFAULT_MAX_TOKENS = 256
 KV_PORT_BASE = 23000
 REPLAY_PORT_OFFSET = 100
 TOKEN_PORT_OFFSET = 200
-
-
-class LifecycleEventForwarder:
-    """Copy of ``kv_aware.vllm.token_tracking.LifecycleEventForwarder``, which
-    imports vLLM. Batches lifecycle events and broadcasts them in order to every
-    LLMRouter replica without blocking generation."""
-
-    def __init__(self, handle):
-        self._handle = handle
-        self._events: asyncio.Queue = asyncio.Queue()
-        self._delivery_task: Optional[asyncio.Task] = None
-
-    def report(self, method_name: str, *args) -> None:
-        if self._delivery_task is None or self._delivery_task.done():
-            self._delivery_task = asyncio.get_running_loop().create_task(
-                self._deliver()
-            )
-        self._events.put_nowait((method_name, args))
-
-    async def _deliver(self) -> None:
-        while True:
-            batch = [await self._events.get()]
-            while not self._events.empty():
-                batch.append(self._events.get_nowait())
-            try:
-                results = await self._handle.broadcast(
-                    "on_lifecycle_events", batch
-                ).results_async(
-                    timeout_s=LIFECYCLE_EVENT_BROADCAST_TIMEOUT_S,
-                    return_exceptions=True,
-                )
-                errors = [r for r in results if isinstance(r, Exception)]
-                if errors:
-                    logger.warning(
-                        "KV lifecycle events dropped on %d/%d routers: %s",
-                        len(errors),
-                        len(results),
-                        errors[0],
-                    )
-            except Exception as e:
-                logger.warning("Dropping KV lifecycle events: %s", e)
-            finally:
-                for _ in batch:
-                    self._events.task_done()
 
 
 class MockerServer:
@@ -123,7 +81,9 @@ class MockerServer:
             },
             KV_TOKEN_METADATA_KEY: {"endpoint": f"tcp://{ip}:{token_port}"},
         }
-        self._forwarder = LifecycleEventForwarder(get_llm_router_handle())
+        self._forwarder = LifecycleEventForwarder(
+            get_llm_router_handle(), get_worker_id(context.replica_id.unique_id)
+        )
         self._app = Starlette(
             routes=[
                 Route("/v1/chat/completions", self._chat, methods=["POST"]),
