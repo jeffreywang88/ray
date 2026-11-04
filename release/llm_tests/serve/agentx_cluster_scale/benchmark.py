@@ -32,6 +32,9 @@ PERF_METRICS = (
     ("p90_ttft_ms", "LATENCY"),
     ("route_p50_ms", "LATENCY"),
     ("route_p99_ms", "LATENCY"),
+    # Share of routed requests past Serve's top latency bucket (1 s), whose
+    # time the histogram can't resolve.
+    ("route_share_over_top_bucket", "LATENCY"),
     ("tok_s_scaling_efficiency", "THROUGHPUT"),
     ("p90_interactivity_ratio", "THROUGHPUT"),
     # Prompt tokens the engines served from cache: how well KV-aware routing

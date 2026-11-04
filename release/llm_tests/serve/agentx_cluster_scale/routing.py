@@ -166,6 +166,8 @@ class RoutingScraper:
         empty = {
             "route_p50_ms": None,
             "route_p99_ms": None,
+            "route_share_over_top_bucket": None,
+            "route_top_bucket_ms": None,
             "fallbacks_per_s": None,
             "truncated_bodies": None,
             **prompt_sources({}),
@@ -181,7 +183,16 @@ class RoutingScraper:
             "truncated_bodies": counters.get("truncations", 0.0),
             **prompt_sources(counters),
         }
-        if buckets.get(math.inf, 0.0) > 0:
-            result["route_p50_ms"] = histogram_quantile(buckets, 0.5)
-            result["route_p99_ms"] = histogram_quantile(buckets, 0.99)
+        total = buckets.get(math.inf, 0.0)
+        if total > 0:
+            # Serve's histogram tops out at 1 s, and routing a prompt near 1M
+            # tokens takes seconds (mostly tokenization). A quantile past the
+            # top bucket is unknown, so it is None rather than the bucket bound.
+            top = max(b for b in buckets if not math.isinf(b))
+            over = 1 - buckets.get(top, 0.0) / total
+            result["route_share_over_top_bucket"] = over
+            result["route_top_bucket_ms"] = top
+            for q, key in ((0.5, "route_p50_ms"), (0.99, "route_p99_ms")):
+                if 1 - q >= over:
+                    result[key] = histogram_quantile(buckets, q)
         return result

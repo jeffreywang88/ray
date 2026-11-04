@@ -33,10 +33,52 @@ thing from it as from a vLLM replica:
   over ZMQ when it names itself in the `kv-lifecycle-owner` header (replica mesh,
   ray-project/ray#67791), otherwise broadcast to every `LLMRouter` replica.
 
-HAProxy's routing body limit stays at Serve's 8 MiB default. The traces' prompts have a
-median of 142k tokens and reach 990k, so most bodies are larger than 512 KiB. A body over the
-limit reaches the router truncated, and the router routes it without tokens. Every phase counts
-truncations, and a run with any is invalid.
+**Routing up to a 1M-token context.** The router must get, and tokenize, every prompt in
+full, as in production. A body HAProxy truncates, or a router call that times out, is routed
+without tokens, so without KV overlap. The traces' prompts have a median of 142k tokens and
+reach 990k. Two HAProxy limits are raised:
+
+| Flag | Default | Why |
+| --- | --- | --- |
+| `--router-body-buffer-mib` | 16 | A 1M-token AgentX prompt is ~4.2 MB of JSON: 3.97 bytes per token, measured with the default tokenizer on AgentX's corpus. |
+| `--router-timeout-s` | 30 | The router renders and tokenizes a 1M-token prompt in ~3.9 s on an idle core. Serve's default is 5 s. |
+
+Every phase counts truncated bodies, and a run with any is invalid. Serve's router-latency
+histogram tops out at 1 s, while routing a long prompt takes seconds (mostly tokenization). So
+`route_share_over_top_bucket` reports the share past 1 s, and a routing percentile that falls
+there is `None` rather than 1000 ms.
+
+## What the KV hit ratio means
+
+The hit ratio is not a calibrated knob like the speedups. The Mocker runs a block-level
+prefix cache on the token ids it is given, and its mechanics match vLLM v1's
+`KVCacheManager`:
+
+- Blocks are content-hash chains (16-token blocks).
+- The lookup happens at the first schedule. Blocks become visible as their prefill chunk is
+  scheduled.
+- `cached_tokens` is capped at `(prompt - 1)` rounded down to whole blocks.
+- Freed blocks are evicted LRU, a request's tail first, out of `--kv-cache-tokens`.
+- Preemption works the same way.
+
+The hit then sets prefill cost, which the timing model charges only for uncached tokens. So the
+ratio measures what KV-aware routing controls: whether each turn lands on the engine that holds
+its prefix.
+
+It is not production vLLM's hit ratio for the default model:
+
+- **The Mocker can't cache hybrid models.** It prefix-caches a single full-attention KV cache
+  and refuses prefix caching with multiple KV-cache groups. DeepSeek-V4's sliding-window and
+  compressed groups can only lower vLLM's hit, so read the Mocker's ratio as an upper bound
+  for it.
+- **Each engine pools a whole DP group's cache.** One Mocker stands for a DEP replica with
+  the summed KV cache. Ray Serve LLM runs each DP rank as its own replica with its own cache,
+  so the routers in production index `gpus-per-replica` times more workers.
+- **Output blocks never hit.** Their token ids are synthetic. With real engines they wouldn't
+  either here, because AgentX replays the trace's assistant text, not the generated output.
+- **Long prompts cost too little.** The default timing model prices prefill by uncached
+  tokens, with no context-length term. That shifts residency and KV pressure, not the cache
+  mechanics.
 
 ## Phases
 
@@ -87,9 +129,9 @@ there are 256 replicas, so the theoretical output is about 1.44M tok/s.
 
 - `perf_metrics`: per phase, output tok/s (total and per replica), p90 interactivity,
   req/s, mean and p90 TTFT, routing p50 and p99 (HAProxy's time in the ingress router,
-  from `ray_serve_haproxy_ingress_router_latency_ms`), and `tok_s_scaling_efficiency`
-  (phase tok/s / (engines x replica tok/s)) and `p90_interactivity_ratio` (phase /
-  replica).
+  from `ray_serve_haproxy_ingress_router_latency_ms`; `None` past its 1 s top bucket) and
+  `route_share_over_top_bucket`, KV hit ratio, `tok_s_scaling_efficiency` (phase tok/s /
+  (engines x replica tok/s)) and `p90_interactivity_ratio` (phase / replica).
 - `phases`: every metric per phase, including the router count, KV hit ratio, peak
   CPU of the engine and client nodes, HAProxy's `truncated_bodies`, and where the engines'
   prompts came from (`prompts_from_token_channel`, `prompts_engine_tokenized_no_key`,

@@ -12,10 +12,6 @@ import sys
 
 import ray
 
-# HAProxy's routing body limit stays at Serve's default (8 MiB). The traces'
-# prompts reach 990k tokens (median 142k), several MB of JSON. A body over the
-# limit reaches the router truncated, so it is routed without KV overlap; the
-# benchmark counts truncations and fails the run if there are any.
 SERVE_ENV = {
     "RAY_SERVE_ENABLE_HA_PROXY": "1",
     "RAY_SERVE_LLM_ENABLE_DIRECT_STREAMING": "1",
@@ -23,6 +19,25 @@ SERVE_ENV = {
     "RAY_SERVE_HAPROXY_MAXCONN": "65536",
     "RAY_SERVE_INGRESS_REQUEST_ROUTER_METRICS_ENABLED": "1",
 }
+
+
+def router_env(args: argparse.Namespace) -> dict:
+    """HAProxy limits that let the router tokenize every prompt, up to the
+    model's full context, as in production.
+
+    - Body buffer: HAProxy forwards at most this much of a body to the router.
+      A truncated body is routed without tokens, so without KV overlap.
+    - Timeout: HAProxy's wait for the body and for each router call. Past it,
+      HAProxy retries another router, then falls back to its own pick.
+    """
+    return {
+        "RAY_SERVE_HAPROXY_INGRESS_REQUEST_ROUTER_BUFSIZE": str(
+            args.router_body_buffer_mib * 1024 * 1024
+        ),
+        "RAY_SERVE_HAPROXY_INGRESS_REQUEST_ROUTER_TIMEOUT_S": str(
+            args.router_timeout_s
+        ),
+    }
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -56,6 +71,21 @@ def parse_args(argv=None) -> argparse.Namespace:
     c.add_argument("--chips-per-node", type=int, default=8)
     c.add_argument("--node-cpus", type=float, default=16)
     c.add_argument("--routers-per-node", type=int, default=2)
+    c.add_argument(
+        "--router-body-buffer-mib",
+        type=int,
+        default=16,
+        help="HAProxy's routing body buffer. A 1M-token AgentX prompt is about "
+        "4.2 MB of JSON (3.97 bytes per token, measured with the default "
+        "tokenizer); 16 MiB leaves about 4x headroom.",
+    )
+    c.add_argument(
+        "--router-timeout-s",
+        type=int,
+        default=30,
+        help="HAProxy's limit on each router call. The router tokenizes a 1M-token "
+        "prompt in about 4 s on an idle core (Serve's default limit is 5 s).",
+    )
     c.add_argument(
         "--client-nodes",
         type=int,
@@ -102,6 +132,7 @@ def main() -> int:
     args = parse_args()
     env_vars = {
         **SERVE_ENV,
+        **router_env(args),
         "RAY_SERVE_INGRESS_ROUTER_REPLICAS_PER_NODE": str(args.routers_per_node),
     }
     # Serve reads these at import time, so set them before importing it.
