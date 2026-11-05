@@ -170,7 +170,9 @@ class LLMRouter:
                 Tokenizer,
             )
 
-            self._tokenizer = await asyncio.to_thread(Tokenizer, llm_config)
+            self._tokenizer = await asyncio.to_thread(
+                Tokenizer, llm_config, prompt_token_cache=True
+            )
         self._trace = kv_trace.writer("router")
         if self._trace is not None:
             if self._tokenizer is not None:

@@ -1,5 +1,6 @@
 from ray.serve._private.constants import SERVE_INGRESS_ROUTER_HEADER_PREFIX
 from ray.serve._private.constants_utils import (
+    get_env_bool,
     get_env_float_positive,
     get_env_int_positive,
 )
@@ -28,6 +29,14 @@ KV_TOKEN_STAGING_MAX_ENTRIES = get_env_int_positive(
 KV_TOKEN_STAGING_MAX_BYTES = get_env_int_positive(
     "RAY_SERVE_LLM_KV_TOKEN_STAGING_MAX_BYTES", 1024**3
 )
+# LLMRouter's prompt token cache (vllm/prompt_token_cache.py): reuses the token
+# IDs of earlier prompts' prefixes. VERIFY also encodes every prompt in full,
+# returns that, and logs any mismatch with the cached encoding.
+KV_TOKEN_CACHE_ENABLED = get_env_bool("RAY_SERVE_LLM_KV_TOKEN_CACHE", "1")
+KV_TOKEN_CACHE_MAX_BYTES = get_env_int_positive(
+    "RAY_SERVE_LLM_KV_TOKEN_CACHE_MAX_BYTES", 1024**3
+)
+KV_TOKEN_CACHE_VERIFY = get_env_bool("RAY_SERVE_LLM_KV_TOKEN_CACHE_VERIFY", "0")
 KV_TOKEN_ZMQ_SEND_QUEUE_LIMIT = 256
 KV_TOKEN_ZMQ_RECEIVE_QUEUE_LIMIT = 1024
 KV_TOKEN_ZMQ_MAX_SOCKETS = 4096

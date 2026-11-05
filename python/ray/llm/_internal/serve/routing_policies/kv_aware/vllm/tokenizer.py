@@ -22,6 +22,14 @@ from ray.llm._internal.serve.engines.vllm.vllm_engine import (
     _get_vllm_engine_config,
 )
 from ray.llm._internal.serve.observability.logging import get_logger
+from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
+    KV_TOKEN_CACHE_ENABLED,
+    KV_TOKEN_CACHE_MAX_BYTES,
+    KV_TOKEN_CACHE_VERIFY,
+)
+from ray.llm._internal.serve.routing_policies.kv_aware.vllm.prompt_token_cache import (
+    install_prompt_token_cache,
+)
 
 logger = get_logger(__name__)
 
@@ -89,9 +97,12 @@ class Tokenizer:
 
     Args:
         llm_config: The deployment's LLM config.
+        prompt_token_cache: Reuse the token IDs of earlier prompts' prefixes
+            (see ``prompt_token_cache``), unless
+            ``RAY_SERVE_LLM_KV_TOKEN_CACHE=0``.
     """
 
-    def __init__(self, llm_config: LLMConfig):
+    def __init__(self, llm_config: LLMConfig, *, prompt_token_cache: bool = False):
         engine_config = llm_config.get_engine_config()
         _, vllm_config = _get_vllm_engine_config(llm_config, device_type="cpu")
         self._model_config = vllm_config.model_config
@@ -115,6 +126,13 @@ class Tokenizer:
             tool_strict_level=frontend_args.tool_strict_level,
             default_chat_template_kwargs=frontend_args.default_chat_template_kwargs,
         )
+        self._prompt_token_cache = None
+        if prompt_token_cache and KV_TOKEN_CACHE_ENABLED:
+            self._prompt_token_cache = install_prompt_token_cache(
+                self._renderer.renderer,
+                max_bytes=KV_TOKEN_CACHE_MAX_BYTES,
+                verify=KV_TOKEN_CACHE_VERIFY,
+            )
         # Check the templates the renderer actually uses, including the model's
         # default when no chat-template override is configured.
         self._merge_inline_system = (
