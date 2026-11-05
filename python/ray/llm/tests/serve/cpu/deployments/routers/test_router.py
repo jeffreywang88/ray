@@ -350,6 +350,55 @@ class TestRoutingPayload:
     def test_returns_none_when_no_key_derivable(self, body):
         assert _parse_routing_payload(body) is None
 
+    @pytest.mark.parametrize(
+        "body",
+        [
+            b'{"a":1,"a":2}',
+            b'{"a":NaN,"b":Infinity,"c":-Infinity}',
+            b'{"a":123456789012345678901234567890,"b":-18446744073709551617}',
+            b'{"a":1e400,"b":-1e400,"c":1e-400,"d":-0.0,"e":-0,"f":0.1}',
+            b'{"a":"\\ud800","b":"\\ud83d\\ude80","c":"\\u0000"}',
+            b'\xef\xbb\xbf{"a":1}',
+            '{"a":"\u00e9"}'.encode("utf-16"),
+            b'{"a":"\xff"}',
+            b'{"a":"x\x01y"}',
+            b'{"a":01}',
+            b'{"a":1} x',
+            b' \n{"a":[1,{"b":null}],"c":true}\r\n',
+            b"null",
+            b'{"a":' + b"[" * 500 + b"]" * 500 + b"}",
+            b'{"a":' + b"[" * 100_000 + b"]" * 100_000 + b"}",
+        ],
+    )
+    def test_json_loads_matches_json_module(self, body):
+        """The fast JSON path returns or raises exactly what json.loads does."""
+        import json
+        import math
+
+        def outcome(loads):
+            try:
+                return "ok", loads(body)
+            except (ValueError, TypeError, RecursionError) as e:
+                return "error", type(e)
+
+        def same(a, b):
+            if type(a) is not type(b):
+                return False
+            if isinstance(a, float):
+                return (math.isnan(a) and math.isnan(b)) or (
+                    a == b and math.copysign(1, a) == math.copysign(1, b)
+                )
+            if isinstance(a, dict):
+                return list(a) == list(b) and all(same(a[k], b[k]) for k in a)
+            if isinstance(a, list):
+                return len(a) == len(b) and all(map(same, a, b))
+            return a == b
+
+        fast, reference = outcome(router_module._json_loads), outcome(json.loads)
+        assert fast[0] == reference[0]
+        if fast[0] == "ok":
+            assert same(fast[1], reference[1])
+
     @pytest.mark.asyncio
     async def test_payload_satisfies_prefix_router_contract(self):
         """The normalized payload is read by the real
