@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import uuid
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -14,6 +15,7 @@ from ray.llm._internal.serve.routing_policies.kv_aware.constants import (
     KV_TOKEN_KEY_HEADER,
     REQUEST_TOKEN_IDS_KWARG,
 )
+from ray.llm._internal.serve.routing_policies.kv_aware import trace as kv_trace
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_token_tracker import (
     get_token_endpoint,
 )
@@ -137,6 +139,9 @@ class LLMRouter:
     # keeps the guard safe before __init__ runs.
     _warned_no_routing_key: bool = False
     _warned_no_token_endpoint: bool = False
+    # Per-request latency trace (RAY_SERVE_LLM_KV_TRACE_DIR); None when off.
+    _trace = None
+    _traced_headers: int = 0
     _base_model_id: Optional[str] = None
     _kv_token_tracker = None
 
@@ -166,6 +171,13 @@ class LLMRouter:
             )
 
             self._tokenizer = await asyncio.to_thread(Tokenizer, llm_config)
+        self._trace = kv_trace.writer("router")
+        if self._trace is not None:
+            if self._tokenizer is not None:
+                kv_trace.wrap_executor(self._tokenizer._renderer.renderer._executor)
+            self._lag_task = asyncio.create_task(
+                kv_trace.monitor_loop_lag(self._trace)
+            )
         self._handle._init()
 
     def _start_kv_token_tracking(
@@ -193,10 +205,33 @@ class LLMRouter:
 
     @router_app.post("/internal/route")
     async def route(self, request: Request):
+        if self._trace is None:
+            return await self._route(request, None)
+        record = {"t_in": time.time()}
+        kv_trace.current.set(record)
+        try:
+            return await self._route(request, record)
+        except BaseException as e:
+            record["err"] = type(e).__name__
+            raise
+        finally:
+            record["t_out"] = time.time()
+            self._trace.write(record)
+
+    async def _route(self, request: Request, record: Optional[Dict[str, Any]]):
         body = await request.body()
+        if record is not None:
+            record["t_body"] = time.time()
+            record["body_bytes"] = len(body)
+            record["xrid"] = request.headers.get("x-request-id")
+            if self._traced_headers < 3:
+                self._traced_headers += 1
+                record["headers"] = sorted(request.headers.keys())
         body_truncated = _BODY_TRUNCATED_HEADER in request.headers
         request_body = _parse_request_body(body)
         routing_payload = _get_routing_payload_from_body(request_body)
+        if record is not None:
+            record["t_parse"] = time.time()
         if routing_payload is None and not self._warned_no_routing_key:
             self._warned_no_routing_key = True
             logger.warning(
@@ -230,6 +265,10 @@ class LLMRouter:
                 raise HTTPException(status_code=e.status_code, detail=e.message)
             # Media needs engine preprocessing, not just prompt token IDs.
             stage_token_ids = is_text_only_chat(payload.get("messages", []))
+            if record is not None:
+                record["t_tok"] = time.time()
+                record["n_tok"] = len(request_token_ids or ())
+                record["n_msgs"] = len(payload.get("messages") or ())
         # HAProxy forwards the configured session header on the same name,
         # but use the same case-insensitive, separator-tolerant matcher as
         # proxy.py / ingress.py so a `-`/`_` rewrite anywhere in the path
@@ -242,6 +281,9 @@ class LLMRouter:
         handle = self._get_handle(multiplexed_model_id)
         if session_id:
             handle = handle.options(session_id=session_id)
+        if record is not None:
+            record["sid"] = session_id
+            record["t_pick0"] = time.time()
         try:
             host, port, replica_id, token_endpoint = await self._pick_replica(
                 handle=handle,
@@ -254,6 +296,9 @@ class LLMRouter:
             raise HTTPException(status_code=503, detail=str(e))
 
         response = {"host": host, "port": port, "replica_id": replica_id}
+        if record is not None:
+            record["t_pick"] = time.time()
+            record["replica"] = replica_id
         request_headers = {}
         if multiplexed_model_id:
             request_headers[SERVE_MULTIPLEXED_MODEL_ID] = multiplexed_model_id
@@ -265,6 +310,9 @@ class LLMRouter:
             )
             if token_key:
                 request_headers[KV_TOKEN_KEY_HEADER] = token_key
+            if record is not None:
+                record["t_push"] = time.time()
+                record["pushed"] = bool(token_key)
         lifecycle_endpoint = (
             self._kv_token_tracker.lifecycle_endpoint
             if self._kv_token_tracker is not None
