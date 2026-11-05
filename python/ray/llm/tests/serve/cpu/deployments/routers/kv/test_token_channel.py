@@ -88,6 +88,18 @@ async def _wait_until_staged(store, keys):
     pytest.fail(f"Timed out waiting for staged prompt tokens: {sorted(remaining)}")
 
 
+def test_encodes_uint32_array_like_list():
+    """The router passes the prompt token cache's uint32 array when it has
+    one; the payload is the same bytes as for the list."""
+    import numpy as np
+
+    ids = [0, 1, 255, 65536, 151_643, 2**32 - 1]
+    assert encode_prompt_token_ids(np.asarray(ids, dtype=np.uint32)) == (
+        encode_prompt_token_ids(ids)
+    )
+    assert token_channel.decode_prompt_token_ids(encode_prompt_token_ids(ids)) == ids
+
+
 def test_sender_exceeds_default_socket_cap():
     """Opens more sockets than the default context's 1023 cap."""
     sender = TokenSender(max_sockets=1100)
@@ -575,6 +587,53 @@ async def test_routes_tokens_to_replica():
         sender.close()
         await selected_receiver.close()
         await unselected_receiver.close()
+
+
+@pytest.mark.asyncio
+async def test_router_sends_the_prompt_token_cache_array():
+    """The router hands the session ID to the prompt token cache, routes on
+    the token ID list, and pushes the cache's uint32 array as is."""
+    import numpy as np
+
+    from ray.llm._internal.serve.routing_policies.kv_aware.vllm.prompt_token_cache import (  # noqa: E501
+        _request_scope,
+    )
+
+    ids = [5, 6, 7]
+    array = np.asarray(ids, dtype=np.uint32)
+    sessions = []
+
+    async def tokenize(payload, request_path=None):
+        scope = _request_scope.get()
+        sessions.append(scope.session_id)
+        result = list(ids)
+        scope.put(result, array)
+        return result
+
+    router = LLMRouter.__new__(LLMRouter)
+    router._handle = MagicMock()
+    router._tokenizer = MagicMock()
+    router._tokenizer.tokenize = tokenize
+    router._pick_replica = AsyncMock(return_value=("host", 8000, "r", "tcp://x:1"))
+    router._push_prompt_tokens = MagicMock(return_value="key")
+    request = MagicMock()
+    request.body = AsyncMock(
+        return_value=b'{"model":"m","messages":[{"role":"user","content":"hi"}]}'
+    )
+    request.headers = Headers(
+        {
+            SERVE_INGRESS_ROUTER_REQUEST_PATH_HEADER: "/v1/chat/completions",
+            "x-session-id": "conversation-1",
+        }
+    )
+
+    response = await router.route(request)
+
+    assert sessions == ["conversation-1"]
+    assert router._pick_replica.call_args.kwargs["request_token_ids"] == ids
+    assert router._push_prompt_tokens.call_args.kwargs["request_token_ids"] is array
+    routed_headers = response[RAY_SERVE_INGRESS_REQUEST_ROUTER_OPT_HEADERS_FIELD]
+    assert routed_headers[KV_TOKEN_KEY_HEADER] == "key"
 
 
 class TestTokenReceiverFailures:

@@ -8,6 +8,7 @@ import random
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import pytest
 from transformers import AutoTokenizer
 
@@ -15,6 +16,7 @@ from ray.llm._internal.serve.core.configs.llm_config import LLMConfig
 from ray.llm._internal.serve.routing_policies.kv_aware import trace as kv_trace
 from ray.llm._internal.serve.routing_policies.kv_aware.vllm.prompt_token_cache import (
     PromptTokenCache,
+    RequestScope,
     _BoundaryScanner,
     _TokenMatcher,
     _unsupported_reason,
@@ -133,6 +135,24 @@ class TestBoundaryScanner:
                 [i for _, _, i in expected],
             )
 
+    @pytest.mark.parametrize("seed", range(20))
+    def test_scan_resumes_at_any_boundary(self, seed):
+        """Scanning from the end of a boundary token finds the rest of the
+        full scan, which lets a session's next prompt skip its shared prefix."""
+        rng = random.Random(seed)
+        names = rng.sample(self.TOKENS, 6)
+        added = [
+            {"id": i, "content": t.decode(), "normalized": i % 3 == 1}
+            for i, t in enumerate(names)
+        ]
+        scanner = _BoundaryScanner(added, identity_normalizer=True)
+        assert scanner.max_token_bytes == max(len(t) for t in names)
+        for _ in range(50):
+            data = bytes(rng.choice(b"abcxy<> ") for _ in range(rng.randint(0, 40)))
+            ends, ids = scanner.scan(data)
+            for k, end in enumerate(ends):
+                assert scanner.scan(data, end) == (ends[k + 1 :], ids[k + 1 :])
+
 
 class TestExactness:
     @pytest.mark.parametrize("seed", range(5))
@@ -154,6 +174,70 @@ class TestExactness:
                 reused += record["tok_reused"]
                 assert record["tok_reused"] + record["tok_encoded"] == len(ids)
         assert reused > 0
+
+    @pytest.mark.parametrize("seed", range(5))
+    def test_sessions_resume_their_latest_prompt(self, hf_tokenizer, seed):
+        """Turns of interleaved sessions with session hints, including wrong
+        hints (sessions sharing one), edits of earlier turns, shorter prompts
+        and prompts ending in part of an added token, encode exactly. Most
+        turns scan and hash only what they add to the session's latest one."""
+        rng = random.Random(seed)
+        cache = _cache(hf_tokenizer)
+        resumed = []
+        resume = cache._resume
+        cache._resume = lambda *a: resumed.append(resume(*a)) or resumed[-1]
+        system = "<|im_start|>system\n" + _random_text(rng, 30) + "<|im_end|>\n"
+        sessions = {f"s{i}": system for i in range(4)}
+        hints = {name: rng.choice([name, name, "shared"]) for name in sessions}
+        for _ in range(80):
+            name = rng.choice(list(sessions))
+            history = sessions[name]
+            turn = "<|im_start|>user\n" + _random_text(rng, 8) + "<|im_end|>\n"
+            prompt = history + turn + "<|im_start|>assistant\n"
+            r = rng.random()
+            if r < 0.1:
+                cut = rng.randint(0, len(prompt))
+                prompt = prompt[:cut] + rng.choice(PIECES) + prompt[cut:]
+            elif r < 0.2:
+                prompt = prompt[: rng.randint(0, len(prompt))]
+            elif r < 0.3:
+                prompt += rng.choice(["<|im_", "<", "<think", "|>"])
+            for kwargs in (CHAT, {"add_special_tokens": True}):
+                record = {}
+                result = cache.encode_array(prompt, kwargs, record, hints[name])
+                expected = hf_tokenizer(prompt, **kwargs)["input_ids"]
+                assert result[0] == expected
+                assert result[1].dtype == np.uint32
+                assert result[1].tolist() == expected
+                assert record["tok_reused"] + record["tok_encoded"] == len(expected)
+            sessions[name] = (
+                history
+                + turn
+                + "<|im_start|>assistant\n"
+                + (_random_text(rng, 8) + "<|im_end|>\n")
+            )
+        assert sum(r is not None for r in resumed) > len(resumed) // 2
+        assert 0 < cache.stats()["sessions"] <= len(sessions)
+
+    def test_session_prompts_memory_bounded(self, hf_tokenizer):
+        rng = random.Random(2)
+        cache = _cache(hf_tokenizer, max_bytes=40_000)
+        for i in range(100):
+            prompt = _random_text(rng, rng.randint(1, 120))
+            ids = cache.encode(prompt, CHAT, session=f"s{i % 7}")
+            assert ids == hf_tokenizer(prompt, **CHAT)["input_ids"]
+            assert cache.stats()["session_bytes"] <= 10_000
+
+    def test_fast_backend_matches_tokenizer(self, hf_tokenizer):
+        cache = _cache(hf_tokenizer)
+        assert cache._fast_backend is not None
+        rng = random.Random(3)
+        for _ in range(20):
+            text = _random_text(rng, rng.randint(0, 80))
+            assert (
+                cache._encode_rest(text, CHAT)
+                == hf_tokenizer(text, add_special_tokens=False)["input_ids"]
+            )
 
     def test_concurrent_encodes(self, hf_tokenizer):
         rng = random.Random(0)
@@ -280,7 +364,10 @@ async def test_router_tokenizer_sessions(hf_tokenizer):
             payload = {"model": "test-model", "messages": messages}
             record = {}
             kv_trace.current.set(record)
-            ids = await cached.tokenize(payload, request_path="/v1/chat/completions")
+            with RequestScope(session_id=f"session-{session}") as scope:
+                ids = await cached.tokenize(
+                    payload, request_path="/v1/chat/completions"
+                )
             kv_trace.current.set(None)
             assert ids == await plain.tokenize(
                 payload, request_path="/v1/chat/completions"
@@ -288,6 +375,10 @@ async def test_router_tokenizer_sessions(hf_tokenizer):
             assert record["tok_reused"] + record["tok_encoded"] == len(ids)
             if turn or session:
                 assert record["tok_reused"] > 0
+            # The IDs come with the array the cache built them from.
+            array = scope.token_array(ids)
+            assert array is not None and array.tolist() == ids
+            assert scope.token_array(list(ids)) is None
             messages.append({"role": "assistant", "content": _random_text(rng, 10)})
 
 

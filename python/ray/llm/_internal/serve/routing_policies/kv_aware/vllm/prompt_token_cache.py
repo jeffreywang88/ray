@@ -16,15 +16,22 @@ The keys are content hashes of prompt prefixes, not session IDs, so prompts
 that share a prefix (e.g. a system prompt) share its tokens too, and the next
 turn hits even though it diverges from the previous prompt shortly before its
 end (the generation prompt, or the previous answer's dropped reasoning).
+
+Finding those prefixes means scanning the whole prompt for added tokens and
+hashing it. With a session ID (``RequestScope``), the cache instead compares
+the prompt byte for byte with the session's latest one, takes the scan and
+hashes of the shared part from it, and scans and hashes only the rest; a
+wrong or stale session ID only costs that shortcut.
 """
 
 import asyncio
+import contextvars
 import functools
 import hashlib
 import json
 import re
 import threading
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -68,6 +75,57 @@ _INDEX_BYTES_PER_KEY = 200
 _SUPERSEDED_TAIL_TOKENS = 32
 _DIGEST_SIZE = 16
 _MAX_LOGGED_MISMATCHES = 20
+# Per session, the hash states kept at the last boundaries of its latest
+# prompt: its next prompt resumes scanning and hashing at the last of these
+# that it shares. The next prompt usually differs from the latest only in its
+# last one or two boundaries (the generation prompt).
+_RECENT_STATES = 16
+# Estimated bytes per boundary (end offset, token ID, digest) and per hash
+# state of a session's latest prompt.
+_RECENT_BYTES_PER_BOUNDARY = 120
+_RECENT_BYTES_PER_STATE = 500
+# Share of ``max_bytes`` that sessions' latest prompts may take in addition.
+_RECENT_BYTES_FRACTION = 0.25
+
+
+class RequestScope:
+    """The prompt token cache's view of one request, entered (as a context
+    manager) in the task that tokenizes the request.
+
+    In: the request's session ID, which lets the cache compare the prompt
+    with the session's latest one and scan and hash only what it adds.
+    Exactness never depends on it.
+
+    Out: the uint32 array the cache built the prompt token IDs from, so the
+    caller can serialize the IDs (``tobytes``) without converting the list.
+    """
+
+    __slots__ = ("session_id", "_ids", "_array", "_token")
+
+    def __init__(self, session_id: Optional[str] = None):
+        self.session_id = session_id
+        self._ids: Optional[List[int]] = None
+        self._array: Optional[np.ndarray] = None
+
+    def __enter__(self) -> "RequestScope":
+        self._token = _request_scope.set(self)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        _request_scope.reset(self._token)
+
+    def put(self, ids: List[int], array: np.ndarray) -> None:
+        self._ids, self._array = ids, array
+
+    def token_array(self, ids: Optional[List[int]]) -> Optional[np.ndarray]:
+        """The uint32 array of ``ids``, if they are the very list the cache
+        returned (not a copy or a truncated or concatenated list)."""
+        return self._array if ids is not None and ids is self._ids else None
+
+
+_request_scope: contextvars.ContextVar[Optional[RequestScope]] = contextvars.ContextVar(
+    "prompt_token_cache_request", default=None
+)
 
 
 def _is_identity_normalizer(normalizer: Optional[Dict[str, Any]]) -> bool:
@@ -215,10 +273,19 @@ class _BoundaryScanner:
         if identity_normalizer and normalized:
             self.token_ids.update(normalized)
             self._normalized = _TokenMatcher(normalized)
+        # Whether the scan matches a token at a position depends on at most
+        # this many bytes from there.
+        self.max_token_bytes = max(map(len, self.token_ids), default=0)
 
-    def scan(self, data: bytes) -> Tuple[List[int], List[int]]:
-        """Returns the end offsets and token IDs of the boundary tokens in ``data``."""
-        raw = self._raw.find(data, 0, len(data)) if self._raw is not None else []
+    def scan(self, data: bytes, start: int = 0) -> Tuple[List[int], List[int]]:
+        """Returns the end offsets and token IDs of the boundary tokens in
+        ``data[start:]``.
+
+        ``start`` must be 0 or the end of a boundary token of ``data``, where
+        the scan of all of ``data`` resumes too.
+        """
+        end = len(data)
+        raw = self._raw.find(data, start, end) if self._raw is not None else []
         normalized = self._normalized
         if normalized is None:
             matches = raw
@@ -226,30 +293,66 @@ class _BoundaryScanner:
             # Normalized tokens are extracted from the pieces between raw ones.
             # Scanning the whole text finds the same unless a match overlaps a
             # raw token.
-            matches = sorted(raw + normalized.find(data, 0, len(data)))
+            matches = sorted(raw + normalized.find(data, start, end))
             if not _non_overlapping(matches):
                 matches = []
-                gap_start = 0
+                gap_start = start
                 for match in raw:
                     if match[0] > gap_start:
                         matches += normalized.find(data, gap_start, match[0])
                     matches.append(match)
                     gap_start = match[1]
-                if gap_start < len(data):
-                    matches += normalized.find(data, gap_start, len(data))
+                if gap_start < end:
+                    matches += normalized.find(data, gap_start, end)
         return [m[1] for m in matches], [m[2] for m in matches]
 
 
 class _Entry:
-    """The token IDs of one stored prompt, and the index keys pointing to it."""
+    """The token IDs of one stored prompt, and the index keys pointing to it.
 
-    __slots__ = ("tokens", "keys", "live", "nbytes")
+    ``counts[i]`` is the number of tokens up to and including the prompt's
+    ``i``-th boundary token.
+    """
 
-    def __init__(self, tokens: np.ndarray, keys: List[bytes]):
+    __slots__ = ("tokens", "keys", "counts", "live", "nbytes")
+
+    def __init__(self, tokens: np.ndarray, keys: List[bytes], counts: np.ndarray):
         self.tokens = tokens
         self.keys = keys
+        self.counts = counts
         self.live = 0
-        self.nbytes = tokens.nbytes + len(keys) * _INDEX_BYTES_PER_KEY
+        self.nbytes = tokens.nbytes + counts.nbytes + len(keys) * _INDEX_BYTES_PER_KEY
+
+
+class _RecentPrompt:
+    """A session's latest stored prompt, to scan and hash only what the
+    session's next prompt adds to it.
+
+    Holds the prompt's UTF-8 bytes, its boundaries' end offsets, token IDs
+    and digests, and the hash states at its last ``_RECENT_STATES``
+    boundaries, keyed by boundary index.
+    """
+
+    __slots__ = ("data", "ends", "ids", "digests", "states", "nbytes")
+
+    def __init__(
+        self,
+        data: bytes,
+        ends: List[int],
+        ids: List[int],
+        digests: List[bytes],
+        states: List[Tuple[int, Any]],
+    ):
+        self.data = data
+        self.ends = ends
+        self.ids = ids
+        self.digests = digests
+        self.states = states
+        self.nbytes = (
+            len(data)
+            + len(ends) * _RECENT_BYTES_PER_BOUNDARY
+            + len(states) * _RECENT_BYTES_PER_STATE
+        )
 
 
 class PromptTokenCache:
@@ -258,7 +361,9 @@ class PromptTokenCache:
     Every prefix of a stored prompt that ends right after a boundary added
     token is indexed by the hash of its UTF-8 bytes, so a new prompt reuses its
     longest stored prefix and encodes only the rest. Stored prompts are evicted
-    least recently used beyond ``max_bytes`` of tokens and index.
+    least recently used beyond ``max_bytes`` of tokens and index. Each
+    session's latest prompt (its text and scan) is kept too, least recently
+    used beyond ``max_bytes * _RECENT_BYTES_FRACTION``.
 
     Thread-safe: the renderer encodes on a thread pool. The lock covers only
     the index and LRU, never an encode.
@@ -294,10 +399,15 @@ class PromptTokenCache:
         self._is_boundary_id = np.zeros(size, dtype=bool)
         self._is_boundary_id[list(self._scanner.token_ids.values())] = True
         self._special_affixes = self._probe_special_affixes()
+        self._fast_backend = self._make_fast_backend()
         self._lock = threading.Lock()
         self._index: Dict[bytes, Tuple[_Entry, int]] = {}
         self._lru: "OrderedDict[_Entry, None]" = OrderedDict()
         self._bytes = 0
+        # Each session's latest stored prompt, least recently stored first.
+        self._recent: "OrderedDict[str, _RecentPrompt]" = OrderedDict()
+        self._recent_bytes = 0
+        self._max_recent_bytes = int(max_bytes * _RECENT_BYTES_FRACTION)
         self._mismatches = 0
         self._scan_mismatches = 0
 
@@ -341,6 +451,60 @@ class PromptTokenCache:
                 return False
         return True
 
+    def _make_fast_backend(self) -> Optional[Any]:
+        """A private copy of the backend tokenizer that encodes with
+        ``encode_batch_fast`` (no offsets: ~15% faster), or None.
+
+        Nothing changes its truncation or padding, so threads can share it.
+        Like ``encode_batch`` (which the tokenizer calls), and unlike
+        ``encode``, it releases the GIL. Used only if it encodes probe texts
+        exactly as the tokenizer does.
+        """
+        backend = self._tokenizer.backend_tokenizer
+        if not hasattr(backend, "encode_batch_fast"):
+            return None
+        try:
+            fast = type(backend).from_str(backend.to_str())
+            fast.no_truncation()
+            fast.no_padding()
+            fast.encode_special_tokens = False
+        except Exception:
+            return None
+        tokens = [t.decode() for t in self._scanner.token_ids][:4]
+        probes = [
+            "Hello, world! 123 4567",
+            " a\n\n  b\t\r\n c  ",
+            "你好世界 こんにちは 🚀 é ﬁ １２３ ½",
+            "def f(x):\n    return x <y> && z\n",
+        ] + [f"x {t}y\n{t}{t} {t}" for t in tokens]
+        for probe in probes:
+            if (
+                fast.encode_batch_fast([probe], add_special_tokens=False)[0].ids
+                != self._tokenizer(probe, add_special_tokens=False)["input_ids"]
+            ):
+                return None
+        return fast
+
+    def _encode_rest(self, rest: str, kwargs: Dict[str, Any]) -> List[int]:
+        """``tokenizer(rest, **kwargs)["input_ids"]`` without special tokens:
+        the IDs of the text after the reused prefix."""
+        if self._fast_backend is not None:
+            ids = self._fast_backend.encode_batch_fast(
+                [rest], add_special_tokens=False
+            )[0].ids
+            max_length = kwargs.get("max_length")
+            if not (
+                kwargs.get("truncation")
+                and max_length is not None
+                and len(ids) > max_length
+            ):
+                return ids
+            # The tokenizer would truncate them.
+        # The same truncation kwargs keep the tokenizer's shared state unchanged.
+        return self._tokenizer(rest, **{**kwargs, "add_special_tokens": False})[
+            "input_ids"
+        ]
+
     def _probe_special_affixes(self) -> Optional[Tuple[List[int], List[int]]]:
         """The IDs add_special_tokens=True puts before and after the text's, if
         the same for any text (as for TemplateProcessing's single sequence)."""
@@ -364,22 +528,43 @@ class PromptTokenCache:
                 "prompts": len(self._lru),
                 "keys": len(self._index),
                 "bytes": self._bytes,
+                "sessions": len(self._recent),
+                "session_bytes": self._recent_bytes,
                 "mismatches": self._mismatches,
             }
 
     def encode(
-        self, text: str, kwargs: Dict[str, Any], record: Optional[Dict] = None
+        self,
+        text: str,
+        kwargs: Dict[str, Any],
+        record: Optional[Dict] = None,
+        session: Optional[str] = None,
     ) -> Optional[List[int]]:
         """``tokenizer(text, **kwargs)["input_ids"]`` from cached prefixes.
 
         Returns None when it cannot be reproduced exactly; the caller then
         encodes as usual. Sets ``tok_reused`` and ``tok_encoded`` (and
         ``tok_mismatch`` when verifying) on the trace ``record``.
+
+        ``session`` (e.g. a session ID) names the conversation that ``text``
+        continues: the cache then compares ``text`` with the session's latest
+        prompt, and scans and hashes only what it adds. Any value is exact.
         """
-        result = self._encode(text, kwargs)
+        result = self.encode_array(text, kwargs, record, session)
+        return None if result is None else result[0]
+
+    def encode_array(
+        self,
+        text: str,
+        kwargs: Dict[str, Any],
+        record: Optional[Dict] = None,
+        session: Optional[str] = None,
+    ) -> Optional[Tuple[List[int], Optional[np.ndarray]]]:
+        """``encode``, also returning the IDs as a uint32 array (or None)."""
+        result = self._encode(text, kwargs, session)
         if result is None:
             return None
-        input_ids, reused, encoded, store = result
+        input_ids, array, reused, encoded, store = result
         if record is not None:
             record["tok_reused"] = reused
             record["tok_encoded"] = encoded
@@ -390,14 +575,15 @@ class PromptTokenCache:
                 record["tok_mismatch"] = mismatch
             if mismatch:
                 self._log_mismatch(input_ids, expected, reused)
-                return expected
+                return expected, None
         if store is not None:
             store()
-        return input_ids
+        return input_ids, array
 
-    def _encode(self, text: str, kwargs: Dict[str, Any]):
-        """Returns the input IDs, the numbers of reused and newly encoded
-        tokens, and a callable that stores the prompt (or None)."""
+    def _encode(self, text: str, kwargs: Dict[str, Any], session: Optional[str] = None):
+        """Returns the input IDs as a list and as a uint32 array, the numbers
+        of reused and newly encoded tokens, and a callable that stores the
+        prompt (or None)."""
         if not kwargs.keys() <= _SUPPORTED_ENCODE_KWARGS:
             return None
         add_special = kwargs.get("add_special_tokens", True)
@@ -408,18 +594,28 @@ class PromptTokenCache:
         except UnicodeEncodeError:  # Lone surrogates.
             return None
 
-        ends, boundary_ids = self._scanner.scan(data)
-        digests, full_digest = self._digests(data, ends)
+        scanned = None
+        if session is not None:
+            with self._lock:
+                recent = self._recent.get(session)
+            if recent is not None:
+                scanned = self._resume(recent, data)
+        if scanned is None:
+            ends, boundary_ids = self._scanner.scan(data)
+            digests, full_digest, states = self._digests(data, ends)
+        else:
+            ends, boundary_ids, digests, full_digest, states = scanned
 
         # The longest stored prefix: the whole text, else the last boundary.
+        # The first ``shared`` boundaries end within it.
         with self._lock:
             index = self._index
-            hit, cut = index.get(full_digest), len(data)
+            hit, cut, shared = index.get(full_digest), len(data), len(ends)
             if hit is None:
                 for i in range(len(digests) - 1, -1, -1):
                     hit = index.get(digests[i])
                     if hit is not None:
-                        cut = ends[i]
+                        cut, shared = ends[i], i + 1
                         break
             if hit is not None:
                 self._lru.move_to_end(hit[0])
@@ -427,27 +623,32 @@ class PromptTokenCache:
         if hit is None:
             prefix = np.empty(0, dtype=np.uint32)
             rest = text
+            shared = 0
         else:
             prefix = hit[0].tokens[: hit[1]]
             rest = data[cut:].decode("utf-8")
-        # The rest's pieces tokenize as they would within the whole text. The
-        # same truncation kwargs keep the tokenizer's shared state unchanged.
-        encoded = (
-            self._tokenizer(rest, **{**kwargs, "add_special_tokens": False})[
-                "input_ids"
-            ]
-            if rest
-            else []
-        )
+        # The rest's pieces tokenize as they would within the whole text.
+        encoded = self._encode_rest(rest, kwargs) if rest else []
         tokens = (
             np.concatenate((prefix, np.asarray(encoded, dtype=np.uint32)))
             if len(prefix)
             else np.asarray(encoded, dtype=np.uint32)
         )
-        input_ids = prefix.tolist() + encoded if len(prefix) else encoded
+        # One conversion of the whole array, rather than of the prefix and
+        # then a concatenation with the encoded list.
+        input_ids = tokens.tolist() if len(prefix) else encoded
+        array = tokens
         if add_special:
             before, after = self._special_affixes
-            input_ids = before + input_ids + after
+            if before or after:
+                input_ids = before + input_ids + after
+                array = np.concatenate(
+                    (
+                        np.asarray(before, dtype=np.uint32),
+                        tokens,
+                        np.asarray(after, dtype=np.uint32),
+                    )
+                )
         max_length = kwargs.get("max_length")
         if (
             kwargs.get("truncation")
@@ -457,58 +658,138 @@ class PromptTokenCache:
             # Possibly truncated: exact only as the tokenizer's own encode.
             if len(prefix) or len(input_ids) > max_length:
                 return None
-            return input_ids, 0, len(encoded), None
+            return input_ids, array, 0, len(encoded), None
         if not rest:
-            return input_ids, len(prefix), 0, None  # Already stored.
+            return input_ids, array, len(prefix), 0, None  # Already stored.
 
         # The scan must agree with the tokenizer on every boundary token, or
-        # the prefixes this prompt reused or would store may be wrong.
-        positions = np.flatnonzero(self._is_boundary_id[tokens])
-        if len(positions) != len(ends) or not np.array_equal(
-            tokens[positions], boundary_ids
+        # the prefixes this prompt reused or would store may be wrong. Those
+        # in the reused prefix agreed when its prompt was stored: up to the
+        # end of the prefix, right after a boundary token in both prompts,
+        # the scans of both find the same tokens.
+        new_tokens = tokens[len(prefix) :]
+        positions = np.flatnonzero(self._is_boundary_id[new_tokens])
+        if len(positions) != len(ends) - shared or not np.array_equal(
+            new_tokens[positions], boundary_ids[shared:]
         ):
             self._scan_mismatches += 1
             if self._scan_mismatches <= _MAX_LOGGED_MISMATCHES:
                 logger.warning(
                     "Prompt token cache: added tokens found in the text (%d) "
                     "differ from those in its token IDs (%d); not caching it.",
-                    len(ends),
+                    len(ends) - shared,
                     len(positions),
                 )
             if len(prefix):
                 return None
-            return input_ids, 0, len(encoded), None
+            return input_ids, array, 0, len(encoded), None
 
+        counts = positions + (len(prefix) + 1)
+        if shared:
+            counts = np.concatenate((hit[0].counts[:shared], counts))
         keys = digests + ([full_digest] if not ends or ends[-1] != len(data) else [])
-        counts = (positions + 1).tolist() + [len(tokens)] * (len(keys) - len(ends))
+        key_counts = counts.tolist() + [len(tokens)] * (len(keys) - len(ends))
         superseded = None
         if hit is not None and len(hit[0].tokens) - len(prefix) <= (
             _SUPERSEDED_TAIL_TOKENS
         ):
             superseded = hit[0]
-        store = functools.partial(self._store, _Entry(tokens, keys), counts, superseded)
-        return input_ids, len(prefix), len(encoded), store
+        recent = None
+        if session is not None:
+            recent = _RecentPrompt(data, ends, boundary_ids, digests, states)
+        store = functools.partial(
+            self._store,
+            _Entry(tokens, keys, counts),
+            key_counts,
+            superseded,
+            session,
+            recent,
+        )
+        return input_ids, array, len(prefix), len(encoded), store
+
+    def _resume(self, recent: _RecentPrompt, data: bytes):
+        """The boundaries, digests and kept hash states of ``data``, scanning
+        and hashing it only from the last of ``recent``'s kept boundaries that
+        it shares, and taking the earlier ones from ``recent``. None if it
+        shares none of them.
+
+        ``data`` shares a boundary of ``recent`` that ends at ``end`` if both
+        texts agree on their first ``end + max_token_bytes`` bytes. Their scans
+        then find the same tokens up to ``end`` (each match depends on at most
+        the next ``max_token_bytes`` bytes), and the scan of ``data`` resumes
+        at ``end``.
+        """
+        lookahead = self._scanner.max_token_bytes
+        old = memoryview(recent.data)
+        limit = min(len(data), len(old)) - lookahead
+        for i, state in reversed(recent.states):
+            start = recent.ends[i]
+            if start <= limit and data.startswith(old[: start + lookahead]):
+                break
+        else:
+            return None
+        ends, ids = self._scanner.scan(data, start)
+        digests, full_digest, states = self._digests(
+            data, ends, start, state.copy(), i + 1
+        )
+        n = i + 1
+        kept = [s for s in recent.states if s[0] < n]
+        return (
+            recent.ends[:n] + ends,
+            recent.ids[:n] + ids,
+            recent.digests[:n] + digests,
+            full_digest,
+            (kept + states)[-_RECENT_STATES:],
+        )
 
     @staticmethod
-    def _digests(data: bytes, ends: List[int]) -> Tuple[List[bytes], bytes]:
-        """Hashes of ``data[:end]`` for each end, and of all of ``data``."""
+    def _digests(
+        data: bytes,
+        ends: List[int],
+        start: int = 0,
+        hasher: Optional[Any] = None,
+        first: int = 0,
+    ) -> Tuple[List[bytes], bytes, List[Tuple[int, Any]]]:
+        """Hashes of ``data[:end]`` for each end, and of all of ``data``.
+
+        ``hasher`` holds the hash of ``data[:start]``, if ``start`` is not 0.
+        Also returns the hash states at the last ``_RECENT_STATES`` ends, with
+        their boundary index (counting the first end as ``first``).
+        """
         view = memoryview(data)
-        h = hashlib.blake2b(digest_size=_DIGEST_SIZE)
+        h = hasher if hasher is not None else hashlib.blake2b(digest_size=_DIGEST_SIZE)
         digests = []
-        start = 0
-        for end in ends:
+        states: "deque[Tuple[int, Any]]" = deque(maxlen=_RECENT_STATES)
+        for i, end in enumerate(ends, first):
             h.update(view[start:end])
-            digests.append(h.copy().digest())
+            state = h.copy()
+            digests.append(state.digest())
+            states.append((i, state))
             start = end
         h.update(view[start:])
-        return digests, h.digest()
+        return digests, h.digest(), list(states)
 
     def _store(
-        self, entry: _Entry, counts: List[int], superseded: Optional[_Entry]
+        self,
+        entry: _Entry,
+        counts: List[int],
+        superseded: Optional[_Entry],
+        session: Optional[str] = None,
+        recent: Optional[_RecentPrompt] = None,
     ) -> None:
         if entry.nbytes > self._max_bytes:
             return
         with self._lock:
+            if session is not None:
+                previous = self._recent.pop(session, None)
+                if previous is not None:
+                    self._recent_bytes -= previous.nbytes
+                if recent is not None and recent.nbytes <= self._max_recent_bytes:
+                    self._recent[session] = recent
+                    self._recent_bytes += recent.nbytes
+                    while self._recent_bytes > self._max_recent_bytes:
+                        _, dropped = self._recent.popitem(last=False)
+                        self._recent_bytes -= dropped.nbytes
             index = self._index
             for key, count in zip(entry.keys, counts):
                 old = index.get(key)
@@ -575,35 +856,54 @@ class CachedPromptTokenizer:
         renderer._tokenize_prompt_async = self._tokenize_prompt_async
 
     def _tokenize_prompt(self, prompt: Dict[str, Any], params: Any) -> Dict[str, Any]:
-        return self.tokenize_prompt(prompt, params, kv_trace.current.get())
+        return self.tokenize_prompt(
+            prompt, params, kv_trace.current.get(), _request_scope.get()
+        )
 
     def _tokenize_prompt_async(self, prompt: Dict[str, Any], params: Any):
-        # The pool thread has no context: capture the trace record here.
+        # The pool thread has no context: capture the trace record and the
+        # request scope here.
         record = kv_trace.current.get()
+        scope = _request_scope.get()
         return asyncio.get_running_loop().run_in_executor(
             self._executor,
-            functools.partial(self.tokenize_prompt, prompt, params, record),
+            functools.partial(self.tokenize_prompt, prompt, params, record, scope),
         )
 
     def tokenize_prompt(
-        self, prompt: Dict[str, Any], params: Any, record: Optional[Dict] = None
+        self,
+        prompt: Dict[str, Any],
+        params: Any,
+        record: Optional[Dict] = None,
+        scope: Optional[RequestScope] = None,
     ) -> Dict[str, Any]:
         """``BaseRenderer._tokenize_prompt`` with the prompt token cache."""
         renderer = self._renderer
-        input_ids = None
+        result = None
         if renderer.get_tokenizer() is self._tokenizer and not (
             renderer._wants_offsets(prompt, params)
         ):
-            input_ids = self.cache.encode(
-                prompt["prompt"], params.get_encode_kwargs(), record
+            result = self.cache.encode_array(
+                prompt["prompt"],
+                params.get_encode_kwargs(),
+                record,
+                scope.session_id if scope is not None else None,
             )
-        if input_ids is None:
+        if result is None:
             result = self._original(prompt, params)
             if record is not None:
                 record["tok_reused"] = 0
                 record["tok_encoded"] = len(result["prompt_token_ids"])
             return result
-        return renderer._build_tokens_prompt(input_ids, prompt)
+        input_ids, array = result
+        # _build_tokens_prompt copies the IDs into a new list; the cache's
+        # list is already new, so put it in place of the copy. The scope can
+        # then recognize it by identity.
+        tokens_prompt = renderer._build_tokens_prompt((), prompt)
+        tokens_prompt["prompt_token_ids"] = input_ids
+        if scope is not None and array is not None:
+            scope.put(input_ids, array)
+        return tokens_prompt
 
 
 def install_prompt_token_cache(

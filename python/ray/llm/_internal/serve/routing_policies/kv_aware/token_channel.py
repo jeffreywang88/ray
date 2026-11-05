@@ -3,7 +3,7 @@ import contextlib
 import dataclasses
 import time
 from collections import OrderedDict
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 import zmq
@@ -25,8 +25,11 @@ from ray.llm._internal.serve.routing_policies.kv_aware.network_utils import (
 logger = get_logger(__name__)
 
 
-def encode_prompt_token_ids(token_ids: List[int]) -> bytes:
-    """Encode token IDs as compact raw little-endian uint32 bytes."""
+def encode_prompt_token_ids(token_ids: Union[List[int], np.ndarray]) -> bytes:
+    """Encode token IDs as compact raw little-endian uint32 bytes.
+
+    A uint32 array is encoded without a per-element conversion.
+    """
     try:
         arr = np.asarray(token_ids, dtype="<u4")
     except OverflowError as e:

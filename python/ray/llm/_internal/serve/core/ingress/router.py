@@ -3,7 +3,7 @@ import json
 import time
 import uuid
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from fastapi import FastAPI, HTTPException, Request
 
@@ -31,6 +31,8 @@ from ray.serve.handle import DeploymentHandle
 # Type-only import as LLMConfig transitively pulls in vLLM. This file should
 # remain engine-agnostic.
 if TYPE_CHECKING:
+    import numpy as np
+
     from ray.llm._internal.serve.core.configs.llm_config import LLMConfig
 
 logger = get_logger(__name__)
@@ -270,11 +272,23 @@ class LLMRouter:
                 "limit.",
                 body_truncated,
             )
+        # HAProxy forwards the configured session header on the same name,
+        # but use the same case-insensitive, separator-tolerant matcher as
+        # proxy.py / ingress.py so a `-`/`_` rewrite anywhere in the path
+        # doesn't silently drop session affinity.
+        session_id = next(
+            (v for k, v in request.headers.items() if _matches_session_id_header(k)),
+            None,
+        )
         # Tokenize only a parseable, routable body; a truncated or unparseable
         # body has no routing payload, so fall back to token-less routing.
         request_token_ids = None
+        request_token_array = None
         stage_token_ids = False
         if self._tokenizer is not None and routing_payload is not None:
+            from ray.llm._internal.serve.routing_policies.kv_aware.vllm.prompt_token_cache import (  # noqa: E501
+                RequestScope,
+            )
             from ray.llm._internal.serve.routing_policies.kv_aware.vllm.prompt_token_forwarding import (  # noqa: E501
                 is_text_only_chat,
             )
@@ -285,25 +299,22 @@ class LLMRouter:
             payload = vars(routing_payload)
             request_path = request.headers.get(SERVE_INGRESS_ROUTER_REQUEST_PATH_HEADER)
             try:
-                request_token_ids = await self._tokenizer.tokenize(
-                    payload, request_path=request_path
-                )
+                # The prompt token cache compares the prompt with the session's
+                # previous one, and leaves the IDs as a uint32 array that the
+                # token channel sends as is.
+                with RequestScope(session_id=session_id or None) as scope:
+                    request_token_ids = await self._tokenizer.tokenize(
+                        payload, request_path=request_path
+                    )
             except TokenizeError as e:
                 raise HTTPException(status_code=e.status_code, detail=e.message)
+            request_token_array = scope.token_array(request_token_ids)
             # Media needs engine preprocessing, not just prompt token IDs.
             stage_token_ids = is_text_only_chat(payload.get("messages", []))
             if record is not None:
                 record["t_tok"] = time.time()
                 record["n_tok"] = len(request_token_ids or ())
                 record["n_msgs"] = len(payload.get("messages") or ())
-        # HAProxy forwards the configured session header on the same name,
-        # but use the same case-insensitive, separator-tolerant matcher as
-        # proxy.py / ingress.py so a `-`/`_` rewrite anywhere in the path
-        # doesn't silently drop session affinity.
-        session_id = next(
-            (v for k, v in request.headers.items() if _matches_session_id_header(k)),
-            None,
-        )
         multiplexed_model_id = self._get_multiplexed_model_id(request_body)
         handle = self._get_handle(multiplexed_model_id)
         if session_id:
@@ -333,7 +344,11 @@ class LLMRouter:
             token_key = self._push_prompt_tokens(
                 token_endpoint=token_endpoint,
                 replica_id=replica_id,
-                request_token_ids=request_token_ids,
+                request_token_ids=(
+                    request_token_ids
+                    if request_token_array is None
+                    else request_token_array
+                ),
             )
             if token_key:
                 request_headers[KV_TOKEN_KEY_HEADER] = token_key
@@ -398,7 +413,7 @@ class LLMRouter:
         *,
         token_endpoint: Optional[str],
         replica_id: str,
-        request_token_ids: List[int],
+        request_token_ids: Union[List[int], "np.ndarray"],
     ) -> Optional[str]:
         # Only reachable on the KV path, where __init__ built the sender.
         if not token_endpoint or self._token_sender is None:

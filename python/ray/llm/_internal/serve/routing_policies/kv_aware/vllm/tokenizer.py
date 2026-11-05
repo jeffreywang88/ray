@@ -190,6 +190,16 @@ class Tokenizer:
             # exceptions are real bugs and should surface, not degrade routing.
             raise TokenizeError(str(e), status_code=400, type="BadRequestError")
 
+        if len(rendered_inputs) == 1:
+            # The renderer built this list for this request alone: return it
+            # rather than a copy (the prompt token cache's RequestScope
+            # recognizes it by identity).
+            token_ids = extract_prompt_components(
+                self._model_config, rendered_inputs[0]
+            ).token_ids
+            if token_ids is None:
+                return []
+            return token_ids if type(token_ids) is list else list(token_ids)
         input_ids: List[int] = []
         for rendered_input in rendered_inputs:
             components = extract_prompt_components(self._model_config, rendered_input)
