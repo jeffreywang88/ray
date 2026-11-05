@@ -16,10 +16,15 @@ observes matches a vLLM replica:
 - Lifecycle events: reported with the installed Ray's protocol (see
   ``LifecycleReporter``).
 
-Prompt sources are counted in ``kvbench_mocker_prompts{source}``.
+Prompt sources are counted in ``kvbench_mocker_prompts{source}``. Each
+response names its engine replica in ``x-kvbench-engine``;
+``kvbench_mocker_session_requests{source}`` counts requests by whether the
+engine served their session before, and ``kvbench_mocker_ttft_ms`` is the
+engine's own TTFT (request arrival at the engine to first token).
 """
 
 import asyncio
+import collections
 import json
 import time
 import uuid
@@ -45,9 +50,9 @@ from ray.llm._internal.serve.routing_policies.kv_aware.kv_aware_router import (
     KVAwareRouter,
 )
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_token_tracker import (
-    get_llm_router_handle,
     get_worker_id,
 )
+from ray.serve._private.constants import SERVE_SESSION_ID
 from ray.serve.config import RequestRouterConfig
 from ray.serve.deployment import Application
 from ray.serve.llm import LLMConfig
@@ -74,6 +79,26 @@ SOURCE_NO_KEY = "engine_no_key"
 # request arrived.
 SOURCE_STORE_MISS = "engine_store_miss"
 
+# Requests by whether this engine served their session before (the `source`
+# tag): with session pinning, a session's turns after its first stay "repeat".
+SESSIONS_METRIC = "kvbench_mocker_session_requests"
+SESSION_NEW = "new"
+SESSION_REPEAT = "repeat"
+SESSION_NONE = "none"
+# Sessions an engine remembers (oldest dropped first); a 25-minute run sees a
+# few thousand per engine.
+MAX_SESSIONS = 200_000
+# Engine-side TTFT: from the request reaching the engine to its first token,
+# i.e. without the router's tokenization and routing.
+TTFT_METRIC = "kvbench_mocker_ttft_ms"
+TTFT_BOUNDARIES_MS = (
+    [5, 10, *range(20, 100, 10), *range(100, 300, 25), *range(300, 500, 50)]
+    + [*range(500, 1000, 100), *range(1000, 2000, 250), 2000, 2500, 3000, 4000]
+    + [5000, 7500, 10000, 15000, 20000, 30000, 60000]
+)
+# Response header naming the engine replica that served the request.
+ENGINE_HEADER = "x-kvbench-engine"
+
 
 class LifecycleReporter:
     """Reports lifecycle events with the protocol of the installed Ray.
@@ -95,6 +120,10 @@ class LifecycleReporter:
                 LifecycleEventForwarder,
             )
         except ImportError:
+            # Only Ray without the replica mesh has the router handle helper.
+            from ray.llm._internal.serve.routing_policies.kv_aware.kv_token_tracker import (  # noqa: E501
+                get_llm_router_handle,
+            )
             from ray.llm._internal.serve.routing_policies.kv_aware.vllm.token_tracking import (  # noqa: E501
                 LifecycleEventForwarder,
             )
@@ -153,7 +182,8 @@ class MockerServer:
             },
             KV_TOKEN_METADATA_KEY: {"endpoint": f"tcp://{ip}:{token_port}"},
         }
-        self._lifecycle = LifecycleReporter(context.replica_id.unique_id)
+        self._engine_id = context.replica_id.unique_id
+        self._lifecycle = LifecycleReporter(self._engine_id)
         # The router's own renderer, built from the same LLMConfig, so a
         # fallback tokenization yields exactly the ids the router hashes.
         from ray.llm._internal.serve.routing_policies.kv_aware.vllm.tokenizer import (  # noqa: E501
@@ -167,6 +197,19 @@ class MockerServer:
             PROMPTS_METRIC,
             description="Mocker requests by where their prompt token ids came from.",
             tag_keys=("source",),
+        )
+        self._sessions: "collections.OrderedDict[str, None]" = collections.OrderedDict()
+        self._session_requests = metrics.Counter(
+            SESSIONS_METRIC,
+            description="Mocker requests by whether this engine served their "
+            "session (the session-id header) before.",
+            tag_keys=("source",),
+        )
+        self._ttft = metrics.Histogram(
+            TTFT_METRIC,
+            description="Mocker TTFT from the request reaching the engine to its "
+            "first token.",
+            boundaries=TTFT_BOUNDARIES_MS,
         )
         logger.info("Lifecycle protocol: %s", self._lifecycle.protocol)
         self._app = Starlette(
@@ -210,7 +253,24 @@ class MockerServer:
         self._prompts.inc(tags={"source": source})
         return await self._tokenizer.tokenize(body, request_path=CHAT_PATH)
 
+    def _count_session(self, request: Request) -> None:
+        session_id = request.headers.get(SERVE_SESSION_ID)
+        if not session_id:
+            source = SESSION_NONE
+        elif session_id in self._sessions:
+            self._sessions.move_to_end(session_id)
+            source = SESSION_REPEAT
+        else:
+            self._sessions[session_id] = None
+            if len(self._sessions) > MAX_SESSIONS:
+                self._sessions.popitem(last=False)
+            source = SESSION_NEW
+        self._session_requests.inc(tags={"source": source})
+
     async def _chat(self, request: Request):
+        arrived = time.monotonic()
+        self._count_session(request)
+        headers = {ENGINE_HEADER: self._engine_id}
         body = json.loads(await request.body())
         context = serve.context._serve_request_context.get()
         request_id = (context.request_id if context else "") or uuid.uuid4().hex
@@ -227,6 +287,7 @@ class MockerServer:
             return JSONResponse(
                 {"error": {"message": message, "type": kind, "code": status}},
                 status_code=status,
+                headers=headers,
             )
         max_tokens = int(
             body.get("max_completion_tokens")
@@ -245,12 +306,19 @@ class MockerServer:
             )
             return StreamingResponse(
                 self._stream(
-                    live, request_id, owner, model, len(token_ids), include_usage
+                    live,
+                    request_id,
+                    owner,
+                    model,
+                    len(token_ids),
+                    include_usage,
+                    arrived,
                 ),
                 media_type="text/event-stream",
+                headers=headers,
             )
         completion, cached = 0, 0
-        async for n, cached in self._chunks(live, request_id, owner):
+        async for n, cached in self._chunks(live, request_id, owner, arrived):
             completion += n
         return JSONResponse(
             {
@@ -268,10 +336,13 @@ class MockerServer:
                     }
                 ],
                 "usage": _usage(len(token_ids), completion, cached),
-            }
+            },
+            headers=headers,
         )
 
-    async def _chunks(self, live, request_id: str, owner: Optional[str]):
+    async def _chunks(
+        self, live, request_id: str, owner: Optional[str], arrived: float
+    ):
         """Yields (new_tokens, cached_tokens) and reports lifecycle events."""
         first = True
         cached = 0
@@ -282,6 +353,7 @@ class MockerServer:
                     cached = c
                 if n and first:
                     first = False
+                    self._ttft.observe((time.monotonic() - arrived) * 1000)
                     self._lifecycle.report(owner, "on_prefill_complete", request_id)
                 if n:
                     yield n, cached
@@ -291,7 +363,7 @@ class MockerServer:
             self._lifecycle.report(owner, "on_request_completed", request_id)
 
     async def _stream(
-        self, live, request_id, owner, model, prompt_tokens, include_usage
+        self, live, request_id, owner, model, prompt_tokens, include_usage, arrived
     ):
         header = {
             "id": request_id,
@@ -310,7 +382,7 @@ class MockerServer:
 
         completion, cached = 0, 0
         yield delta({"role": "assistant", "content": ""})
-        async for n, cached in self._chunks(live, request_id, owner):
+        async for n, cached in self._chunks(live, request_id, owner, arrived):
             completion += n
             yield delta({"content": TOKEN_TEXT * n})
         yield delta({}, finish="length")

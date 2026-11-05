@@ -31,32 +31,62 @@ def head_node_id() -> str:
     raise RuntimeError("no alive head node")
 
 
-def _engine_nodes(node_cpus: float) -> List[dict]:
+def _engine_nodes(node_cpus: float, exclude: Tuple[str, ...] = ()) -> List[dict]:
     head = head_node_id()
     nodes = [
         n
         for n in _alive_nodes()
-        if n["NodeID"] != head and n["Resources"].get("CPU", 0) >= node_cpus
+        if n["NodeID"] != head
+        and n["NodeID"] not in exclude
+        and n["Resources"].get("CPU", 0) >= node_cpus
     ]
     return sorted(nodes, key=lambda n: n["NodeID"])
 
 
-def _client_nodes() -> List[dict]:
-    nodes = [n for n in _alive_nodes() if n["Resources"].get(CLIENT_RESOURCE)]
+def _client_nodes(resource: str) -> List[dict]:
+    nodes = [n for n in _alive_nodes() if n["Resources"].get(resource)]
     return sorted(nodes, key=lambda n: n["NodeID"])
 
 
 def scale(
-    num_engine_nodes: int, node_cpus: float, num_client_nodes: int, timeout_s: float
+    num_engine_nodes: int,
+    node_cpus: float,
+    num_client_nodes: int,
+    timeout_s: float,
+    client_resource: str = CLIENT_RESOURCE,
+    reserve_engine_nodes: int = 0,
+    client_node_ids: List[str] = (),
+    exclude_node_ids: List[str] = (),
 ) -> Tuple[List[dict], List[dict]]:
-    """Waits for the engine and client nodes and returns the ones to use."""
+    """Waits for the engine and client nodes and returns the ones to use.
+
+    ``reserve_engine_nodes`` keeps the largest phase's nodes requested, so the
+    autoscaler starts them early and doesn't remove them between phases. Nodes
+    without replicas get no proxy, so no routers, and don't affect a phase.
+    With ``client_resource="CPU"``, client nodes are plain ``node_cpus``
+    workers; the first ``num_client_nodes`` of them are clients, never engines.
+    """
+    shared = client_resource == "CPU"
+    engine_bundles = [{"CPU": node_cpus}] * max(num_engine_nodes, reserve_engine_nodes)
+    client_bundles = [{"CPU": node_cpus} if shared else {client_resource: 1}]
+    # Excluded nodes take a node each without being usable.
+    excluded = [{"CPU": node_cpus}] * len(exclude_node_ids)
     request_resources(
-        bundles=[{"CPU": node_cpus}] * num_engine_nodes
-        + [{CLIENT_RESOURCE: 1}] * num_client_nodes
+        bundles=engine_bundles + client_bundles * num_client_nodes + excluded
     )
     start = time.monotonic()
     while True:
-        engines, clients = _engine_nodes(node_cpus), _client_nodes()
+        workers = _engine_nodes(node_cpus, tuple(exclude_node_ids))
+        if client_node_ids:
+            by_id = {n["NodeID"]: n for n in _alive_nodes()}
+            clients = [by_id[i] for i in client_node_ids if i in by_id]
+            engines = [n for n in workers if n["NodeID"] not in set(client_node_ids)]
+            if len(clients) < len(client_node_ids):
+                raise RuntimeError("some --client-node-ids are not alive")
+        elif shared:
+            clients, engines = workers[:num_client_nodes], workers[num_client_nodes:]
+        else:
+            engines, clients = workers, _client_nodes(client_resource)
         if len(engines) >= num_engine_nodes and len(clients) >= num_client_nodes:
             return engines[:num_engine_nodes], clients[:num_client_nodes]
         if time.monotonic() - start > timeout_s:
@@ -67,12 +97,33 @@ def scale(
         time.sleep(10)
 
 
+def node_memory_gb(node_ids: List[str]) -> float:
+    """The smallest total memory among the nodes, in GB."""
+    import psutil
+
+    @ray.remote(num_cpus=0)
+    def total() -> float:
+        return psutil.virtual_memory().total / 2**30
+
+    return min(
+        ray.get(
+            [
+                total.options(
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(n, soft=False)
+                ).remote()
+                for n in node_ids
+            ]
+        )
+    )
+
+
 def ingress_urls(nodes: List[dict]) -> List[str]:
     return [f"http://{n['NodeManagerAddress']}:{INGRESS_PORT}" for n in nodes]
 
 
 def _actors_per_node(name_fragment: str) -> Dict[str, int]:
-    actors = list_actors(filters=[("state", "=", "ALIVE")], limit=100_000)
+    # The state API serves at most 10,000 rows by default.
+    actors = list_actors(filters=[("state", "=", "ALIVE")], limit=10_000)
     return collections.Counter(
         a.node_id for a in actors if a.name and name_fragment in a.name
     )
@@ -112,9 +163,11 @@ def wait_for_placement(
 
 @ray.remote(num_cpus=0)
 class CpuSampler:
+    """Samples the node's CPU and memory use (percent)."""
+
     def __init__(self, interval_s: float):
         self._interval_s = interval_s
-        self._samples: List[float] = []
+        self._samples: List[Tuple[float, float, float]] = []
         self._running = True
 
     async def run(self) -> None:
@@ -123,9 +176,11 @@ class CpuSampler:
         psutil.cpu_percent()
         while self._running:
             await asyncio.sleep(self._interval_s)
-            self._samples.append(psutil.cpu_percent())
+            self._samples.append(
+                (time.time(), psutil.cpu_percent(), psutil.virtual_memory().percent)
+            )
 
-    async def stop(self) -> List[float]:
+    async def stop(self) -> List[Tuple[float, float, float]]:
         self._running = False
         return self._samples
 
@@ -142,15 +197,23 @@ def start_cpu_samplers(node_ids: List[str], interval_s: float = 5.0) -> dict:
     return samplers
 
 
-def stop_cpu_samplers(samplers: dict) -> Dict[str, Dict[str, float]]:
-    """Returns the max and p95 CPU percent per node."""
+def stop_cpu_samplers(
+    samplers: dict, window: Tuple[float, float]
+) -> Dict[str, Dict[str, float]]:
+    """Returns the max and p95 CPU percent and the max memory percent per node,
+    over the samples inside ``window`` (the profiling phase, in epoch seconds),
+    so AgentX's dataset build and warmup don't count."""
     samples = ray.get([s.stop.remote() for s in samplers.values()])
     for sampler in samplers.values():
         ray.kill(sampler)
-    return {
-        node_id: {
-            "max": float(np.max(s)) if s else 0.0,
-            "p95": float(np.percentile(s, 95)) if s else 0.0,
+    result = {}
+    for node_id, node_samples in zip(samplers, samples):
+        inside = [x for x in node_samples if window[0] <= x[0] <= window[1]]
+        cpu = [c for _, c, _ in inside]
+        mem = [m for _, _, m in inside]
+        result[node_id] = {
+            "max": float(np.max(cpu)) if cpu else 0.0,
+            "p95": float(np.percentile(cpu, 95)) if cpu else 0.0,
+            "mem_max": float(np.max(mem)) if mem else 0.0,
         }
-        for node_id, s in zip(samplers, samples)
-    }
+    return result

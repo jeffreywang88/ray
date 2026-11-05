@@ -4705,7 +4705,7 @@
   run:
     timeout: 21600
     long_running: false
-    script: python run.py --client-nodes 8 --agentx-bin /home/ray/agentx-venv/bin/agentx
+    script: python run.py --client-nodes 16 --agentx-bin /home/ray/agentx-venv/bin/agentx
 
   variations:
     - __suffix__: c128_n128
