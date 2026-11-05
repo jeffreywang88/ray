@@ -13,6 +13,10 @@ local function first_header(hdrs, name)
     return nil
 end
 
+local SESSION_HEADER_KEY = (SESSION_HEADER:lower():gsub("-", "_"))
+
+-- Matches the header like http_util._matches_session_id_header: ignoring case
+-- and treating "-" and "_" as the same.
 local function session_id_from(hdrs)
     if SESSION_HEADER == "" or not hdrs then
         return nil
@@ -24,6 +28,14 @@ local function session_id_from(hdrs)
             alt = SESSION_HEADER:gsub("_", "-")
         end
         entry = hdrs[alt]
+    end
+    if not entry then
+        for name, values in pairs(hdrs) do
+            if (name:lower():gsub("-", "_")) == SESSION_HEADER_KEY then
+                entry = values
+                break
+            end
+        end
     end
     if entry then
         return entry[0]

@@ -49,6 +49,46 @@ local function request_headers_for_router(headers)
     return table.concat(lines)
 end
 
+-- 32-bit FNV-1a of s, continuing from hash h.
+local function fnv1a32(h, s)
+    for i = 1, #s do
+        h = ((h ~ s:byte(i)) * 16777619) & 0xFFFFFFFF
+    end
+    return h
+end
+
+-- MurmurHash3's 32-bit finalizer, so weights that share the session prefix
+-- still differ in every bit.
+local function fmix32(h)
+    h = h ~ (h >> 16)
+    h = (h * 0x85EBCA6B) & 0xFFFFFFFF
+    h = h ~ (h >> 13)
+    h = (h * 0xC2B2AE35) & 0xFFFFFFFF
+    return h ~ (h >> 16)
+end
+
+-- Rendezvous (highest-random-weight) order of the router pool for a session:
+-- every turn of the session starts at the same router, so its per-router
+-- caches (e.g. prompt tokenization) stay warm, and failover walks the other
+-- routers in an order that is stable for the session. Adding or removing a
+-- router moves only the sessions that ranked it first.
+local function rendezvous_order(pool, session_id)
+    -- Weight of a router = fmix32(FNV-1a(session_id .. "\0" .. host:port)).
+    local seed = (fnv1a32(2166136261, session_id) * 16777619) & 0xFFFFFFFF
+    local order, weight = {}, {}
+    for i = 1, #pool do
+        order[i] = i
+        weight[i] = fmix32(fnv1a32(seed, pool[i].host_header))
+    end
+    table.sort(order, function(a, b)
+        if weight[a] ~= weight[b] then
+            return weight[a] > weight[b]
+        end
+        return a < b
+    end)
+    return order
+end
+
 local function set_router_response_headers(txn, json_body)
     local headers = json_body:match('"request_headers"%s*:%s*{(.-)}')
     if not headers then
@@ -84,12 +124,20 @@ local function route(txn, app, pool, replica_map)
         txn:set_var("txn.ingress_request_router_failed", "router_unavailable")
         return
     end
-    local start = _rr_cursor[app] or 0
-    _rr_cursor[app] = start + 1
+    -- Requests of a session start at its rendezvous router; others round-robin.
+    local session_id = session_id_from(hdrs)
+    local order = nil
+    local start = 0
+    if n > 1 and session_id and session_id ~= "" then
+        order = rendezvous_order(pool, session_id)
+    else
+        start = _rr_cursor[app] or 0
+        _rr_cursor[app] = start + 1
+    end
     local response = nil
     for i = 0, n - 1 do
         response = call_router(
-            pool[(start + i) % n + 1],
+            order and pool[order[i + 1]] or pool[(start + i) % n + 1],
             {headers = headers, body = body}
         )
         if response then

@@ -43,6 +43,7 @@ from ray.serve._private.constants import (
     SERVE_INGRESS_ROUTER_HEADER_PREFIX,
     SERVE_INGRESS_ROUTER_REQUEST_PATH_HEADER,
     SERVE_MULTIPLEXED_MODEL_ID,
+    SERVE_SESSION_ID,
 )
 from ray.serve._private.haproxy import (
     BackendConfig,
@@ -1394,6 +1395,133 @@ async def test_ingress_request_router_end_to_end(haproxy_api_cleanup, monkeypatc
             _shutdown_fake_servers(
                 (replica_a, replica_b, router),
                 (replica_a_thread, replica_b_thread, router_thread),
+            )
+
+
+def _rendezvous_order(host_headers, session_id: str):
+    """Reference for the Lua rendezvous_order: router indices by descending
+    fmix32(FNV-1a(session_id + NUL + host:port)), ties by index."""
+
+    def fnv1a32(h: int, data: bytes) -> int:
+        for b in data:
+            h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+        return h
+
+    def fmix32(h: int) -> int:
+        h ^= h >> 16
+        h = (h * 0x85EBCA6B) & 0xFFFFFFFF
+        h ^= h >> 13
+        h = (h * 0xC2B2AE35) & 0xFFFFFFFF
+        return h ^ (h >> 16)
+
+    seed = fnv1a32(2166136261, session_id.encode() + b"\0")
+    weights = [fmix32(fnv1a32(seed, hh.encode())) for hh in host_headers]
+    return sorted(range(len(host_headers)), key=lambda i: (-weights[i], i))
+
+
+@pytest.mark.asyncio
+async def test_ingress_request_router_session_affinity(
+    haproxy_api_cleanup, monkeypatch
+):
+    """A session's requests start at its rendezvous router and fail over in a
+    stable order; requests without a session id round-robin."""
+    # Make the 127.0.0.1 routers co-located so all of them form the pool.
+    monkeypatch.setattr(
+        "ray.serve._private.haproxy.get_localhost_ip", lambda: "127.0.0.1"
+    )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        haproxy_port = find_free_port()
+        stats_port = find_free_port()
+        replica_port = find_free_port()
+        router_ports = sorted(find_free_port() for _ in range(3))
+        actor_name = "SERVE_REPLICA::app#dep#aaa"
+        replica, replica_thread = _create_replica_server(
+            replica_port, replica_id_header="A"
+        )
+        routers = [
+            _create_router_server(port, replica_id_to_return=actor_name)
+            for port in router_ports
+        ]
+        host_headers = [f"127.0.0.1:{port}" for port in router_ports]
+
+        def counts():
+            return [len(captured["bodies"]) for _, _, captured in routers]
+
+        def post(headers=None) -> int:
+            """Sends one request; returns the index of the router it used."""
+            before = counts()
+            resp = requests.post(
+                f"http://127.0.0.1:{haproxy_port}/predict",
+                json={"prompt": "hi"},
+                headers=headers or {},
+                timeout=5,
+            )
+            assert resp.status_code == 200, resp.text
+            assert resp.headers.get("x-replica-id") == "A"
+            used = [i for i, (a, b) in enumerate(zip(before, counts())) if b > a]
+            assert len(used) == 1, (before, counts())
+            return used[0]
+
+        try:
+            backend = BackendConfig(
+                name="llm",
+                path_prefix="/",
+                app_name="llm",
+                http_health_check_path="/-/healthz",
+                servers=[
+                    ServerConfig(
+                        name="A",
+                        host="127.0.0.1",
+                        port=replica_port,
+                        replica_id=actor_name,
+                    ),
+                ],
+                ingress_request_router_servers=[
+                    ServerConfig(name=f"router_{i}", host="127.0.0.1", port=port)
+                    for i, port in enumerate(router_ports)
+                ],
+            )
+            await _start_router_haproxy(
+                temp_dir,
+                haproxy_port,
+                stats_port,
+                {"llm": backend},
+                haproxy_api_cleanup,
+                # One thread, so one round-robin cursor (each thread's Lua
+                # state has its own).
+                nbthread=1,
+            )
+
+            sessions = [f"session-{i}" for i in range(12)]
+            first = {}
+            for sid in sessions:
+                expected = _rendezvous_order(host_headers, sid)[0]
+                for _ in range(3):
+                    assert post({SERVE_SESSION_ID: sid}) == expected, sid
+                first[sid] = expected
+            # Sessions spread over the routers.
+            assert len(set(first.values())) > 1, first
+
+            # The header matches like _matches_session_id_header: any case,
+            # "-" and "_" interchangeable.
+            mixed = SERVE_SESSION_ID.upper().replace("-", "_", 1)
+            assert post({mixed: sessions[0]}) == first[sessions[0]]
+
+            # Without a session id, requests round-robin over the pool.
+            assert sorted(post() for _ in range(3)) == [0, 1, 2]
+
+            # When a session's router is down, it fails over to its second
+            # rendezvous choice. (Each failover waits out HAProxy's connect
+            # retries, ~3 s, so try once.)
+            sid = sessions[0]
+            order = _rendezvous_order(host_headers, sid)
+            down_server, down_thread, _ = routers[order[0]]
+            _shutdown_fake_servers((down_server,), (down_thread,))
+            assert post({SERVE_SESSION_ID: sid}) == order[1]
+        finally:
+            _shutdown_fake_servers(
+                [replica] + [server for server, _, _ in routers],
+                [replica_thread] + [thread for _, thread, _ in routers],
             )
 
 
