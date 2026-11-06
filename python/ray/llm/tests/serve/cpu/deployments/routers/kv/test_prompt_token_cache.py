@@ -4,6 +4,7 @@ The cache must return exactly the token IDs of a full encode: KV-aware routing
 scores replicas on prompt prefix overlap, so a divergence silently mis-routes.
 """
 
+import gc
 import random
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,7 @@ from transformers import AutoTokenizer
 
 from ray.llm._internal.serve.core.configs.llm_config import LLMConfig
 from ray.llm._internal.serve.routing_policies.kv_aware import trace as kv_trace
+from ray.llm._internal.serve.routing_policies.kv_aware.vllm import prompt_token_cache
 from ray.llm._internal.serve.routing_policies.kv_aware.vllm.prompt_token_cache import (
     PromptTokenCache,
     RequestScope,
@@ -219,6 +221,56 @@ class TestExactness:
         assert sum(r is not None for r in resumed) > len(resumed) // 2
         assert 0 < cache.stats()["sessions"] <= len(sessions)
 
+    @pytest.mark.parametrize("chunk", [1, 7, 4096])
+    @pytest.mark.parametrize("seed", range(3))
+    def test_id_lists_share_ints_and_chunks(
+        self, hf_tokenizer, monkeypatch, seed, chunk
+    ):
+        """The returned lists hold the cache's shared int objects, copied
+        from a stored prompt's chunks whether the reused prefix is most of it
+        or a small part of it; a session's next prompt shares its full chunks;
+        changing a returned list changes no later result."""
+        monkeypatch.setattr(prompt_token_cache, "_ID_CHUNK", chunk)
+        rng = random.Random(seed)
+        cache = _cache(hf_tokenizer)
+        system = "<|im_start|>system\n" + _random_text(rng, 30) + "<|im_end|>\n"
+        history = system
+        previous = None
+        for turn in range(12):
+            history += "<|im_start|>user\n" + _random_text(rng, 10) + "<|im_end|>\n"
+            # Every third prompt shares only the system prompt with the
+            # session's history, so it reuses a short prefix of a long one.
+            prompt = (system if turn % 3 == 2 else history) + "<|im_start|>assistant\n"
+            for kwargs in (CHAT, {"add_special_tokens": True}):
+                record = {}
+                ids, array = cache.encode_array(prompt, kwargs, record, "s")
+                expected = hf_tokenizer(prompt, **kwargs)["input_ids"]
+                assert ids == expected
+                assert array.tolist() == expected
+                if kwargs is CHAT:
+                    assert all(i is cache._ints[i] for i in ids)
+                if turn:
+                    assert record["tok_reused"] > 0
+                # The caller owns the list.
+                ids.reverse()
+                ids[: len(ids) // 2] = [0] * (len(ids) // 2)
+                ids.append(1)
+            entry = next(reversed(cache._lru))
+            assert [len(c) for c in entry.chunks[:-1]] == [chunk] * (
+                len(entry.chunks) - 1
+            )
+            assert sum(map(len, entry.chunks)) == len(entry.tokens)
+            if chunk < 4096 and turn % 3 == 1:
+                # It extends the previous history prompt.
+                assert entry.chunks[0] is previous.chunks[0]
+            previous = entry
+            history += "<|im_start|>assistant\n" + _random_text(rng, 8) + "<|im_end|>\n"
+        # Untracks the chunks, then the tuples of them.
+        gc.collect()
+        gc.collect()
+        for entry in cache._lru:
+            assert not any(map(gc.is_tracked, (entry.chunks,) + entry.chunks))
+
     def test_session_prompts_memory_bounded(self, hf_tokenizer):
         rng = random.Random(2)
         cache = _cache(hf_tokenizer, max_bytes=40_000)
@@ -288,7 +340,8 @@ class TestExactness:
             cache.encode("hi", {"add_special_tokens": False, "padding": True}) is None
         )
 
-    def test_verify_returns_full_encode_on_mismatch(self, hf_tokenizer):
+    @pytest.mark.parametrize("corrupt", ["tokens", "chunks"])
+    def test_verify_returns_full_encode_on_mismatch(self, hf_tokenizer, corrupt):
         cache = _cache(hf_tokenizer, verify=True)
         prompt = "<|im_start|>user\nhello world<|im_end|>\n"
         record = {}
@@ -297,15 +350,19 @@ class TestExactness:
             == hf_tokenizer(prompt, **CHAT)["input_ids"]
         )
         assert record["tok_mismatch"] is False
-        # Corrupt the stored prompt: the next prompt reuses its prefix.
+        # Corrupt the stored prompt's array or chunks: the next prompt reuses
+        # its prefix, as an array (sent to the engine) and as a list.
         (entry,) = cache._lru
-        entry.tokens[1] += 1
+        if corrupt == "tokens":
+            entry.tokens[1] += 1
+        else:
+            (chunk,) = entry.chunks
+            entry.chunks = (chunk[:1] + (chunk[1] + 1,) + chunk[2:],)
         longer = prompt + "<|im_start|>assistant\n"
         record = {}
-        assert (
-            cache.encode(longer, CHAT, record)
-            == hf_tokenizer(longer, **CHAT)["input_ids"]
-        )
+        ids, array = cache.encode_array(longer, CHAT, record)
+        assert ids == hf_tokenizer(longer, **CHAT)["input_ids"]
+        assert array is None
         assert record["tok_mismatch"] is True
         assert record["tok_reused"] > 0
         assert cache.stats()["mismatches"] == 1

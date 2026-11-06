@@ -22,6 +22,14 @@ hashing it. With a session ID (``RequestScope``), the cache instead compares
 the prompt byte for byte with the session's latest one, takes the scan and
 hashes of the shared part from it, and scans and hashes only the rest; a
 wrong or stale session ID only costs that shortcut.
+
+The lists of token IDs the cache returns hold shared ints, one int object
+per token ID (``PromptTokenCache._ints``), and each stored prompt keeps its IDs
+as tuples of them too, in chunks that a prompt extending it shares. A prompt's
+list is then a copy of its prefix's pointers plus the new IDs, rather than a
+new int object per token, which costs several times as much to create and
+again to free; storing it creates (and the garbage collector scans) only the
+chunks of its new tokens.
 """
 
 import asyncio
@@ -30,6 +38,7 @@ import functools
 import hashlib
 import json
 import re
+import sys
 import threading
 from collections import OrderedDict, deque
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -86,6 +95,8 @@ _RECENT_BYTES_PER_BOUNDARY = 120
 _RECENT_BYTES_PER_STATE = 500
 # Share of ``max_bytes`` that sessions' latest prompts may take in addition.
 _RECENT_BYTES_FRACTION = 0.25
+# Tokens per chunk of a stored prompt's token ID tuples (see ``_Entry``).
+_ID_CHUNK = 4096
 
 
 class RequestScope:
@@ -310,18 +321,37 @@ class _BoundaryScanner:
 class _Entry:
     """The token IDs of one stored prompt, and the index keys pointing to it.
 
+    Holds the IDs twice: as a uint32 array (``tokens``), and as tuples of
+    the cache's shared ints (``chunks``) that a list of a prefix's IDs
+    copies. Every chunk but the last has ``_ID_CHUNK`` IDs, so a prompt that
+    extends this one shares the chunks within its reused prefix.
     ``counts[i]`` is the number of tokens up to and including the prompt's
     ``i``-th boundary token.
     """
 
-    __slots__ = ("tokens", "keys", "counts", "live", "nbytes")
+    __slots__ = ("tokens", "chunks", "keys", "counts", "live", "nbytes")
 
-    def __init__(self, tokens: np.ndarray, keys: List[bytes], counts: np.ndarray):
+    def __init__(
+        self,
+        tokens: np.ndarray,
+        chunks: Tuple[Tuple[int, ...], ...],
+        keys: List[bytes],
+        counts: np.ndarray,
+    ):
         self.tokens = tokens
+        self.chunks = chunks
         self.keys = keys
         self.counts = counts
         self.live = 0
-        self.nbytes = tokens.nbytes + counts.nbytes + len(keys) * _INDEX_BYTES_PER_KEY
+        # Counts shared chunks in full, as an older prompt holding them may
+        # be dropped.
+        self.nbytes = (
+            tokens.nbytes
+            + sys.getsizeof(chunks)
+            + sum(map(sys.getsizeof, chunks))
+            + counts.nbytes
+            + len(keys) * _INDEX_BYTES_PER_KEY
+        )
 
 
 class _RecentPrompt:
@@ -392,12 +422,16 @@ class PromptTokenCache:
             _is_identity_normalizer(spec.get("normalizer")),
         )
         backend = tokenizer.backend_tokenizer
+        # Above every token ID the tokenizer can return.
         size = max(
             [backend.get_vocab_size(with_added_tokens=True)]
-            + [i + 1 for i in self._scanner.token_ids.values()]
+            + [t["id"] + 1 for t in spec.get("added_tokens") or ()]
         )
         self._is_boundary_id = np.zeros(size, dtype=bool)
         self._is_boundary_id[list(self._scanner.token_ids.values())] = True
+        # One int object per token ID, shared by all the token ID lists and
+        # tuples the cache builds (``_id_list``, ``_id_chunks``).
+        self._ints = np.arange(size).astype(object)
         self._special_affixes = self._probe_special_affixes()
         self._fast_backend = self._make_fast_backend()
         self._lock = threading.Lock()
@@ -570,11 +604,15 @@ class PromptTokenCache:
             record["tok_encoded"] = encoded
         if self._verify:
             expected = self._tokenizer(text, **kwargs)["input_ids"]
-            mismatch = input_ids != expected
+            # The list and the array come from separate copies of the prefix.
+            got = input_ids
+            if got == expected and array is not None:
+                got = array.tolist()
+            mismatch = got != expected
             if record is not None:
                 record["tok_mismatch"] = mismatch
             if mismatch:
-                self._log_mismatch(input_ids, expected, reused)
+                self._log_mismatch(got, expected, reused)
                 return expected, None
         if store is not None:
             store()
@@ -629,14 +667,10 @@ class PromptTokenCache:
             rest = data[cut:].decode("utf-8")
         # The rest's pieces tokenize as they would within the whole text.
         encoded = self._encode_rest(rest, kwargs) if rest else []
-        tokens = (
-            np.concatenate((prefix, np.asarray(encoded, dtype=np.uint32)))
-            if len(prefix)
-            else np.asarray(encoded, dtype=np.uint32)
-        )
-        # One conversion of the whole array, rather than of the prefix and
-        # then a concatenation with the encoded list.
-        input_ids = tokens.tolist() if len(prefix) else encoded
+        new = np.asarray(encoded, dtype=np.uint32)
+        tokens = np.concatenate((prefix, new)) if len(prefix) else new
+        ids = self._id_list(hit, new)
+        input_ids = ids
         array = tokens
         if add_special:
             before, after = self._special_affixes
@@ -667,10 +701,9 @@ class PromptTokenCache:
         # in the reused prefix agreed when its prompt was stored: up to the
         # end of the prefix, right after a boundary token in both prompts,
         # the scans of both find the same tokens.
-        new_tokens = tokens[len(prefix) :]
-        positions = np.flatnonzero(self._is_boundary_id[new_tokens])
+        positions = np.flatnonzero(self._is_boundary_id[new])
         if len(positions) != len(ends) - shared or not np.array_equal(
-            new_tokens[positions], boundary_ids[shared:]
+            new[positions], boundary_ids[shared:]
         ):
             self._scan_mismatches += 1
             if self._scan_mismatches <= _MAX_LOGGED_MISMATCHES:
@@ -697,15 +730,45 @@ class PromptTokenCache:
         recent = None
         if session is not None:
             recent = _RecentPrompt(data, ends, boundary_ids, digests, states)
+        # Tuples, which only the cache holds (the caller may change ``ids``)
+        # and the garbage collector stops tracking once it looks at them.
         store = functools.partial(
             self._store,
-            _Entry(tokens, keys, counts),
+            _Entry(tokens, self._id_chunks(hit, ids), keys, counts),
             key_counts,
             superseded,
             session,
             recent,
         )
         return input_ids, array, len(prefix), len(encoded), store
+
+    def _id_list(self, hit: Optional[Tuple[_Entry, int]], new: np.ndarray) -> List[int]:
+        """The IDs of the ``hit`` prefix (if any) followed by ``new``, as a new
+        list of the shared ints: the prefix's copied from its stored chunks,
+        ``new``'s looked up by ID."""
+        ids: List[int] = []
+        if hit is not None:
+            chunks = hit[0].chunks
+            full, part = divmod(hit[1], _ID_CHUNK)
+            for chunk in chunks[:full]:
+                ids += chunk
+            if part:
+                ids += chunks[full][:part]
+        if len(new):
+            ids += self._ints.take(new).tolist()
+        return ids
+
+    @staticmethod
+    def _id_chunks(
+        hit: Optional[Tuple[_Entry, int]], ids: List[int]
+    ) -> Tuple[Tuple[int, ...], ...]:
+        """``ids`` (``_id_list``'s) in chunks, sharing the full chunks of the
+        ``hit`` prefix."""
+        shared = hit[0].chunks[: hit[1] // _ID_CHUNK] if hit is not None else ()
+        return shared + tuple(
+            tuple(ids[i : i + _ID_CHUNK])
+            for i in range(len(shared) * _ID_CHUNK, len(ids), _ID_CHUNK)
+        )
 
     def _resume(self, recent: _RecentPrompt, data: bytes):
         """The boundaries, digests and kept hash states of ``data``, scanning
