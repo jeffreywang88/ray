@@ -132,7 +132,6 @@ Set these in the cluster environment:
 | Environment variable | Default | Effect |
 | --- | --- | --- |
 | `RAY_SERVE_INGRESS_ROUTER_REPLICAS_PER_NODE` | 1 | Ingress replicas per proxy node. Raise it when ingress tokenization and request scoring bound throughput. |
-| `RAY_SERVE_LLM_ENABLE_DECODE_BLOCK_PROGRESS` | 0 | Report decode progress as the engine generates tokens, for more accurate load tracking. Because each engine replica sends updates to every ingress replica, this can add network overhead at high concurrency. |
 | `RAY_SERVE_LLM_KV_TOKEN_STAGING_TTL_S` | 60 | How long a replica holds a staged prompt-token payload before eviction. |
 | `RAY_SERVE_LLM_KV_TOKEN_STAGING_MAX_ENTRIES` | 8192 | Staged payloads retained per engine replica. |
 | `RAY_SERVE_LLM_KV_TOKEN_STAGING_MAX_BYTES` | 1 GiB | Memory allocated for staged payloads per engine replica. |
@@ -153,8 +152,8 @@ Replica selection determines which `LLMServer` engine replica processes each req
 
 - **Replica discovery.** Ray Serve tracks which `LLMServer` replicas are running and which are eligible to receive traffic. The router only scores the available replicas.
 - **Request orchestration.** The ingress receives and tokenizes each request, selects a replica, and dispatches the request to it.
-- **Request lifecycle.** Engine replicas report prefill completion, decode progress, and request completion back to the ingress, which uses these updates to maintain its view of replica token load.
-- **Event transport and synchronization.** KV cache events are broadcast to all ingress replicas, while the ingress replicas synchronize token load updates with one another. This gives each ingress replica a consistent view of KV cache state and token load, enabling them to make consistent routing decisions.
+- **Request lifecycle.** Engine replicas publish prefill completion and request completion to every ingress replica, which uses these updates to maintain its view of replica token load. An ingress replica applies them even if a different ingress replica selected the request, or that replica has since stopped.
+- **Event transport and synchronization.** KV cache events are broadcast to all ingress replicas, while the ingress replicas synchronize token load updates and session bindings with one another. This gives each ingress replica a consistent view of KV cache state and token load, enabling them to make consistent routing decisions.
 
 ```{figure} ../images/kv_aware_routing_flow.png
 ---
@@ -223,6 +222,8 @@ If the ingress router fails to route a request, Ray Serve LLM can send it to an 
 - **Direct streaming only.** `KVAwareRouter` inherits direct streaming's constraints, including one model per application and no LoRA- or multiplex-aware routing. See {ref}`direct-streaming-limitations`.
 - **No data-parallel deployments.** The router doesn't yet score individual data-parallel ranks. Support is planned.
 - **No prefill-decode disaggregation.** The router doesn't yet support disaggregated prefill and decode. Support is planned.
+- **No catch-up for missed load updates.** An ingress replica only receives token load updates sent after it connects to the other ingress replicas and the engine replicas, and nothing is replayed. An ingress replica that starts while requests are in flight undercounts their load until they finish. The selection service stops counting any request `DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS` (300 by default) after routing it. This clears requests whose completion was lost, but also requests that stream for longer.
+- **Direct TCP between replicas.** Ingress replicas connect to each other and to engine replicas on ports picked at startup, so the network must allow TCP between these replicas on any port.
 
 ## See also
 

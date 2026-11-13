@@ -51,11 +51,6 @@ DEFAULT_KV_INDEXER_THREADS = 4
 # events missed before its SUB connected.
 DEFAULT_KV_EVENTS_REPLAY_PORT_OFFSET = 1000
 
-# TTL for a request's lifecycle tracking on the KV router actor. A live
-# replica whose completion event was lost (e.g. a batch dropped on a
-# transient actor outage) would otherwise leave its entry tracked forever.
-REQUEST_TRACKING_TTL_S = 3600
-
 # Session pinning idle timeout in seconds.
 DEFAULT_SESSION_AFFINITY_TTL_S = 1800.0
 
@@ -63,6 +58,12 @@ DEFAULT_SESSION_AFFINITY_TTL_S = 1800.0
 # request's candidates; hard affinity would reject the request instead.
 SESSION_AFFINITY_MODE = "soft"
 
-# Bound best-effort lifecycle broadcast delivery so one slow ingress replica
-# cannot stall an engine replica's whole lifecycle-event queue indefinitely.
-LIFECYCLE_EVENT_BROADCAST_TIMEOUT_S = 3
+# routing_stats keys for an LLMRouter's Dynamo mesh endpoint and an LLMServer's
+# lifecycle event endpoint.
+KV_REPLICA_SYNC_METADATA_KEY = "kv_replica_sync_metadata"
+KV_LIFECYCLE_METADATA_KEY = "kv_lifecycle_metadata"
+
+# The selection service scopes state by (model_name, routing_group). Each
+# serves one model.
+SELECTION_MODEL_NAME = "default"
+SELECTION_ROUTING_GROUP = "default"
